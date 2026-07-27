@@ -1,0 +1,756 @@
+import AppKit
+import QuickLookUI
+import SwiftUI
+
+struct FilePaneView: View {
+  @EnvironmentObject private var appState: AppState
+  @ObservedObject var model: FilePaneModel
+
+  var body: some View {
+    VStack(spacing: 0) {
+      content
+      Divider()
+      FilePaneStatusBar(model: model)
+    }
+    .background(Color(nsColor: .textBackgroundColor))
+    .dropDestination(for: FileDragPayload.self) { payloads, _ in
+      model.acceptDrop(payloads, to: model.currentURL)
+    }
+    .contextMenu { backgroundContextMenu }
+    .alert(
+      model.prompt?.title ?? "",
+      isPresented: Binding(
+        get: { model.prompt != nil },
+        set: { if !$0 { model.prompt = nil } }
+      )
+    ) {
+      TextField(model.prompt?.placeholder ?? "名前", text: $model.promptText)
+      Button("キャンセル", role: .cancel) { model.prompt = nil }
+      Button("実行") { model.commitPrompt() }
+        .keyboardShortcut(.defaultAction)
+    }
+    .alert(
+      "ファイル操作エラー",
+      isPresented: Binding(
+        get: { model.errorMessage != nil },
+        set: { if !$0 { model.errorMessage = nil } }
+      )
+    ) {
+      Button("OK") { model.errorMessage = nil }
+    } message: {
+      Text(model.errorMessage ?? "")
+    }
+  }
+
+  @ViewBuilder
+  private var content: some View {
+    ZStack {
+      switch model.viewMode {
+      case .list:
+        FileListView(model: model)
+      case .matrix:
+        FileMatrixView(model: model)
+      case .columns:
+        FileColumnBrowserView(model: model)
+      case .gallery:
+        FileGalleryView(model: model)
+      }
+
+      if model.displayedItems.isEmpty, !model.isLoading {
+        ContentUnavailableView(
+          model.searchText.isEmpty ? "このフォルダは空です" : "一致する項目がありません",
+          systemImage: model.searchText.isEmpty ? "folder" : "magnifyingglass"
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .allowsHitTesting(false)
+      }
+    }
+    .overlay(alignment: .topTrailing) {
+      if model.isLoading {
+        ProgressView()
+          .controlSize(.small)
+          .padding(9)
+          .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+          .padding(10)
+          .allowsHitTesting(false)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var backgroundContextMenu: some View {
+    Button("新規ファイル") { model.requestNewFile() }
+    Button("新規フォルダ") { model.requestNewFolder() }
+    Divider()
+    Button("ペースト") { model.paste() }
+      .disabled(model.isPerformingFileOperation)
+    Button("すべてを選択") { model.selectAll() }
+    Divider()
+    Button("再読み込み") { model.load() }
+    Button("ここでターミナルを開く") { FileSystemService.openTerminal(at: model.currentURL) }
+    Button("サイドバーへ追加") { appState.sidebarModel.add(url: model.currentURL) }
+  }
+}
+
+private struct FilePaneStatusBar: View {
+  @ObservedObject var model: FilePaneModel
+  @ObservedObject private var selection: FileSelectionController
+
+  init(model: FilePaneModel) {
+    self.model = model
+    _selection = ObservedObject(wrappedValue: model.selectionController)
+  }
+
+  var body: some View {
+    HStack(spacing: 6) {
+      Text("\(model.displayedItems.count)項目")
+      if selection.count > 0 {
+        Text("·")
+        Text("\(selection.count)項目を選択")
+      }
+      if let operation = model.operationLabel {
+        Text("·")
+        ProgressView().controlSize(.mini)
+        Text(operation)
+      }
+      Spacer(minLength: 12)
+      Text(model.currentURL.path)
+        .lineLimit(1)
+        .truncationMode(.middle)
+    }
+    .font(.caption)
+    .foregroundStyle(.secondary)
+    .padding(.horizontal, 10)
+    .frame(height: 24)
+    .background(.bar)
+  }
+}
+
+struct FileListView: View {
+  @ObservedObject var model: FilePaneModel
+
+  var body: some View {
+    GeometryReader { proxy in
+      let showsDetails = proxy.size.width >= 610
+      VStack(spacing: 0) {
+        FileListHeader(model: model, showsDetails: showsDetails)
+        Divider()
+        FileSelectionSurface(
+          model: model,
+          scopeURL: model.currentURL,
+          onSelect: { item, modifiers in
+            model.select(item, modifiers: modifiers)
+          },
+          itemForURL: { model.item(for: $0) },
+          content: { coordinateSpace in
+            ScrollView {
+              LazyVStack(spacing: 0) {
+                ForEach(model.displayedItems) { item in
+                  SelectableListRow(
+                    model: model,
+                    item: item,
+                    showsDetails: showsDetails,
+                    selection: model.selectionFlag(for: item.url)
+                  )
+                  .fileSelectionHitTarget(item.url, in: coordinateSpace)
+                }
+              }
+              .padding(.vertical, 4)
+            }
+            .contentShape(Rectangle())
+          }
+        )
+      }
+    }
+  }
+}
+
+private struct FileListHeader: View {
+  @ObservedObject var model: FilePaneModel
+  let showsDetails: Bool
+
+  var body: some View {
+    HStack(spacing: 10) {
+      sortButton("名前", sort: .name).frame(maxWidth: .infinity, alignment: .leading)
+      if showsDetails {
+        sortButton("更新日", sort: .modified).frame(width: 132, alignment: .leading)
+        sortButton("サイズ", sort: .size).frame(width: 76, alignment: .trailing)
+        sortButton("種類", sort: .kind).frame(width: 110, alignment: .leading)
+      }
+    }
+    .font(.caption.weight(.medium))
+    .foregroundStyle(.secondary)
+    .padding(.horizontal, 13)
+    .frame(height: 28)
+    .background(.bar)
+  }
+
+  private func sortButton(_ title: String, sort: FileSort) -> some View {
+    Button {
+      if model.sort == sort {
+        model.sortDescending.toggle()
+      } else {
+        model.sort = sort
+        model.sortDescending = false
+      }
+    } label: {
+      HStack(spacing: 3) {
+        Text(title)
+        if model.sort == sort {
+          Image(systemName: model.sortDescending ? "chevron.down" : "chevron.up")
+            .font(.system(size: 8, weight: .bold))
+        }
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+  }
+}
+
+private struct SelectableListRow: View {
+  let model: FilePaneModel
+  let item: FileItem
+  let showsDetails: Bool
+  @ObservedObject var selection: SelectionFlag
+
+  var body: some View {
+    HStack(spacing: 10) {
+      HStack(spacing: 8) {
+        Image(nsImage: item.icon)
+          .resizable()
+          .interpolation(.high)
+          .frame(width: 20, height: 20)
+        Text(item.name)
+          .lineLimit(1)
+          .truncationMode(.middle)
+          .foregroundStyle(item.isHidden ? .secondary : .primary)
+        if !item.tagNames.isEmpty {
+          Image(systemName: "tag.fill")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .help(item.tagNames.joined(separator: ", "))
+        }
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      if showsDetails {
+        Text(item.modifiedLabel).frame(width: 132, alignment: .leading).foregroundStyle(.secondary)
+        Text(item.sizeLabel).frame(width: 76, alignment: .trailing).foregroundStyle(.secondary)
+          .monospacedDigit()
+        Text(item.kindLabel).frame(width: 110, alignment: .leading).foregroundStyle(.secondary)
+          .lineLimit(1)
+      }
+    }
+    .font(.system(size: 13))
+    .padding(.horizontal, 13)
+    .frame(height: 30)
+    .background {
+      RoundedRectangle(cornerRadius: 6, style: .continuous)
+        .fill(selection.isSelected ? Color.accentColor.opacity(0.19) : .clear)
+        .padding(.horizontal, 4)
+    }
+    .contentShape(Rectangle())
+    .highPriorityGesture(
+      TapGesture(count: 2).onEnded {
+        model.ensureSelected(item)
+        model.activate(item)
+      }
+    )
+    .draggable(model.dragPayload(for: item))
+    .dropDestination(for: FileDragPayload.self) { payloads, _ in
+      guard item.isDirectory, !item.isPackage else { return false }
+      return model.acceptDrop(payloads, to: item.url)
+    }
+    .contextMenu { FileItemContextMenu(model: model, item: item) }
+  }
+}
+
+struct FileMatrixView: View {
+  @ObservedObject var model: FilePaneModel
+
+  var body: some View {
+    FileSelectionSurface(
+      model: model,
+      scopeURL: model.currentURL,
+      onSelect: { item, modifiers in
+        model.select(item, modifiers: modifiers)
+      },
+      itemForURL: { model.item(for: $0) },
+      content: { coordinateSpace in
+        ScrollView {
+          LazyVGrid(
+            columns: [
+              GridItem(
+                .adaptive(minimum: model.iconSize + 54, maximum: model.iconSize + 98), spacing: 12)
+            ],
+            alignment: .leading,
+            spacing: 12
+          ) {
+            ForEach(model.displayedItems) { item in
+              MatrixCell(
+                model: model,
+                item: item,
+                iconSize: model.iconSize,
+                selection: model.selectionFlag(for: item.url)
+              )
+              .fileSelectionHitTarget(item.url, in: coordinateSpace)
+            }
+          }
+          .padding(14)
+        }
+        .contentShape(Rectangle())
+      }
+    )
+  }
+}
+
+private struct MatrixCell: View {
+  let model: FilePaneModel
+  let item: FileItem
+  let iconSize: Double
+  @ObservedObject var selection: SelectionFlag
+
+  var body: some View {
+    VStack(spacing: 7) {
+      Image(nsImage: item.icon)
+        .resizable()
+        .interpolation(.high)
+        .frame(width: iconSize, height: iconSize)
+      Text(item.name)
+        .font(.system(size: 12.5))
+        .lineLimit(2)
+        .multilineTextAlignment(.center)
+        .truncationMode(.middle)
+        .foregroundStyle(item.isHidden ? .secondary : .primary)
+      if !item.tagNames.isEmpty {
+        Label(item.tagNames.joined(separator: ", "), systemImage: "tag.fill")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+      }
+    }
+    .padding(8)
+    .frame(maxWidth: .infinity, minHeight: iconSize + 54, alignment: .top)
+    .background(
+      selection.isSelected ? Color.accentColor.opacity(0.18) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+    )
+    .contentShape(Rectangle())
+    .highPriorityGesture(
+      TapGesture(count: 2).onEnded {
+        model.ensureSelected(item)
+        model.activate(item)
+      }
+    )
+    .draggable(model.dragPayload(for: item))
+    .dropDestination(for: FileDragPayload.self) { payloads, _ in
+      guard item.isDirectory, !item.isPackage else { return false }
+      return model.acceptDrop(payloads, to: item.url)
+    }
+    .contextMenu { FileItemContextMenu(model: model, item: item) }
+  }
+}
+
+struct FileGalleryView: View {
+  @ObservedObject var model: FilePaneModel
+  @ObservedObject private var selection: FileSelectionController
+
+  init(model: FilePaneModel) {
+    self.model = model
+    _selection = ObservedObject(wrappedValue: model.selectionController)
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      GalleryPreview(model: model, selectedURL: selection.primaryURL)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .layoutPriority(1)
+        .clipped()
+
+      GalleryFilmstrip(model: model, selectedURL: selection.primaryURL)
+        .frame(minHeight: 122, idealHeight: 122, maxHeight: 122)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+  }
+}
+
+private struct GalleryPreview: View {
+  let model: FilePaneModel
+  let selectedURL: URL?
+
+  var body: some View {
+    ZStack {
+      if let selected = model.item(for: selectedURL) {
+        EmbeddedQuickLookView(url: selected.url)
+          .padding(18)
+          .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+          .padding(18)
+      } else {
+        ContentUnavailableView("項目を選択", systemImage: "rectangle.on.rectangle.angled")
+      }
+    }
+  }
+}
+
+private struct GalleryFilmstrip: View {
+  let model: FilePaneModel
+  let selectedURL: URL?
+
+  var body: some View {
+    VStack(spacing: 0) {
+      Divider()
+      ScrollViewReader { proxy in
+        FileSelectionSurface(
+          model: model,
+          scopeURL: model.currentURL,
+          onSelect: { item, modifiers in
+            model.select(item, modifiers: modifiers)
+          },
+          itemForURL: { model.item(for: $0) },
+          content: { coordinateSpace in
+            ScrollView(.horizontal, showsIndicators: false) {
+              LazyHStack(spacing: 8) {
+                ForEach(model.displayedItems) { item in
+                  GalleryThumbnail(
+                    model: model,
+                    item: item,
+                    selection: model.selectionFlag(for: item.url)
+                  )
+                  .fileSelectionHitTarget(item.url, in: coordinateSpace)
+                  .id(item.url)
+                }
+              }
+              .padding(.horizontal, 10)
+              .padding(.vertical, 8)
+            }
+          }
+        )
+        .onChange(of: selectedURL) { _, newValue in
+          guard let newValue else { return }
+          withAnimation(.easeOut(duration: 0.16)) {
+            proxy.scrollTo(newValue, anchor: .center)
+          }
+        }
+      }
+    }
+    .background(.bar)
+  }
+}
+
+private struct GalleryThumbnail: View {
+  let model: FilePaneModel
+  let item: FileItem
+  @ObservedObject var selection: SelectionFlag
+
+  var body: some View {
+    VStack(spacing: 5) {
+      Image(nsImage: item.icon)
+        .resizable()
+        .interpolation(.high)
+        .frame(width: 54, height: 54)
+      Text(item.name)
+        .font(.caption)
+        .lineLimit(1)
+        .truncationMode(.middle)
+        .frame(width: 94)
+    }
+    .padding(7)
+    .background(
+      selection.isSelected ? Color.accentColor.opacity(0.19) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+    )
+    .contentShape(Rectangle())
+    .highPriorityGesture(TapGesture(count: 2).onEnded { model.activate(item) })
+    .draggable(model.dragPayload(for: item))
+    .contextMenu { FileItemContextMenu(model: model, item: item) }
+  }
+}
+
+private struct EmbeddedQuickLookView: NSViewRepresentable {
+  let url: URL
+
+  func makeNSView(context: Context) -> QLPreviewView {
+    let view = QLPreviewView(frame: .zero, style: .normal)!
+    view.autostarts = true
+    view.wantsLayer = true
+    view.layer?.masksToBounds = true
+    view.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    view.setContentHuggingPriority(.defaultLow, for: .vertical)
+    view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+    return view
+  }
+
+  func updateNSView(_ nsView: QLPreviewView, context: Context) {
+    let current = (nsView.previewItem as? NSURL).map { $0 as URL }
+    guard current != url else { return }
+    nsView.previewItem = nil
+    nsView.previewItem = url as NSURL
+  }
+
+  static func dismantleNSView(_ nsView: QLPreviewView, coordinator: Void) {
+    nsView.previewItem = nil
+  }
+}
+
+struct FileColumnBrowserView: View {
+  @ObservedObject var model: FilePaneModel
+  @State private var columns: [ColumnData] = []
+  @State private var loadTask: Task<Void, Never>?
+
+  var body: some View {
+    ScrollView(.horizontal) {
+      LazyHStack(spacing: 0) {
+        ForEach(Array(columns.enumerated()), id: \.element.id) { index, column in
+          ColumnView(model: model, data: column) { item, modifiers in
+            select(item, modifiers: modifiers, in: index)
+          }
+          Divider()
+        }
+      }
+    }
+    .onAppear { resetFromModel() }
+    .onChange(of: model.currentURL) { _, _ in resetFromModel() }
+    .onChange(of: model.displayedItems) { _, _ in refreshRootColumn() }
+    .onDisappear { loadTask?.cancel() }
+  }
+
+  private func resetFromModel() {
+    loadTask?.cancel()
+    columns = [
+      ColumnData(url: model.currentURL, items: model.displayedItems, isLoading: model.isLoading)
+    ]
+  }
+
+  private func refreshRootColumn() {
+    guard !columns.isEmpty else {
+      resetFromModel()
+      return
+    }
+    columns[0] = ColumnData(
+      url: model.currentURL, items: model.displayedItems, isLoading: model.isLoading)
+  }
+
+  private func select(
+    _ item: FileItem,
+    modifiers: NSEvent.ModifierFlags,
+    in index: Int
+  ) {
+    let column = columns[index]
+    model.select(
+      item,
+      modifiers: modifiers,
+      orderedItems: column.items,
+      scope: column.url
+    )
+    loadTask?.cancel()
+    columns = Array(columns.prefix(index + 1))
+    guard item.isDirectory, !item.isPackage else { return }
+
+    columns.append(ColumnData(url: item.url, items: [], isLoading: true))
+    let targetURL = item.url
+    let showHidden = model.showHidden
+    loadTask = Task {
+      let raw = await Task.detached(priority: .userInitiated) {
+        (try? FileSystemService.contents(of: targetURL, showHidden: showHidden)) ?? []
+      }.value
+      guard !Task.isCancelled else { return }
+      let arranged = await model.arrange(raw)
+      guard !Task.isCancelled, columns.last?.url == targetURL else { return }
+      columns[columns.count - 1] = ColumnData(url: targetURL, items: arranged, isLoading: false)
+    }
+  }
+}
+
+private struct ColumnData: Identifiable {
+  var id: URL { url }
+  let url: URL
+  let items: [FileItem]
+  let itemLookup: [URL: FileItem]
+  let isLoading: Bool
+
+  init(url: URL, items: [FileItem], isLoading: Bool) {
+    self.url = url
+    self.items = items
+    self.itemLookup = items.reduce(into: [:]) { lookup, item in
+      lookup[item.url] = item
+    }
+    self.isLoading = isLoading
+  }
+}
+
+private struct ColumnView: View {
+  let model: FilePaneModel
+  let data: ColumnData
+  let select: (FileItem, NSEvent.ModifierFlags) -> Void
+
+  var body: some View {
+    FileSelectionSurface(
+      model: model,
+      scopeURL: data.url,
+      onSelect: select,
+      itemForURL: { data.itemLookup[$0] },
+      content: { coordinateSpace in
+        ZStack(alignment: .top) {
+          ScrollView {
+            LazyVStack(spacing: 0) {
+              ForEach(data.items) { item in
+                ColumnItemRow(
+                  model: model,
+                  item: item,
+                  selection: model.selectionFlag(for: item.url)
+                )
+                .fileSelectionHitTarget(item.url, in: coordinateSpace)
+              }
+            }
+            .padding(.vertical, 4)
+          }
+          if data.isLoading {
+            ProgressView().controlSize(.small).padding(.top, 12)
+          }
+        }
+      }
+    )
+    .frame(width: 245)
+  }
+}
+
+private struct ColumnItemRow: View {
+  let model: FilePaneModel
+  let item: FileItem
+  @ObservedObject var selection: SelectionFlag
+
+  var body: some View {
+    HStack(spacing: 7) {
+      Image(nsImage: item.icon).resizable().frame(width: 18, height: 18)
+      Text(item.name).lineLimit(1).truncationMode(.middle)
+      Spacer()
+      if item.isDirectory && !item.isPackage {
+        Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+      }
+    }
+    .font(.system(size: 12.5))
+    .padding(.horizontal, 9)
+    .frame(height: 28)
+    .background {
+      RoundedRectangle(cornerRadius: 5, style: .continuous)
+        .fill(selection.isSelected ? Color.accentColor.opacity(0.19) : .clear)
+        .padding(.horizontal, 3)
+    }
+    .contentShape(Rectangle())
+    .highPriorityGesture(TapGesture(count: 2).onEnded { model.activate(item) })
+    .draggable(model.dragPayload(for: item))
+    .dropDestination(for: FileDragPayload.self) { payloads, _ in
+      guard item.isDirectory, !item.isPackage else { return false }
+      return model.acceptDrop(payloads, to: item.url)
+    }
+    .contextMenu { FileItemContextMenu(model: model, item: item) }
+  }
+}
+
+private struct FileItemContextMenu: View {
+  @EnvironmentObject private var appState: AppState
+  let model: FilePaneModel
+  let item: FileItem
+
+  var body: some View {
+    Button(item.isDirectory && !item.isPackage ? "開く" : "デフォルトアプリで開く") {
+      model.ensureSelected(item)
+      model.activate(item)
+    }
+
+    Menu("このアプリケーションで開く") {
+      ForEach(Array(applications.prefix(18)), id: \.self) { applicationURL in
+        Button {
+          let configuration = NSWorkspace.OpenConfiguration()
+          NSWorkspace.shared.open(
+            [item.url],
+            withApplicationAt: applicationURL,
+            configuration: configuration,
+            completionHandler: nil
+          )
+        } label: {
+          Text(applicationURL.deletingPathExtension().lastPathComponent)
+        }
+      }
+      Divider()
+      Button("その他…") {
+        OpenWithApplicationCache.shared.chooseApplicationAndOpen(item.url)
+      }
+    }
+
+    if item.isDirectory && !item.isPackage {
+      Button("新しいタブで開く") {
+        model.ensureSelected(item)
+        appState.openInNewTab(item.url)
+      }
+      Button("新しいペインで開く") {
+        model.ensureSelected(item)
+        appState.openInNewPane(item.url)
+      }
+      Button("サイドバーへ追加") { appState.sidebarModel.add(url: item.url) }
+    } else if item.isPackage {
+      Button("パッケージの内容を表示") {
+        model.ensureSelected(item)
+        model.navigate(to: item.url)
+      }
+    }
+
+    Button("Quick Look") {
+      model.ensureSelected(item)
+      model.previewSelected()
+    }
+    Divider()
+    Button("コピー") {
+      model.ensureSelected(item)
+      model.copySelection()
+    }
+    Button("移動用にカット") {
+      model.ensureSelected(item)
+      model.copySelection(cut: true)
+    }
+    Button("名称変更") {
+      model.ensureSelected(item)
+      model.requestRename(item.url)
+    }
+    Button("複製") {
+      model.ensureSelected(item)
+      model.duplicateSelection()
+    }
+    Button("エイリアスを作成") {
+      model.ensureSelected(item)
+      model.createAliasSelection()
+    }
+    Button("圧縮") {
+      model.ensureSelected(item)
+      model.compressSelection()
+    }
+    Button("タグを編集") {
+      model.ensureSelected(item)
+      model.requestTagsForSelection()
+    }
+    Divider()
+    Button("情報を見る") {
+      model.ensureSelected(item)
+      appState.isInspectorPresented = true
+    }
+    Button("パスをコピー") {
+      model.ensureSelected(item)
+      model.copySelectedPath()
+    }
+    Button("Finderで表示") {
+      model.ensureSelected(item)
+      model.revealSelection()
+    }
+    Button("ここでターミナルを開く") { FileSystemService.openTerminal(at: item.url) }
+    Divider()
+    Button("ゴミ箱に入れる", role: .destructive) {
+      model.ensureSelected(item)
+      model.trashSelection()
+    }
+  }
+
+  private var applications: [URL] {
+    OpenWithApplicationCache.shared.applications(for: item)
+  }
+}
