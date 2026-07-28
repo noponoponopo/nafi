@@ -87,6 +87,25 @@ struct FileItem: Identifiable, Hashable, Sendable {
   var icon: NSImage {
     FileIconCache.shared.icon(for: self)
   }
+
+  static func make(from url: URL) -> FileItem? {
+    guard url.isFileURL || url.scheme == nil else { return nil }
+    guard let values = try? url.resourceValues(forKeys: FileSystemService.resourceKeys)
+    else { return nil }
+    let name = values.name ?? url.lastPathComponent
+    return FileItem(
+      url: url,
+      name: name,
+      isDirectory: values.isDirectory == true,
+      isPackage: values.isPackage == true,
+      isHidden: values.isHidden == true || name.hasPrefix("."),
+      fileSize: values.fileSize.map(Int64.init),
+      creationDate: values.creationDate,
+      modificationDate: values.contentModificationDate,
+      contentTypeIdentifier: values.contentType?.identifier,
+      tagNames: values.tagNames ?? []
+    )
+  }
 }
 
 enum FileSort: String, CaseIterable, Identifiable, Sendable {

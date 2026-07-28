@@ -102,7 +102,27 @@ final class FilePaneModel: ObservableObject, Identifiable {
   @Published var showHidden: Bool
   @Published var searchText = "" {
     didSet {
-      if searchText != oldValue { scheduleRebuild(debounceNanoseconds: 110_000_000) }
+      if searchText != oldValue { scheduleSearch(debounceNanoseconds: 180_000_000) }
+    }
+  }
+  @Published var searchScope: FileSearchScope = .currentFolder {
+    didSet {
+      if searchScope != oldValue { scheduleSearch() }
+    }
+  }
+  @Published var searchFilterMode: FileSearchFilterMode = .all {
+    didSet {
+      if searchFilterMode != oldValue { scheduleSearch() }
+    }
+  }
+  @Published var selectedSearchKinds: Set<FileSearchKind> = [] {
+    didSet {
+      if selectedSearchKinds != oldValue { scheduleSearch() }
+    }
+  }
+  @Published var searchExtensionsText = "" {
+    didSet {
+      if searchExtensionsText != oldValue { scheduleSearch(debounceNanoseconds: 180_000_000) }
     }
   }
   @Published var sort: FileSort = .name {
@@ -117,7 +137,9 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
   @Published var viewMode: FileViewMode
   @Published var iconSize: Double = 64
-  @Published var isLoading = false
+  @Published private(set) var isLoading = false
+  @Published private(set) var searchRootURL: URL?
+  @Published private(set) var searchDidReachLimit = false
   @Published private(set) var operationLabel: String?
   @Published var errorMessage: String?
   @Published var prompt: Prompt?
@@ -125,6 +147,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
   @Published var transferConflict: TransferConflictPrompt?
 
   private var allItems: [FileItem] = []
+  private var searchItems: [FileItem] = []
   private var itemLookup: [URL: FileItem] = [:]
   private var displayedIndex: [URL: Int] = [:]
   private var backStack: [URL] = []
@@ -134,9 +157,13 @@ final class FilePaneModel: ObservableObject, Identifiable {
   private var supplementalItems: [URL: FileItem] = [:]
   private var cancellables = Set<AnyCancellable>()
   private var loadTask: Task<Void, Never>?
+  private var searchTask: Task<Void, Never>?
   private var rebuildTask: Task<Void, Never>?
   private var reloadTask: Task<Void, Never>?
   private var loadToken = UUID()
+  private var searchToken = UUID()
+  private var isDirectoryLoading = false
+  private var isSearchLoading = false
   private var contentRevision = 0
   private var ignoreFileSystemNotificationsUntil = Date.distantPast
   private var pendingSelectionURL: URL?
@@ -148,11 +175,20 @@ final class FilePaneModel: ObservableObject, Identifiable {
     self.showHidden = showHidden
     self.viewMode = viewMode
 
-    NotificationCenter.default.publisher(for: .namiFileSystemDidChange)
+    NotificationCenter.default.publisher(for: .nafiFileSystemDidChange)
       .sink { [weak self] notification in
         guard let directories = notification.userInfo?["directories"] as? [URL] else { return }
         Task { @MainActor [weak self] in
           guard let self, Date() >= self.ignoreFileSystemNotificationsUntil else { return }
+          if self.isRecursiveSearchActive, let root = self.searchRootURL,
+            directories.contains(where: {
+              NafiURL.sameLocation($0, root) || NafiURL.isDescendant($0, of: root)
+                || NafiURL.isDescendant(root, of: $0)
+            })
+          {
+            self.scheduleSearch(debounceNanoseconds: 130_000_000)
+            return
+          }
           let current = NafiURL.normalized(self.currentURL)
           guard directories.contains(where: { NafiURL.sameLocation($0, current) }) else { return }
           self.scheduleReload()
@@ -179,6 +215,29 @@ final class FilePaneModel: ObservableObject, Identifiable {
   var canGoForward: Bool { !forwardStack.isEmpty }
   var selectionCount: Int { selectionController.count }
   var isPerformingFileOperation: Bool { operationLabel != nil }
+  var isSearchActive: Bool { !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+  var isRecursiveSearchActive: Bool { isSearchActive && searchScope.searchesRecursively }
+
+  var searchFilter: FileSearchFilter {
+    FileSearchFilter(
+      mode: searchFilterMode,
+      kinds: selectedSearchKinds,
+      extensions: FileSearchFilter.parseExtensions(searchExtensionsText)
+    )
+  }
+
+  var searchDescription: String {
+    "\(searchScope.label)・\(searchFilter.summary)"
+  }
+
+  func searchLocationLabel(for item: FileItem) -> String {
+    let parent = NafiURL.parent(of: item.url)
+    if NafiURL.isRemote(parent) {
+      let path = NafiURL.remotePath(in: parent) ?? "/"
+      return remoteProfileName.map { "\($0):\(path)" } ?? path
+    }
+    return parent.path
+  }
 
   var selectedItem: FileItem? {
     guard let url = selectionController.primaryURL else { return nil }
@@ -203,6 +262,10 @@ final class FilePaneModel: ObservableObject, Identifiable {
     clone.sort = sort
     clone.sortDescending = sortDescending
     clone.iconSize = iconSize
+    clone.searchScope = searchScope
+    clone.searchFilterMode = searchFilterMode
+    clone.selectedSearchKinds = selectedSearchKinds
+    clone.searchExtensionsText = searchExtensionsText
     return clone
   }
 
@@ -212,12 +275,15 @@ final class FilePaneModel: ObservableObject, Identifiable {
 
     let directory = currentURL
     let showHidden = showHidden
-    let query = searchText
+    let recursiveSearch = isRecursiveSearchActive
+    let query = recursiveSearch ? "" : searchText
+    let filter = recursiveSearch ? FileSearchFilter.all : searchFilter
     let requestedSort = sort
     let descending = sortDescending
     let token = UUID()
     loadToken = token
-    isLoading = true
+    isDirectoryLoading = true
+    updateLoadingState()
 
     loadTask = Task { [weak self] in
       let remoteProfile: ServerProfile?
@@ -231,7 +297,12 @@ final class FilePaneModel: ObservableObject, Identifiable {
         let items = try await UnifiedFileSystemService.contents(
           of: directory, showHidden: showHidden)
         let displayed = Self.arranged(
-          items, query: query, sort: requestedSort, descending: descending)
+          items,
+          query: query,
+          filter: filter,
+          sort: requestedSort,
+          descending: descending
+        )
         result = (items, displayed, nil)
       } catch is CancellationError {
         result = ([], [], nil)
@@ -243,7 +314,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
         NafiURL.sameLocation(self.currentURL, directory)
       else { return }
 
-      self.isLoading = false
+      self.isDirectoryLoading = false
+      self.updateLoadingState()
       self.remoteProfileName = remoteProfile?.name
       self.remoteProfileKind = remoteProfile?.kind
       if let error = result.error {
@@ -256,21 +328,23 @@ final class FilePaneModel: ObservableObject, Identifiable {
       }
 
       self.allItems = result.items
-      var lookup: [URL: FileItem] = [:]
-      lookup.reserveCapacity(result.items.count)
-      for item in result.items { lookup[item.url] = item }
-      self.itemLookup = lookup
+      self.rebuildItemLookup(using: self.isRecursiveSearchActive ? self.searchItems : result.items)
       self.contentRevision &+= 1
 
-      if self.searchText == query && self.sort == requestedSort
-        && self.sortDescending == descending
+      if !recursiveSearch, !self.isRecursiveSearchActive, self.searchText == query,
+        self.searchFilter == filter, self.sort == requestedSort,
+        self.sortDescending == descending
       {
         self.applyDisplayedItems(result.displayed)
+      } else if self.isRecursiveSearchActive {
+        self.scheduleSearch()
       } else {
         self.scheduleRebuild()
       }
 
-      let available = Set(result.items.map(\.url))
+      let available = Set(
+        (self.isRecursiveSearchActive ? self.searchItems : result.items).map(\.url)
+      )
       let preserved = self.selectionController.selectedURLs.filter {
         self.supplementalItems[$0] != nil
       }
@@ -280,7 +354,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       }
 
       if let pendingURL = self.pendingSelectionURL.map(NafiURL.normalized),
-        let pendingItem = lookup[pendingURL]
+        let pendingItem = self.itemLookup[pendingURL]
       {
         self.selectionController.replace(with: [pendingItem.url], primary: pendingItem.url)
         self.selectionAnchor = pendingItem.url
@@ -303,7 +377,11 @@ final class FilePaneModel: ObservableObject, Identifiable {
     }
 
     currentURL = standardized
+    searchTask?.cancel()
     allItems.removeAll(keepingCapacity: true)
+    searchItems.removeAll(keepingCapacity: true)
+    searchRootURL = nil
+    searchDidReachLimit = false
     itemLookup.removeAll(keepingCapacity: true)
     applyDisplayedItems([])
     selectionController.reset()
@@ -874,7 +952,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       )
     }
     pasteboard.setString(
-      cut ? "cut" : "copy", forType: NSPasteboard.PasteboardType("app.nami.transfer-mode"))
+      cut ? "cut" : "copy", forType: NSPasteboard.PasteboardType("app.nafi.transfer-mode"))
   }
 
   func paste() {
@@ -893,7 +971,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       return
     }
     let move =
-      pasteboard.string(forType: NSPasteboard.PasteboardType("app.nami.transfer-mode")) == "cut"
+      pasteboard.string(forType: NSPasteboard.PasteboardType("app.nafi.transfer-mode")) == "cut"
     transferItems(
       urls,
       to: currentURL,
@@ -962,18 +1040,29 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
 
   func arrange(_ items: [FileItem]) async -> [FileItem] {
-    let query = searchText
+    let query = isRecursiveSearchActive ? "" : searchText
+    let filter = isRecursiveSearchActive ? FileSearchFilter.all : searchFilter
     let requestedSort = sort
     let descending = sortDescending
     return await Task.detached(priority: .userInitiated) {
-      Self.arranged(items, query: query, sort: requestedSort, descending: descending)
+      Self.arranged(
+        items,
+        query: query,
+        filter: filter,
+        sort: requestedSort,
+        descending: descending
+      )
     }.value
   }
 
   nonisolated static func arranged(
-    _ items: [FileItem], query: String, sort: FileSort, descending: Bool
+    _ items: [FileItem],
+    query: String,
+    filter: FileSearchFilter,
+    sort: FileSort,
+    descending: Bool
   ) -> [FileItem] {
-    let normalizedQuery = query.folding(
+    let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).folding(
       options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
       locale: Locale(identifier: "ja_JP")
     )
@@ -983,7 +1072,9 @@ final class FilePaneModel: ObservableObject, Identifiable {
     directories.reserveCapacity(items.count / 4)
     files.reserveCapacity(items.count)
 
-    for item in items where normalizedQuery.isEmpty || item.normalizedName.contains(normalizedQuery)
+    for item in items
+    where (normalizedQuery.isEmpty || item.normalizedName.contains(normalizedQuery))
+      && (normalizedQuery.isEmpty || filter.matches(item))
     {
       if item.isDirectory {
         directories.append(item)
@@ -1033,8 +1124,10 @@ final class FilePaneModel: ObservableObject, Identifiable {
 
   private func scheduleRebuild(debounceNanoseconds: UInt64 = 0) {
     rebuildTask?.cancel()
-    let items = allItems
-    let query = searchText
+    let recursiveSearch = isRecursiveSearchActive
+    let items = recursiveSearch ? searchItems : allItems
+    let query = recursiveSearch ? "" : searchText
+    let filter = recursiveSearch ? FileSearchFilter.all : searchFilter
     let requestedSort = sort
     let descending = sortDescending
     let revision = contentRevision
@@ -1045,14 +1138,122 @@ final class FilePaneModel: ObservableObject, Identifiable {
       }
       guard !Task.isCancelled else { return }
       let displayed = await Task.detached(priority: .userInitiated) {
-        Self.arranged(items, query: query, sort: requestedSort, descending: descending)
+        Self.arranged(
+          items,
+          query: query,
+          filter: filter,
+          sort: requestedSort,
+          descending: descending
+        )
       }.value
       guard let self, !Task.isCancelled, self.contentRevision == revision,
-        self.searchText == query, self.sort == requestedSort,
+        self.isRecursiveSearchActive == recursiveSearch,
+        recursiveSearch || self.searchText == query,
+        recursiveSearch || self.searchFilter == filter, self.sort == requestedSort,
         self.sortDescending == descending
       else { return }
       self.applyDisplayedItems(displayed)
     }
+  }
+
+  private func scheduleSearch(debounceNanoseconds: UInt64 = 0) {
+    searchTask?.cancel()
+    rebuildTask?.cancel()
+
+    guard isSearchActive else {
+      isSearchLoading = false
+      updateLoadingState()
+      searchItems.removeAll(keepingCapacity: true)
+      searchRootURL = nil
+      searchDidReachLimit = false
+      rebuildItemLookup(using: allItems)
+      contentRevision &+= 1
+      scheduleRebuild()
+      return
+    }
+
+    guard isRecursiveSearchActive else {
+      isSearchLoading = false
+      updateLoadingState()
+      searchItems.removeAll(keepingCapacity: true)
+      searchRootURL = nil
+      searchDidReachLimit = false
+      rebuildItemLookup(using: allItems)
+      contentRevision &+= 1
+      scheduleRebuild(debounceNanoseconds: debounceNanoseconds)
+      return
+    }
+
+    let query = searchText
+    let directory = currentURL
+    let scope = searchScope
+    let showHidden = showHidden
+    let filter = searchFilter
+    let token = UUID()
+    searchToken = token
+    isSearchLoading = true
+    updateLoadingState()
+
+    searchTask = Task { [weak self] in
+      if debounceNanoseconds > 0 {
+        try? await Task.sleep(nanoseconds: debounceNanoseconds)
+      }
+      guard !Task.isCancelled else { return }
+
+      let result: Result<FileSearchResult, Error>
+      do {
+        result = .success(
+          try await FileSearchService.search(
+            query: query,
+            from: directory,
+            scope: scope,
+            showHidden: showHidden,
+            filter: filter
+          )
+        )
+      } catch {
+        result = .failure(error)
+      }
+
+      guard let self, !Task.isCancelled, self.searchToken == token,
+        NafiURL.sameLocation(self.currentURL, directory), self.searchText == query,
+        self.searchScope == scope, self.showHidden == showHidden, self.searchFilter == filter
+      else { return }
+
+      self.isSearchLoading = false
+      self.updateLoadingState()
+      switch result {
+      case .failure(let error):
+        if error is CancellationError { return }
+        self.searchItems = []
+        self.searchRootURL = nil
+        self.searchDidReachLimit = false
+        self.rebuildItemLookup(using: [])
+        self.applyDisplayedItems([])
+        self.selectionController.reset()
+        self.errorMessage = error.localizedDescription
+      case .success(let searchResult):
+        self.searchItems = searchResult.items
+        self.searchRootURL = searchResult.rootURL
+        self.searchDidReachLimit = searchResult.didReachLimit
+        self.rebuildItemLookup(using: searchResult.items)
+        self.contentRevision &+= 1
+        self.scheduleRebuild()
+        self.selectionController.retain(Set(searchResult.items.map(\.url)))
+        self.errorMessage = nil
+      }
+    }
+  }
+
+  private func rebuildItemLookup(using items: [FileItem]) {
+    var lookup: [URL: FileItem] = [:]
+    lookup.reserveCapacity(items.count)
+    for item in items { lookup[item.url] = item }
+    itemLookup = lookup
+  }
+
+  private func updateLoadingState() {
+    isLoading = isDirectoryLoading || isSearchLoading
   }
 
   private func scheduleReload() {

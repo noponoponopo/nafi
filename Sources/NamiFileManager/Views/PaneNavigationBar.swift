@@ -2,101 +2,87 @@ import SwiftUI
 
 struct PaneNavigationBar: View {
   @ObservedObject var model: FilePaneModel
-  @State private var isEditingPath = false
-  @State private var pathText = ""
 
   var body: some View {
     HStack(spacing: 8) {
-      pathControl
+      PanePathControl(model: model)
         .frame(maxWidth: .infinity)
 
-      HStack(spacing: 6) {
-        Image(systemName: "magnifyingglass")
-          .foregroundStyle(.secondary)
-        TextField("検索", text: $model.searchText)
-          .textFieldStyle(.plain)
-      }
-      .padding(.horizontal, 9)
-      .frame(minWidth: 130, idealWidth: 170, maxWidth: 220)
-      .frame(height: 28)
-      .background(
-        .quaternary.opacity(0.75), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+      PaneSearchControl(model: model)
 
-      Menu {
-        Picker("並び順", selection: $model.sort) {
-          ForEach(FileSort.allCases) { sort in Text(sort.label).tag(sort) }
-        }
-        Toggle("降順", isOn: $model.sortDescending)
-        Divider()
-        Toggle("隠しファイル", isOn: $model.showHidden)
-          .onChange(of: model.showHidden) { _, _ in model.load() }
-        if model.viewMode == .matrix {
-          Divider()
-          Slider(value: $model.iconSize, in: 42...112, step: 4) {
-            Text("アイコンサイズ")
-          }
-        }
-      } label: {
-        Image(systemName: "ellipsis.circle")
-          .frame(width: 26, height: 26)
-          .contentShape(Rectangle())
-      }
-      .menuStyle(.borderlessButton)
-      .fixedSize()
-      .help("表示オプション")
+      PaneDisplayOptionsMenu(model: model)
     }
     .controlSize(.small)
     .padding(.horizontal, 9)
     .frame(height: 39)
     .background(.bar)
   }
+}
 
-  @ViewBuilder
-  private var pathControl: some View {
-    if isEditingPath {
-      TextField("パス", text: $pathText)
-        .textFieldStyle(.plain)
-        .padding(.horizontal, 9)
-        .frame(height: 28)
-        .background(
-          .quaternary.opacity(0.75), in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-        )
-        .onSubmit { commitPath() }
-        .onExitCommand { isEditingPath = false }
-    } else {
-      Button {
-        pathText =
-          NafiURL.isRemote(model.currentURL)
-          ? (NafiURL.remotePath(in: model.currentURL) ?? "/")
-          : model.currentURL.path
-        isEditingPath = true
-      } label: {
-        HStack(spacing: 7) {
-          Image(systemName: NafiURL.isRemote(model.currentURL) ? "network" : "folder.fill")
-            .foregroundStyle(Color.accentColor)
-          Text(model.title)
-            .fontWeight(.medium)
-            .lineLimit(1)
-          Text(
-            NafiURL.isRemote(model.currentURL)
-              ? (NafiURL.remotePath(in: NafiURL.parent(of: model.currentURL)) ?? "/")
-              : model.currentURL.deletingLastPathComponent().path
-          )
+private struct PanePathControl: View {
+  @ObservedObject var model: FilePaneModel
+  @State private var isEditingPath = false
+  @State private var pathText = ""
+
+  var body: some View {
+    Group {
+      if isEditingPath {
+        pathEditor
+      } else {
+        pathButton
+      }
+    }
+  }
+
+  private var pathEditor: some View {
+    TextField("パス", text: $pathText)
+      .textFieldStyle(.plain)
+      .padding(.horizontal, 9)
+      .frame(height: 28)
+      .background(
+        .quaternary.opacity(0.75),
+        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+      )
+      .onSubmit { commitPath() }
+      .onExitCommand { isEditingPath = false }
+  }
+
+  private var pathButton: some View {
+    Button {
+      pathText =
+        NafiURL.isRemote(model.currentURL)
+        ? (NafiURL.remotePath(in: model.currentURL) ?? "/")
+        : model.currentURL.path
+      isEditingPath = true
+    } label: {
+      HStack(spacing: 7) {
+        Image(systemName: NafiURL.isRemote(model.currentURL) ? "network" : "folder.fill")
+          .foregroundStyle(Color.accentColor)
+        Text(model.title)
+          .fontWeight(.medium)
+          .lineLimit(1)
+        Text(parentPath)
           .foregroundStyle(.secondary)
           .lineLimit(1)
           .truncationMode(.head)
-          Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 9)
-        .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-        .background(
-          .quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-        )
-        .contentShape(Rectangle())
+        Spacer(minLength: 0)
       }
-      .buttonStyle(.plain)
-      .help("クリックしてパスを入力")
+      .padding(.horizontal, 9)
+      .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+      .background(
+        .quaternary.opacity(0.55),
+        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+      )
+      .contentShape(Rectangle())
     }
+    .buttonStyle(.plain)
+    .help("クリックしてパスを入力")
+  }
+
+  private var parentPath: String {
+    NafiURL.isRemote(model.currentURL)
+      ? (NafiURL.remotePath(in: NafiURL.parent(of: model.currentURL)) ?? "/")
+      : model.currentURL.deletingLastPathComponent().path
   }
 
   private func commitPath() {
@@ -116,5 +102,36 @@ struct PaneNavigationBar: View {
       model.errorMessage = "フォルダが見つかりません。"
     }
     isEditingPath = false
+  }
+}
+
+private struct PaneDisplayOptionsMenu: View {
+  @ObservedObject var model: FilePaneModel
+
+  var body: some View {
+    Menu {
+      Picker("並び順", selection: $model.sort) {
+        ForEach(FileSort.allCases) { sort in
+          Text(sort.label).tag(sort)
+        }
+      }
+      Toggle("降順", isOn: $model.sortDescending)
+      Divider()
+      Toggle("隠しファイル", isOn: $model.showHidden)
+        .onChange(of: model.showHidden) { _, _ in model.load() }
+      if model.viewMode == .matrix {
+        Divider()
+        Slider(value: $model.iconSize, in: 42...112, step: 4) {
+          Text("アイコンサイズ")
+        }
+      }
+    } label: {
+      Image(systemName: "ellipsis.circle")
+        .frame(width: 26, height: 26)
+        .contentShape(Rectangle())
+    }
+    .menuStyle(.borderlessButton)
+    .fixedSize()
+    .help("表示オプション")
   }
 }

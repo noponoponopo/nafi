@@ -97,7 +97,7 @@ struct NamiCommands: Commands {
       Button("ここでターミナルを開く") { appState.activeModel.openTerminalHere() }
         .disabled(!appState.activeModel.canOpenTerminalHere)
       Divider()
-      Button("接続先を追加") { appState.isServerSheetPresented = true }
+      Button("接続先を追加") { appState.presentServerEditor() }
         .keyboardShortcut("k", modifiers: [.command, .shift])
       Button("自動接続を実行") { Task { await appState.serverManager.connectAutoProfiles() } }
       Button("マウントを再検出") { appState.serverManager.refreshMountedVolumes() }

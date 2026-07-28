@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 extension Notification.Name {
-  static let namiFileSystemDidChange = Notification.Name("app.nami.file-system-did-change")
+  static let nafiFileSystemDidChange = Notification.Name("app.nafi.file-system-did-change")
 }
 
 private final class DirectorySnapshotBox: NSObject, @unchecked Sendable {
@@ -16,7 +16,7 @@ private final class DirectorySnapshotBox: NSObject, @unchecked Sendable {
 }
 
 private final class FileSystemRuntime: @unchecked Sendable {
-  private let notificationQueue = DispatchQueue(label: "app.nami.file-change-coalescer")
+  private let notificationQueue = DispatchQueue(label: "app.nafi.file-change-coalescer")
   private let snapshotCache: NSCache<NSString, DirectorySnapshotBox> = {
     let cache = NSCache<NSString, DirectorySnapshotBox>()
     cache.countLimit = 96
@@ -59,7 +59,7 @@ private final class FileSystemRuntime: @unchecked Sendable {
         pendingNotification = nil
         DispatchQueue.main.async {
           NotificationCenter.default.post(
-            name: .namiFileSystemDidChange,
+            name: .nafiFileSystemDidChange,
             object: nil,
             userInfo: ["directories": changedDirectories]
           )
@@ -130,6 +130,23 @@ struct FileSystemService {
     }
     runtime.store(result, for: cacheKey)
     return result
+  }
+
+  static func directorySize(at url: URL) -> Int64 {
+    guard
+      let enumerator = FileManager.default.enumerator(
+        at: url,
+        includingPropertiesForKeys: [.fileSizeKey],
+        options: [],
+        errorHandler: { _, _ in true }
+      )
+    else { return 0 }
+    var total: Int64 = 0
+    for case let fileURL as URL in enumerator {
+      let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+      total += Int64(size)
+    }
+    return total
   }
 
   static func createFile(named name: String, in directory: URL) throws -> URL {

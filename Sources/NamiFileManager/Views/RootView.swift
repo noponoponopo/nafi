@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
   @EnvironmentObject private var appState: AppState
+  @Environment(\.openWindow) private var openWindow
 
   var body: some View {
     RootViewContent(
@@ -9,6 +10,14 @@ struct RootView: View {
       workspace: appState.workspace,
       serverManager: appState.serverManager
     )
+    .task {
+      appState.openServerEditor = { profile in
+        openWindow(id: "server-editor", value: profile)
+      }
+      appState.openInspector = { url in
+        openWindow(id: "file-inspector", value: url)
+      }
+    }
   }
 }
 
@@ -22,7 +31,7 @@ private struct RootViewContent: View {
       SidebarView(
         serverManager: appState.serverManager, model: appState.sidebarModel, workspace: workspace
       )
-      .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 380)
+      .navigationSplitViewColumnWidth(min: 120, ideal: 240, max: 380)
     } detail: {
       WorkspaceView(workspace: workspace)
         .background(Color(nsColor: .textBackgroundColor))
@@ -30,19 +39,8 @@ private struct RootViewContent: View {
     .navigationSplitViewStyle(.balanced)
     .toolbarRole(.automatic)
     .toolbar { windowToolbar }
-    .sheet(isPresented: $appState.isServerSheetPresented) {
-      ServerEditorView(serverManager: appState.serverManager, profile: nil)
-    }
     .sheet(isPresented: $appState.isSidebarEditorPresented) {
       SidebarCustomizationView(model: appState.sidebarModel)
-    }
-    .sheet(isPresented: $appState.isInspectorPresented) {
-      if let item = workspace.activeModel.selectedItem {
-        FileInspectorView(item: item)
-      } else {
-        ContentUnavailableView("選択項目なし", systemImage: "info.circle")
-          .frame(width: 420, height: 280)
-      }
     }
     .sheet(item: $appState.quickEditRequest) { request in
       QuickEditView(url: request.url) { savedURL in
@@ -96,21 +94,14 @@ private struct RootViewContent: View {
 
     ToolbarItemGroup {
       Button {
-        appState.sidebarModel.add(url: workspace.activeModel.currentURL)
-      } label: {
-        Image(systemName: "sidebar.left")
-      }
-      .help("現在のフォルダをサイドバーへ追加")
-
-      Button {
-        appState.isServerSheetPresented = true
+        appState.presentServerEditor()
       } label: {
         Image(systemName: "network.badge.shield.half.filled")
       }
       .help("サーバーへ接続")
 
-      ActiveInspectorButton(session: workspace.activeSession) {
-        appState.isInspectorPresented = true
+      ActiveInspectorButton(session: workspace.activeSession) { item in
+        appState.presentInspector(for: item.url)
       }
     }
   }
@@ -187,7 +178,7 @@ private struct ActiveViewModePickerContent: View {
 
 private struct ActiveInspectorButton: View {
   @ObservedObject var session: PaneSession
-  let action: () -> Void
+  let action: (FileItem) -> Void
 
   var body: some View {
     ActiveInspectorButtonContent(model: session.activeModel, action: action)
@@ -198,19 +189,22 @@ private struct ActiveInspectorButton: View {
 private struct ActiveInspectorButtonContent: View {
   @ObservedObject var model: FilePaneModel
   @ObservedObject private var selection: FileSelectionController
-  let action: () -> Void
+  let action: (FileItem) -> Void
 
-  init(model: FilePaneModel, action: @escaping () -> Void) {
+  init(model: FilePaneModel, action: @escaping (FileItem) -> Void) {
     self.model = model
     _selection = ObservedObject(wrappedValue: model.selectionController)
     self.action = action
   }
 
   var body: some View {
-    Button(action: action) {
+    Button {
+      guard let item = model.selectedItem else { return }
+      action(item)
+    } label: {
       Image(systemName: "info.circle")
     }
-    .disabled(selection.count == 0)
+    .disabled(model.selectedItem == nil)
     .help("情報を見る")
   }
 }

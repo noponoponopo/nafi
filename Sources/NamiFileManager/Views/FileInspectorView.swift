@@ -1,11 +1,41 @@
 import AppKit
 import SwiftUI
 
+struct InspectorWindow: View {
+  let url: URL
+  @State private var item: FileItem?
+
+  var body: some View {
+    Group {
+      if let item {
+        FileInspectorView(item: item)
+      } else {
+        ProgressView("情報を読み込み中…")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
+    }
+    .task(id: url) {
+      await loadItem()
+    }
+  }
+
+  private func loadItem() async {
+    if NafiURL.isRemote(url) {
+      let parent = NafiURL.parent(of: url)
+      let items = (try? await UnifiedFileSystemService.contents(of: parent, showHidden: true)) ?? []
+      item = items.first(where: { $0.url == url })
+    } else {
+      item = FileItem.make(from: url)
+    }
+  }
+}
+
 struct FileInspectorView: View {
   @Environment(\.dismiss) private var dismiss
   let item: FileItem
 
   @State private var details = InspectorDetails.loading
+  @State private var folderSize: Int64?
   @State private var applications: [URL] = []
   @State private var selectedApplicationURL: URL?
   @State private var currentDefaultApplicationURL: URL?
@@ -36,7 +66,7 @@ struct FileInspectorView: View {
       Form {
         Section("一般") {
           LabeledContent("場所", value: locationLabel)
-          LabeledContent("サイズ", value: item.sizeLabel)
+          LabeledContent("サイズ", value: sizeLabel)
           LabeledContent("作成日", value: date(item.creationDate))
           LabeledContent("更新日", value: date(item.modificationDate))
           LabeledContent("隠し項目", value: item.isHidden ? "はい" : "いいえ")
@@ -123,6 +153,9 @@ struct FileInspectorView: View {
           LabeledContent("所有者", value: details.ownerName)
           LabeledContent("グループ", value: details.groupName)
           LabeledContent("アクセス権", value: details.permissionLabel)
+          if item.url.isFileURL, let posix = details.posixPermissions {
+            PermissionEditor(url: item.url, posixPermissions: posix & 0o777)
+          }
         }
       }
       .formStyle(.grouped)
@@ -151,6 +184,11 @@ struct FileInspectorView: View {
         item.url.isFileURL ? InspectorDetails.reading(item.url) : .unavailable
       }
       loadApplications()
+      if item.isDirectory && !item.isPackage && item.url.isFileURL {
+        folderSize = await Task.detached(priority: .userInitiated) {
+          FileSystemService.directorySize(at: item.url)
+        }.value
+      }
       details = await detailsTask.value
     }
     .confirmationDialog(
@@ -181,6 +219,16 @@ struct FileInspectorView: View {
       return NafiURL.remotePath(in: NafiURL.parent(of: item.url)) ?? "/"
     }
     return item.url.deletingLastPathComponent().path
+  }
+
+  private var sizeLabel: String {
+    if item.isDirectory && !item.isPackage {
+      if let folderSize {
+        return ByteCountFormatter.string(fromByteCount: folderSize, countStyle: .file)
+      }
+      return "計算中…"
+    }
+    return item.sizeLabel
   }
 
   private var canChangeAll: Bool {
@@ -275,21 +323,116 @@ struct FileInspectorView: View {
 private struct InspectorDetails: Sendable {
   let ownerName: String
   let groupName: String
-  let permissionLabel: String
+  let posixPermissions: Int?
 
-  static let loading = InspectorDetails(ownerName: "…", groupName: "…", permissionLabel: "…")
-  static let unavailable = InspectorDetails(ownerName: "—", groupName: "—", permissionLabel: "—")
+  var permissionLabel: String {
+    guard let posixPermissions else { return "—" }
+    return String(format: "%03o", posixPermissions & 0o777)
+  }
+
+  static let loading = InspectorDetails(ownerName: "…", groupName: "…", posixPermissions: nil)
+  static let unavailable = InspectorDetails(ownerName: "—", groupName: "—", posixPermissions: nil)
 
   static func reading(_ url: URL) -> InspectorDetails {
     let attributes = (try? FileManager.default.attributesOfItem(atPath: url.path)) ?? [:]
     let owner = attributes[.ownerAccountName] as? String ?? "—"
     let group = attributes[.groupOwnerAccountName] as? String ?? "—"
-    let permissions: String
-    if let number = attributes[.posixPermissions] as? NSNumber {
-      permissions = String(format: "%03o", number.intValue & 0o777)
-    } else {
-      permissions = "—"
+    let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+    return InspectorDetails(ownerName: owner, groupName: group, posixPermissions: permissions)
+  }
+}
+
+private struct PermissionTriad: Hashable {
+  var read: Bool
+  var write: Bool
+  var execute: Bool
+
+  init(octalDigit: Int) {
+    read = octalDigit & 0o4 != 0
+    write = octalDigit & 0o2 != 0
+    execute = octalDigit & 0o1 != 0
+  }
+
+  var octalDigit: Int {
+    (read ? 0o4 : 0) | (write ? 0o2 : 0) | (execute ? 0o1 : 0)
+  }
+}
+
+private struct PermissionEditor: View {
+  let url: URL
+  let posixPermissions: Int
+
+  @State private var owner = PermissionTriad(octalDigit: 0)
+  @State private var group = PermissionTriad(octalDigit: 0)
+  @State private var others = PermissionTriad(octalDigit: 0)
+  @State private var isApplying = false
+  @State private var status: String?
+  @State private var didLoad = false
+
+  var body: some View {
+    DisclosureGroup("権限を編集") {
+      VStack(alignment: .leading, spacing: 6) {
+        triadRow("所有者", $owner)
+        triadRow("グループ", $group)
+        triadRow("その他", $others)
+        HStack {
+          Button("適用") { apply() }
+            .disabled(isApplying || !hasChanges)
+          if isApplying {
+            ProgressView().controlSize(.small)
+          }
+          if let status {
+            Text(status).font(.caption).foregroundStyle(.secondary)
+          }
+        }
+        .padding(.top, 4)
+      }
+      .padding(.top, 4)
     }
-    return InspectorDetails(ownerName: owner, groupName: group, permissionLabel: permissions)
+    .font(.callout)
+    .onAppear {
+      guard !didLoad else { return }
+      owner = PermissionTriad(octalDigit: (posixPermissions >> 6) & 0o7)
+      group = PermissionTriad(octalDigit: (posixPermissions >> 3) & 0o7)
+      others = PermissionTriad(octalDigit: posixPermissions & 0o7)
+      didLoad = true
+    }
+  }
+
+  private var currentValue: Int {
+    (owner.octalDigit << 6) | (group.octalDigit << 3) | others.octalDigit
+  }
+
+  private var hasChanges: Bool {
+    currentValue != posixPermissions
+  }
+
+  private func triadRow(_ label: String, _ triad: Binding<PermissionTriad>) -> some View {
+    HStack {
+      Text(label).foregroundStyle(.secondary)
+      Spacer()
+      Toggle("読み", isOn: triad.read).toggleStyle(.checkbox)
+      Toggle("書き", isOn: triad.write).toggleStyle(.checkbox)
+      Toggle("実行", isOn: triad.execute).toggleStyle(.checkbox)
+    }
+  }
+
+  private func apply() {
+    isApplying = true
+    status = nil
+    let target = url
+    let value = currentValue
+    Task { @MainActor in
+      do {
+        try FileManager.default.setAttributes(
+          [.posixPermissions: NSNumber(value: value)],
+          ofItemAtPath: target.path
+        )
+        status = "権限を変更しました。"
+      } catch {
+        status = "変更できませんでした: \(error.localizedDescription)"
+      }
+      isApplying = false
+    }
   }
 }

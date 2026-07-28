@@ -361,9 +361,8 @@ private struct SelectionEventBridge: NSViewRepresentable {
     }
 
     private func contains(_ event: NSEvent) -> Bool {
-      guard let view, let window = view.window, event.window === window else { return false }
-      let point = view.convert(event.locationInWindow, from: nil)
-      return view.visibleRect.contains(point)
+      guard let view else { return false }
+      return WindowEventHitTesting.contains(event, in: view)
     }
 
     private func localPoint(for event: NSEvent) -> CGPoint? {

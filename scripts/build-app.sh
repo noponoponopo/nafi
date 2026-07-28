@@ -48,7 +48,27 @@ if [[ -f "$ICON_SRC" ]]; then
   fi
 fi
 
-codesign --force --deep --sign - "$APP"
+DEFAULT_LOCAL_IDENTITY="nafi Local Development"
+SIGNING_IDENTITY="${NAFI_CODESIGN_IDENTITY:-}"
+
+if [[ -z "$SIGNING_IDENTITY" && "${CI:-false}" != "true" ]]; then
+  if security find-identity -v -p codesigning 2>/dev/null \
+    | grep -Fq "\"$DEFAULT_LOCAL_IDENTITY\""; then
+    SIGNING_IDENTITY="$DEFAULT_LOCAL_IDENTITY"
+  fi
+fi
+
+if [[ -n "$SIGNING_IDENTITY" ]]; then
+  echo "Signing with local identity: $SIGNING_IDENTITY"
+  codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP"
+else
+  echo "Signing ad-hoc. For stable Keychain access, create '$DEFAULT_LOCAL_IDENTITY' or set NAFI_CODESIGN_IDENTITY." >&2
+  codesign --force --deep --sign - "$APP"
+fi
+
+codesign --verify --deep --strict "$APP"
 
 echo "Built: $APP"
-open -R "$APP"
+if [[ "${CI:-false}" != "true" ]]; then
+  open -R "$APP"
+fi

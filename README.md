@@ -28,7 +28,9 @@ nafi is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 ### Browsing
 
 - List, matrix, column, and gallery views sharing the same selection model
-- Search, name/date/size/kind sorting, hidden-file toggle, adjustable matrix icon size
+- Search in the current folder, the current hierarchy, or the whole volume/server
+- Search filtering for folders, selected content kinds, or arbitrary extension groups
+- Name/date/size/kind sorting, hidden-file toggle, adjustable matrix icon size
 - History navigation, parent navigation, direct path entry, and mounted-volume browsing
 - Quick Look panel and embedded gallery preview with a fixed, non-collapsing filmstrip
 - Quick Edit directly below Quick Look for text files up to 8 MB, preserving detected encoding and line endings with external-change conflict checks
@@ -76,7 +78,7 @@ Install Xcode 16 or newer and its command-line tools, then open `Package.swift` 
 ./scripts/build-app.sh
 ```
 
-The script builds `.build/nafi.app` and applies an ad-hoc signature for local use.
+The script builds `.build/nafi.app`. GitHub Actions and machines without a local identity use an ad-hoc signature. For stable Keychain access across local rebuilds, create the free self-signed `nafi Local Development` identity described in [`docs/LOCAL_SIGNING.md`](docs/LOCAL_SIGNING.md); no paid Apple account is required.
 
 To rebuild after replacing an earlier copy:
 

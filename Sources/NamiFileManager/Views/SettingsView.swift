@@ -126,15 +126,6 @@ private struct DefaultFileManagerSettingsView: View {
         }
 
         operationStatus
-
-        Text("ビルドフォルダから実行している場合は、安定して開けるように ~/Applications/nafi.app へコピーしてから登録します。")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-        Text(
-          "通常のフォルダは public.folder で設定します。public.directory は抽象的な親タイプのため、『ディレクトリ互換』は通常フォルダの関連付けを基準に表示します。"
-        )
-        .font(.caption)
-        .foregroundStyle(.secondary)
       }
 
       Section("外部からフォルダやファイルを開いたとき") {
@@ -143,17 +134,6 @@ private struct DefaultFileManagerSettingsView: View {
             Text(behavior.label).tag(behavior.rawValue)
           }
         }
-        Text("ファイルが渡された場合は親フォルダを開き、そのファイルを選択します。")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-      }
-
-      Section("macOSの制限") {
-        Text(
-          "フォルダやボリュームを開く既定アプリはnafiにできます。デスクトップ、DockのFinder、ゴミ箱、開く／保存ダイアログなど、FinderとOSが担当する機能は置き換えられません。"
-        )
-        .font(.caption)
-        .foregroundStyle(.secondary)
       }
     }
     .formStyle(.grouped)

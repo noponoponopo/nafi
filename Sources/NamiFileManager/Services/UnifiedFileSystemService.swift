@@ -396,7 +396,7 @@ struct UnifiedFileSystemService {
 
   private static func notifyChanges(in directories: [URL]) {
     NotificationCenter.default.post(
-      name: .namiFileSystemDidChange,
+      name: .nafiFileSystemDidChange,
       object: nil,
       userInfo: ["directories": directories.map(NafiURL.normalized)]
     )

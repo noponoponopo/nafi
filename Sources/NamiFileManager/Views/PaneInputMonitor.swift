@@ -141,6 +141,9 @@ struct PaneInputMonitor: NSViewRepresentable {
           case 126:
             self.moveSelection(-1)
             return nil
+          case 48 where event.modifierFlags.intersection([.command, .option, .control]).isEmpty:
+            self.moveSelection(event.modifierFlags.contains(.shift) ? -1 : 1)
+            return nil
           case 53:
             self.clearSelection()
             return nil
@@ -179,9 +182,8 @@ struct PaneInputMonitor: NSViewRepresentable {
     }
 
     private func contains(_ event: NSEvent) -> Bool {
-      guard let view, let window = view.window, event.window === window else { return false }
-      let point = view.convert(event.locationInWindow, from: nil)
-      return view.bounds.contains(point)
+      guard let view else { return false }
+      return WindowEventHitTesting.contains(event, in: view)
     }
 
     private func handleScroll(_ event: NSEvent) -> NSEvent? {

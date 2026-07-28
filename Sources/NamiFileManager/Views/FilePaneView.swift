@@ -5,11 +5,19 @@ import SwiftUI
 struct FilePaneView: View {
   @EnvironmentObject private var appState: AppState
   @ObservedObject var model: FilePaneModel
+  let splitDropTargetPaneID: UUID
   @State private var paneDropTargeted = false
 
   var body: some View {
     VStack(spacing: 0) {
       content
+        .overlay {
+          PaneSplitDropOverlay(
+            targetPaneID: splitDropTargetPaneID,
+            workspace: appState.workspace,
+            topInset: splitDropTopInset
+          )
+        }
       Divider()
       FilePaneStatusBar(model: model)
     }
@@ -83,18 +91,26 @@ struct FilePaneView: View {
     }
   }
 
+  private var splitDropTopInset: CGFloat {
+    model.isRecursiveSearchActive || model.viewMode == .list ? 29 : 0
+  }
+
   @ViewBuilder
   private var content: some View {
     ZStack {
-      switch model.viewMode {
-      case .list:
-        FileListView(model: model)
-      case .matrix:
-        FileMatrixView(model: model)
-      case .columns:
-        FileColumnBrowserView(model: model)
-      case .gallery:
-        FileGalleryView(model: model)
+      if model.isRecursiveSearchActive {
+        SearchResultsView(model: model)
+      } else {
+        switch model.viewMode {
+        case .list:
+          FileListView(model: model)
+        case .matrix:
+          FileMatrixView(model: model)
+        case .columns:
+          FileColumnBrowserView(model: model)
+        case .gallery:
+          FileGalleryView(model: model)
+        }
       }
 
       if model.displayedItems.isEmpty, !model.isLoading {
@@ -146,6 +162,14 @@ private struct FilePaneStatusBar: View {
   var body: some View {
     HStack(spacing: 6) {
       Text("\(model.displayedItems.count)項目")
+      if model.isSearchActive {
+        Text("·")
+        Text(model.searchDescription)
+        if model.searchDidReachLimit {
+          Text("·")
+          Label("上限 \(FileSearchService.resultLimit) 件", systemImage: "exclamationmark.triangle")
+        }
+      }
       if selection.count > 0 {
         Text("·")
         Text("\(selection.count)項目を選択")
@@ -369,7 +393,8 @@ private struct TreeListRow: View {
       .frame(maxWidth: .infinity, alignment: .leading)
 
       if showsDetails {
-        Text(row.item.modifiedLabel).frame(width: 132, alignment: .leading).foregroundStyle(.secondary)
+        Text(row.item.modifiedLabel).frame(width: 132, alignment: .leading).foregroundStyle(
+          .secondary)
         Text(row.item.sizeLabel).frame(width: 76, alignment: .trailing).foregroundStyle(.secondary)
           .monospacedDigit()
         Text(row.item.kindLabel).frame(width: 110, alignment: .leading).foregroundStyle(.secondary)
@@ -860,7 +885,7 @@ private struct ColumnItemRow: View {
   }
 }
 
-private struct FileFolderDropModifier: ViewModifier {
+struct FileFolderDropModifier: ViewModifier {
   @ObservedObject var model: FilePaneModel
   let destination: URL?
   let open: () -> Void
@@ -923,7 +948,7 @@ private struct FileFolderDropModifier: ViewModifier {
   }
 }
 
-private struct FileItemContextMenu: View {
+struct FileItemContextMenu: View {
   @EnvironmentObject private var appState: AppState
   let model: FilePaneModel
   let item: FileItem
@@ -1007,7 +1032,7 @@ private struct FileItemContextMenu: View {
     Divider()
     Button("情報を見る") {
       model.ensureSelected(item)
-      appState.isInspectorPresented = true
+      appState.presentInspector(for: item.url)
     }
     Button("パスをコピー") {
       model.ensureSelected(item)

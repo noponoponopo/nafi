@@ -7,9 +7,11 @@ struct PaneHostView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      PaneTabStripView(session: session, workspace: workspace)
+      if session.tabs.count > 1 {
+        PaneTabStripView(session: session, workspace: workspace)
+      }
       PaneNavigationBar(model: session.activeModel)
-      FilePaneView(model: session.activeModel)
+      FilePaneView(model: session.activeModel, splitDropTargetPaneID: session.id)
     }
     .background(Color(nsColor: .textBackgroundColor))
     .background(
@@ -26,7 +28,6 @@ struct PaneHostView: View {
         goForward: session.activeModel.goForward
       )
     )
-    .overlay { PaneSplitDropOverlay(targetPaneID: session.id, workspace: workspace) }
   }
 }
 
@@ -270,25 +271,25 @@ private struct PaneTabButton: View {
   }
 }
 
-private struct PaneSplitDropOverlay: View {
+struct PaneSplitDropOverlay: View {
   let targetPaneID: UUID
   @ObservedObject var workspace: WorkspaceModel
+  let topInset: CGFloat
 
   var body: some View {
     GeometryReader { proxy in
-      let chromeHeight: CGFloat = 74
-      let contentHeight = max(0, proxy.size.height - chromeHeight)
+      let contentHeight = max(0, proxy.size.height - topInset)
 
       ZStack {
         edgeZone(
           .leading,
-          frame: CGRect(x: 0, y: chromeHeight, width: 24, height: contentHeight)
+          frame: CGRect(x: 0, y: topInset, width: 24, height: contentHeight)
         )
         edgeZone(
           .trailing,
           frame: CGRect(
             x: proxy.size.width - 24,
-            y: chromeHeight,
+            y: topInset,
             width: 24,
             height: contentHeight
           )
@@ -297,16 +298,16 @@ private struct PaneSplitDropOverlay: View {
           .top,
           frame: CGRect(
             x: 24,
-            y: chromeHeight,
+            y: topInset,
             width: max(0, proxy.size.width - 48),
-            height: 24
+            height: min(24, contentHeight)
           )
         )
         edgeZone(
           .bottom,
           frame: CGRect(
             x: 24,
-            y: max(chromeHeight, proxy.size.height - 24),
+            y: max(topInset, proxy.size.height - 24),
             width: max(0, proxy.size.width - 48),
             height: min(24, contentHeight)
           )
@@ -322,7 +323,7 @@ private struct PaneSplitDropOverlay: View {
   }
 }
 
-private struct PaneEdgeDropZone: View {
+struct PaneEdgeDropZone: View {
   let edge: PaneDropEdge
   let targetPaneID: UUID
   @ObservedObject var workspace: WorkspaceModel

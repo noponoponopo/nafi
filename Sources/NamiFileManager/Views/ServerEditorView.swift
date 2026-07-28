@@ -11,7 +11,7 @@ struct ServerEditorView: View {
   @State private var connectAfterSave = false
   @State private var errorMessage: String?
 
-  init(serverManager: ServerManager, profile: ServerProfile?) {
+  init(serverManager: ServerManager, profile: ServerProfile? = nil) {
     _serverManager = ObservedObject(wrappedValue: serverManager)
     _draft = State(initialValue: profile ?? .blank)
   }
@@ -100,6 +100,7 @@ struct ServerEditorView: View {
         }
       }
       .formStyle(.grouped)
+      .frame(maxHeight: .infinity)
 
       Divider()
       HStack {
@@ -115,7 +116,7 @@ struct ServerEditorView: View {
       }
       .padding(16)
     }
-    .frame(width: 650, height: 840)
+    .frame(minWidth: 560, idealWidth: 620, minHeight: 480, idealHeight: 640)
     .onAppear {
       password = serverManager.password(for: draft)
       keyPassphrase = serverManager.keyPassphrase(for: draft)

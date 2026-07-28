@@ -4,12 +4,21 @@ import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
-  @Published var isServerSheetPresented = false
-  @Published var isInspectorPresented = false
   @Published var isSidebarEditorPresented = false
   @Published var quickEditRequest: QuickEditRequest?
   @Published var presentationErrorMessage: String?
   @Published var sidebarVisibility: NavigationSplitViewVisibility = .all
+
+  var openServerEditor: ((ServerProfile) -> Void)?
+  var openInspector: ((URL) -> Void)?
+
+  func presentServerEditor(profile: ServerProfile = .blank) {
+    openServerEditor?(profile)
+  }
+
+  func presentInspector(for url: URL) {
+    openInspector?(NafiURL.normalized(url))
+  }
 
   let workspace: WorkspaceModel
   let serverManager = ServerManager()
