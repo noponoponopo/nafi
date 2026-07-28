@@ -15,6 +15,7 @@ let package = Package(
       path: "Sources/NamiFileManager",
       linkerSettings: [
         .linkedFramework("AppKit"),
+        .linkedFramework("CoreServices"),
         .linkedFramework("QuickLook"),
         .linkedFramework("QuickLookUI"),
         .linkedFramework("Security"),

@@ -90,7 +90,7 @@ private struct DefaultFileManagerSettingsView: View {
           isEnabled: service.folderIsHandledByNafi
         )
         DefaultHandlerStatusRow(
-          title: "ディレクトリ",
+          title: "ディレクトリ互換",
           systemImage: "folder.fill",
           isEnabled: service.directoryIsHandledByNafi
         )
@@ -126,6 +126,15 @@ private struct DefaultFileManagerSettingsView: View {
         }
 
         operationStatus
+
+        Text("ビルドフォルダから実行している場合は、安定して開けるように ~/Applications/nafi.app へコピーしてから登録します。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Text(
+          "通常のフォルダは public.folder で設定します。public.directory は抽象的な親タイプのため、『ディレクトリ互換』は通常フォルダの関連付けを基準に表示します。"
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
       }
 
       Section("外部からフォルダやファイルを開いたとき") {
@@ -167,6 +176,10 @@ private struct DefaultFileManagerSettingsView: View {
       Label(message, systemImage: "checkmark.circle.fill")
         .font(.caption)
         .foregroundStyle(.secondary)
+    case .partial(let message):
+      Label(message, systemImage: "exclamationmark.circle.fill")
+        .font(.caption)
+        .foregroundStyle(.orange)
     case .failed(let message):
       Label(message, systemImage: "exclamationmark.triangle.fill")
         .font(.caption)
