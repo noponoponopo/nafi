@@ -4,18 +4,11 @@ import UniformTypeIdentifiers
 
 extension UTType {
   static let nafiFileCollection = UTType(exportedAs: "app.nafi.file-collection")
-  static let nafiPaneTab = UTType(exportedAs: "app.nafi.pane-tab")
   static let nafiSidebarFavorite = UTType(exportedAs: "app.nafi.sidebar-favorite")
 }
 
 struct FileDragPayload: Codable, Sendable {
   let urls: [URL]
-}
-
-struct PaneDragPayload: Codable, Sendable {
-  let sourcePaneID: UUID
-  let sourceTabID: UUID
-  let url: URL
 }
 
 struct SidebarFavoriteDragPayload: Codable, Sendable {
@@ -53,7 +46,6 @@ private final class LockedPayloadCollection<Element: Sendable>: @unchecked Senda
 
 enum DragPayloadProvider {
   static let fileDropTypes: [UTType] = [.nafiFileCollection, .fileURL]
-  static let tabDropTypes: [UTType] = [.nafiPaneTab, .nafiFileCollection, .fileURL]
   static let favoriteDropTypes: [UTType] = [
     .nafiSidebarFavorite, .nafiFileCollection, .fileURL,
   ]
@@ -75,10 +67,6 @@ enum DragPayloadProvider {
     return register(payload, contentType: .nafiFileCollection, on: provider)
   }
 
-  static func paneProvider(for payload: PaneDragPayload) -> NSItemProvider {
-    register(payload, contentType: .nafiPaneTab, on: NSItemProvider())
-  }
-
   static func sidebarFavoriteProvider(for favoriteID: UUID) -> NSItemProvider {
     register(
       SidebarFavoriteDragPayload(favoriteID: favoriteID),
@@ -91,12 +79,6 @@ enum DragPayloadProvider {
     providers.contains {
       $0.hasItemConformingToTypeIdentifier(UTType.nafiFileCollection.identifier)
         || $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-    }
-  }
-
-  static func containsPanePayload(in providers: [NSItemProvider]) -> Bool {
-    providers.contains {
-      $0.hasItemConformingToTypeIdentifier(UTType.nafiPaneTab.identifier)
     }
   }
 
@@ -153,15 +135,6 @@ enum DragPayloadProvider {
 
     group.notify(queue: .main) {
       completion(uniqueLocations(urls.values))
-    }
-  }
-
-  static func loadPanePayload(
-    from providers: [NSItemProvider],
-    completion: @escaping (PaneDragPayload?) -> Void
-  ) {
-    loadPayloads(PaneDragPayload.self, from: providers, contentType: .nafiPaneTab) {
-      completion($0.first)
     }
   }
 

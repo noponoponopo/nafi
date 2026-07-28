@@ -5,19 +5,11 @@ import SwiftUI
 struct FilePaneView: View {
   @EnvironmentObject private var appState: AppState
   @ObservedObject var model: FilePaneModel
-  let splitDropTargetPaneID: UUID
   @State private var paneDropTargeted = false
 
   var body: some View {
     VStack(spacing: 0) {
       content
-        .overlay {
-          PaneSplitDropOverlay(
-            targetPaneID: splitDropTargetPaneID,
-            workspace: appState.workspace,
-            topInset: splitDropTopInset
-          )
-        }
       Divider()
       FilePaneStatusBar(model: model)
     }
@@ -89,10 +81,6 @@ struct FilePaneView: View {
     } message: {
       Text(model.errorMessage ?? "")
     }
-  }
-
-  private var splitDropTopInset: CGFloat {
-    model.isRecursiveSearchActive || model.viewMode == .list ? 29 : 0
   }
 
   @ViewBuilder

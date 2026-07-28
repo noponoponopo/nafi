@@ -18,6 +18,9 @@ final class ServerManager: ObservableObject {
   private let keychain = KeychainStore()
   private let persistenceURL: URL
   private var remoteSessions: [UUID: any RemoteServerSession] = [:]
+  private var passwordCache: [UUID: String] = [:]
+  private var keyPassphraseCache: [UUID: String] = [:]
+  private var sessionTokenCache: [UUID: String] = [:]
 
   init() {
     persistenceURL = AppStoragePaths.file(named: "servers.json")
@@ -75,6 +78,9 @@ final class ServerManager: ObservableObject {
     try keychain.save(password: password, for: profile)
     try keychain.saveKeyPassphrase(keyPassphrase, for: profile)
     try keychain.saveSessionToken(sessionToken, for: profile)
+    passwordCache[profile.id] = password
+    keyPassphraseCache[profile.id] = keyPassphrase
+    sessionTokenCache[profile.id] = sessionToken
     try persistProfiles()
     Task { await RemoteFileSystemRegistry.shared.update(profile: profile) }
   }
@@ -85,21 +91,33 @@ final class ServerManager: ObservableObject {
     }
     profiles.removeAll { $0.id == profile.id }
     states[profile.id] = nil
+    passwordCache[profile.id] = nil
+    keyPassphraseCache[profile.id] = nil
+    sessionTokenCache[profile.id] = nil
     try? keychain.deleteSecrets(for: profile)
     try? persistProfiles()
     Task { await RemoteFileSystemRegistry.shared.unregister(profileID: profile.id) }
   }
 
   func password(for profile: ServerProfile) -> String {
-    (try? keychain.password(for: profile)) ?? ""
+    if let cached = passwordCache[profile.id] { return cached }
+    let value = (try? keychain.password(for: profile)) ?? ""
+    passwordCache[profile.id] = value
+    return value
   }
 
   func keyPassphrase(for profile: ServerProfile) -> String {
-    (try? keychain.keyPassphrase(for: profile)) ?? ""
+    if let cached = keyPassphraseCache[profile.id] { return cached }
+    let value = (try? keychain.keyPassphrase(for: profile)) ?? ""
+    keyPassphraseCache[profile.id] = value
+    return value
   }
 
   func sessionToken(for profile: ServerProfile) -> String {
-    (try? keychain.sessionToken(for: profile)) ?? ""
+    if let cached = sessionTokenCache[profile.id] { return cached }
+    let value = (try? keychain.sessionToken(for: profile)) ?? ""
+    sessionTokenCache[profile.id] = value
+    return value
   }
 
   private func connectProfileForFileSystem(_ profileID: UUID) async throws {

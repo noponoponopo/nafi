@@ -2,8 +2,8 @@ import SwiftUI
 
 struct SettingsView: View {
   @EnvironmentObject private var appState: AppState
-  @AppStorage("Nami.defaultShowHidden") private var defaultShowHidden = false
-  @AppStorage("Nami.defaultViewMode") private var defaultViewMode = FileViewMode.list.rawValue
+  @AppStorage("Nafi.defaultShowHidden") private var defaultShowHidden = false
+  @AppStorage("Nafi.defaultViewMode") private var defaultViewMode = FileViewMode.list.rawValue
   @AppStorage(ThumbnailPreferenceKey.localImages) private var localImageThumbnails = true
   @AppStorage(ThumbnailPreferenceKey.localVideos) private var localVideoThumbnails = true
   @AppStorage(ThumbnailPreferenceKey.remoteImages) private var remoteImageThumbnails = false
@@ -80,6 +80,10 @@ struct SettingsView: View {
       )
       Text("Finder自身や他のアプリが作成する .DS_Store までは抑止しません。")
         .foregroundStyle(.secondary)
+      Divider()
+      Label("接続用の秘密情報", systemImage: "key")
+        .font(.headline)
+      Text("サーバーのパスワード、秘密鍵のパスフレーズ、S3シークレットとセッショントークンはmacOS Keychainに保存します。")
       Spacer()
     }
     .padding(24)

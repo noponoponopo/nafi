@@ -1,18 +1,18 @@
 import SwiftUI
 
-struct NamiCommands: Commands {
+struct NafiCommands: Commands {
   @ObservedObject var appState: AppState
 
   var body: some Commands {
     CommandGroup(replacing: .newItem) {
-      Button("新規タブ") { appState.workspace.newTab() }
+      Button("新規ウインドウタブ") { appState.newNativeTab() }
         .keyboardShortcut("t", modifiers: .command)
       Button("新規ファイル") { appState.activeModel.requestNewFile() }
         .keyboardShortcut("n", modifiers: [.command, .option])
       Button("新規フォルダ") { appState.activeModel.requestNewFolder() }
         .keyboardShortcut("n", modifiers: [.command, .shift])
       Divider()
-      Button("タブを閉じる") { appState.workspace.closeActiveTab() }
+      Button("ウインドウタブを閉じる") { appState.closeActiveNativeTab() }
         .keyboardShortcut("w", modifiers: .command)
     }
 

@@ -47,9 +47,9 @@ final class WorkspaceModel: ObservableObject {
 
   init(initialURL: URL, showHidden: Bool, viewMode: FileViewMode) {
     let session = PaneSession(initialURL: initialURL, showHidden: showHidden, viewMode: viewMode)
-    self.sessions = [session.id: session]
-    self.root = .pane(session.id)
-    self.activePaneID = session.id
+    sessions = [session.id: session]
+    root = .pane(session.id)
+    activePaneID = session.id
   }
 
   var activeSession: PaneSession {
@@ -58,7 +58,7 @@ final class WorkspaceModel: ObservableObject {
 
   var activeModel: FilePaneModel { activeSession.activeModel }
   var paneCount: Int { sessions.count }
-  var allModels: [FilePaneModel] { sessions.values.flatMap(\.tabs) }
+  var allModels: [FilePaneModel] { sessions.values.map(\.activeModel) }
 
   func session(for id: UUID) -> PaneSession? { sessions[id] }
 
@@ -70,21 +70,6 @@ final class WorkspaceModel: ObservableObject {
   func loadAll() {
     for session in sessions.values {
       session.loadAll()
-    }
-  }
-
-  @discardableResult
-  func newTab(in paneID: UUID? = nil, at url: URL? = nil) -> FilePaneModel? {
-    let targetID = paneID ?? activePaneID
-    guard let session = sessions[targetID] else { return nil }
-    focus(targetID)
-    return session.newTab(at: url ?? session.activeModel.currentURL)
-  }
-
-  func closeActiveTab() {
-    let session = activeSession
-    if !session.closeTab(session.activeTabID), paneCount > 1 {
-      closePane(session.id)
     }
   }
 
@@ -101,41 +86,6 @@ final class WorkspaceModel: ObservableObject {
       viewMode: source.activeModel.viewMode
     )
     split(paneID: paneID, edge: edge, model: model)
-  }
-
-  func placeTabPayload(_ payload: PaneDragPayload, in paneID: UUID, before tabID: UUID? = nil) {
-    guard let target = sessions[paneID] else { return }
-    if payload.sourcePaneID == paneID {
-      if let tabID {
-        target.moveTab(payload.sourceTabID, before: tabID)
-      } else {
-        target.moveTabToEnd(payload.sourceTabID)
-      }
-      focus(paneID)
-      return
-    }
-
-    let model = movableModel(for: payload)
-    target.insertTab(model, before: tabID)
-    focus(paneID)
-  }
-
-  func splitTabPayload(_ payload: PaneDragPayload, targetPaneID: UUID, edge: PaneDropEdge) {
-    let model = movableModel(for: payload)
-    split(paneID: targetPaneID, edge: edge, model: model)
-  }
-
-  private func movableModel(for payload: PaneDragPayload) -> FilePaneModel {
-    guard let source = sessions[payload.sourcePaneID],
-      let original = source.tabs.first(where: { $0.id == payload.sourceTabID })
-    else {
-      return FilePaneModel(initialURL: payload.url)
-    }
-
-    if let detached = source.detachTab(payload.sourceTabID) {
-      return detached
-    }
-    return original.clone()
   }
 
   private func split(paneID: UUID, edge: PaneDropEdge, model: FilePaneModel) {

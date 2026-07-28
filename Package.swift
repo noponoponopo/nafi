@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-  name: "NamiFileManager",
+  name: "NafiFileManager",
   platforms: [
     .macOS(.v14)
   ],
   products: [
-    .executable(name: "nafi", targets: ["NamiFileManager"])
+    .executable(name: "nafi", targets: ["NafiFileManager"])
   ],
   dependencies: [
     .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.12.1"),
@@ -17,7 +17,7 @@ let package = Package(
   ],
   targets: [
     .executableTarget(
-      name: "NamiFileManager",
+      name: "NafiFileManager",
       dependencies: [
         .product(name: "Citadel", package: "Citadel"),
         .product(name: "Crypto", package: "swift-crypto"),
@@ -26,7 +26,7 @@ let package = Package(
         .product(name: "NIOTLS", package: "swift-nio"),
         .product(name: "NIOSSL", package: "swift-nio-ssl"),
       ],
-      path: "Sources/NamiFileManager",
+      path: "Sources/NafiFileManager",
       linkerSettings: [
         .linkedFramework("AppKit"),
         .linkedFramework("CoreServices"),

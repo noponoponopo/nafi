@@ -2,15 +2,17 @@
 
 ## State hierarchy
 
-`AppState` owns the `WorkspaceModel`, sidebar state, settings, and server manager. `WorkspaceModel` owns a recursive `PaneLayoutNode` tree and a dictionary of `PaneSession` objects. Every `PaneSession` owns one or more `FilePaneModel` tabs. A `FilePaneModel` owns navigation, display, selection, and file-operation state for exactly one tab.
+`AppState` owns app-wide services, settings, sidebar state, and a registry of open browser windows. The initial SwiftUI browser scene and every AppKit-created native tab each own a `BrowserWindowState`, and each browser state owns one `WorkspaceModel`. AppKit groups those windows with `NSWindow.addTabbedWindow`, so every visible tab is a real macOS window tab with an independent workspace. The key/selected `NSWindow` updates `AppState.activeWindowID`, which keeps commands and sidebar actions pointed at the selected native tab.
 
-This hierarchy prevents one pane's navigation or selection from leaking into another pane while allowing the native toolbar to observe the active pane and active tab.
+`WorkspaceModel` owns a recursive `PaneLayoutNode` tree and a dictionary of `PaneSession` objects. Every `PaneSession` owns exactly one `FilePaneModel`; app-drawn pane tabs no longer exist. Split panes remain independent, while browser-level tab creation, selection, reordering, detaching, and closing are handled by the native window tab group.
 
-## Pane and tab drag flow
+`ActiveWindowChromeCoordinator` connects browser content to its `NSWindow`, assigns a shared tabbing identifier, registers key-window changes, and mirrors the active pane title and represented URL into the window. Because each native tab is its own `NSWindow`, selecting a tab also selects the correct workspace and title automatically.
 
-Tabs use a typed `Transferable` payload. Dropping on a tab strip inserts or reorders the tab. Dropping on a 24-point edge target asks `WorkspaceModel` to replace the target leaf with a new split node. A source pane with multiple tabs transfers the model; a source pane with only one tab clones it so the pane tree never becomes invalid.
+## Native window tab flow
 
-Files use a separate typed payload. Drops resolve to the target folder represented by a pane or directory row. Move is the default; holding Option at the destination requests a copy. Folder, tab, pane-edge, and sidebar targets expose visible destination indicators, and hover targets activate after a short delay.
+Command-T, the plus button in the macOS tab bar, Finder/Launch Services opens configured for a new tab, and every “新しいタブで開く” command create a unique `NativeTabRequest`. `AppState` creates a hidden AppKit `NSWindow` with shared SwiftUI browser content and adds it directly to the requesting window’s native tab group before it is shown. No SwiftUI `openWindow` call or provisional visible window is involved. Closing with Command-W closes the selected `NSWindow` tab, while macOS supplies native tab reordering and “Move Tab to New Window” behavior.
+
+Files opened from Finder create a workspace rooted at the containing folder and schedule the file for selection after the first load. Opening multiple Finder items places each additional item in its own native tab, preventing one item from overwriting another.
 
 ## Selection and rendering
 
@@ -20,9 +22,9 @@ The list view presents an expandable tree: a folder row's disclosure triangle fe
 
 ## File-system execution and synchronization
 
-Directory enumeration, filtering, sorting, metadata formatting, inspector reads, and mutating file operations run outside the main actor. Stale loads are cancellable. `UnifiedFileSystemService` receives ordinary URLs and routes each operation to the local `FileSystemService` or to a live `RemoteServerSession`. Local roots use `file:` URLs. Direct SFTP/FTP/FTPS/S3 roots use internal `nafi-remote://<profile-id>/<path>` URLs; that URL is an address inside nafi, not a mounted Finder path. The UI does not branch into a second browser: every root is loaded into the same `FilePaneModel`, selection controller, views, tab strip, sidebar destinations, context menus, and transfer-conflict flow.
+Directory enumeration, filtering, sorting, metadata formatting, inspector reads, and mutating file operations run outside the main actor. Stale loads are cancellable. `UnifiedFileSystemService` receives ordinary URLs and routes each operation to the local `FileSystemService` or to a live `RemoteServerSession`. Local roots use `file:` URLs. Direct SFTP/FTP/FTPS/S3 roots use internal `nafi-remote://<profile-id>/<path>` URLs; that URL is an address inside nafi, not a mounted Finder path. The UI does not branch into a second browser: every root is loaded into the same `FilePaneModel`, selection controller, views, native window tabs, sidebar destinations, context menus, and transfer-conflict flow.
 
-Cross-root transfers are selected from the source and destination URL kinds. Local-to-local operations retain native file-system behavior. A same-session remote move uses the server rename operation. Other local/remote or remote/remote combinations stream through a private staging location before the source is removed for a move. Notifications name both affected roots so every matching tab or pane reloads. This keeps local and server roots coherent without storing nafi metadata in the browsed directories.
+Cross-root transfers are selected from the source and destination URL kinds. Local-to-local operations retain native file-system behavior. A same-session remote move uses the server rename operation. Other local/remote or remote/remote combinations stream through a private staging location before the source is removed for a move. Notifications name both affected roots so every matching native window tab or pane reloads. This keeps local and server roots coherent without storing nafi metadata in the browsed directories.
 
 The gallery uses a dedicated fixed-height filmstrip outside the Quick Look preview's layout region. Quick Look therefore cannot compress or scroll the filmstrip away.
 

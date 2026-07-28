@@ -9,7 +9,7 @@
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>app.nami.filemanager</string>
+	<string>app.nafi.filemanager</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.8.2</string>
+	<string>0.8.8</string>
 	<key>CFBundleVersion</key>
-	<string>24</string>
+	<string>30</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHumanReadableCopyright</key>
@@ -84,7 +84,7 @@
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
-			<string>Files (Reveal in nafi)</string>
+			<string>All Files (Reveal in nafi)</string>
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 			<key>CFBundleTypeExtensions</key>
@@ -95,8 +95,23 @@
 			<string>Alternate</string>
 			<key>LSItemContentTypes</key>
 			<array>
-				<string>public.data</string>
+				<string>public.item</string>
 				<string>public.content</string>
+				<string>public.data</string>
+				<string>public.text</string>
+				<string>public.source-code</string>
+				<string>public.html</string>
+				<string>public.xml</string>
+				<string>public.json</string>
+				<string>public.image</string>
+				<string>public.audio</string>
+				<string>public.movie</string>
+				<string>public.archive</string>
+				<string>com.adobe.pdf</string>
+			</array>
+			<key>CFBundleTypeOSTypes</key>
+			<array>
+				<string>****</string>
 			</array>
 		</dict>
 	</array>
@@ -134,16 +149,6 @@
 		</dict>
 		<dict>
 			<key>UTTypeIdentifier</key>
-			<string>app.nafi.pane-tab</string>
-			<key>UTTypeDescription</key>
-			<string>nafi Pane Tab</string>
-			<key>UTTypeConformsTo</key>
-			<array>
-				<string>public.data</string>
-			</array>
-		</dict>
-		<dict>
-			<key>UTTypeIdentifier</key>
 			<string>app.nafi.sidebar-favorite</string>
 			<key>UTTypeDescription</key>
 			<string>nafi Sidebar Favorite</string>
@@ -153,5 +158,7 @@
 			</array>
 		</dict>
 	</array>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 </dict>
 </plist>

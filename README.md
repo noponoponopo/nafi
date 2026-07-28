@@ -9,20 +9,20 @@ nafi is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 - Single-pane startup; splitting is optional rather than assumed
 - Recursive pane tree supporting two, three, four, or more panes
 - Horizontal and vertical splitting with draggable native dividers
-- Tabs in every pane, tab reordering, cross-pane tab movement, and edge-drop splitting
+- Native macOS window tabs with system tab reordering, detaching, closing, and the standard tab-bar plus button
 - Mouse-down selection with no click-completion delay; right-click selects its target before the menu opens
 - Normal click, Command-toggle, Shift range, Command-Shift additive range, Select All, arrow-key, and Escape behavior
 - Finder-style drag-marquee selection in list, matrix, column, and gallery views; Command-drag toggles and Shift-drag adds
 - Per-row selection state: clicking invalidates only the rows whose selection changed, not the whole pane
 - O(1) selection/range anchors through a displayed-item index instead of repeated full-array scans
 - Background directory enumeration, filtering, sorting, metadata formatting, file operations, and inspector reads
-- The same pane, tab, sidebar, selection, and file-operation model for local and remote roots
+- The same native window-tab, pane, sidebar, selection, and file-operation model for local and remote roots
 - Content-type icon caching, debounced search, coalesced file-change notifications, and cancellable stale loads
 - Trackpad/Magic Mouse horizontal swipe navigation for Back and Forward
-- Drag files to folders, tabs, sidebar destinations, or other panes to move; hold Option while dropping to copy
-- Clear insertion markers for tab/sidebar reordering and delayed hover-open for folders, tabs, and sidebar destinations
+- Drag files to folders, sidebar destinations, or other panes to move; hold Option while dropping to copy
+- Clear insertion markers for sidebar reordering and delayed hover-open for folders and sidebar destinations
 - Return/Enter starts rename for the selected item
-- Cross-tab and cross-pane refresh notifications after local or remote file operations
+- Cross-window-tab and cross-pane refresh notifications after local or remote file operations
 - Unified system toolbar, adaptive materials, current macOS spacing, rounded selection surfaces, and reduced per-pane chrome
 
 ### Browsing
@@ -52,18 +52,21 @@ nafi is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 - Custom section visibility, favorite rename/remove/reorder, and current-folder insertion
 - SMB, WebDAV, NFS, AFP, FTP/FTPS, SFTP, and S3-compatible connection profiles
 - SMB, WebDAV, NFS, and AFP connections initiated directly through macOS NetFS without launching Finder or another GUI app
-- SFTP, FTP, FTPS, AWS S3, Cloudflare R2, MinIO, Ceph, and other Signature V4-compatible object stores appear as ordinary roots in the same panes and tabs as local folders; there is no separate server browser
+- SFTP, FTP, FTPS, AWS S3, Cloudflare R2, MinIO, Ceph, and other Signature V4-compatible object stores appear as ordinary roots in the same native window tabs and split panes as local folders; there is no separate server browser
 - Local-to-server, server-to-local, and server-to-server drag, copy, move, rename, create-folder, delete, duplicate, ZIP, Quick Look, and Quick Edit flows use the same commands and collision dialog, including S3/R2 buckets and prefixes
-- Remote roots can be mixed with local tabs in any pane and saved in Favorites
+- Remote and local roots can be mixed across native window tabs and split panes and saved in Favorites
 - “Open Terminal Here” works for local folders and SFTP roots; SFTP opens SSH at the current remote path
 - Launch-time auto-connect, reconnect, disconnect, and mounted-volume discovery
 - Passwords, SFTP key passphrases, S3 secret keys, and temporary S3 session tokens stored separately in macOS Keychain
 
 ### macOS integration
 
-- Registers folders, directories, volumes, and mount points as supported document types
+- Registers folders, directories, volumes, mount points, and ordinary files as supported document types
 - Settings control to request nafi as the default application for those types and to restore Finder
-- Opens folders received from Finder, Services, other apps, or Launch Services in the current tab or a new tab
+- Opens folders received from Finder, Services, other apps, or Launch Services in the current native window tab or a new native window tab
+- Accepts arbitrary files (including HTML, source, text, images, media, archives, and PDF) and reveals them in their containing folder
+- Uses only the native macOS window tab bar; Command-T, its plus button, tab selection, tab closing, reordering, and detaching all operate on real NSWindow tabs whose titles follow the active folder
+- Finder open events are attached directly to the currently visible native tab group without creating or repositioning a temporary two-tab window
 - Finder Services entry for opening selected files and folders in nafi
 
 ### Metadata policy
@@ -78,7 +81,7 @@ Install Xcode 16 or newer and its command-line tools, then open `Package.swift` 
 ./scripts/build-app.sh
 ```
 
-The script builds `.build/nafi.app`. GitHub Actions and machines without a local identity use an ad-hoc signature. For stable Keychain access across local rebuilds, create the free self-signed `nafi Local Development` identity described in [`docs/LOCAL_SIGNING.md`](docs/LOCAL_SIGNING.md); no paid Apple account is required.
+The script builds `.build/nafi.app`.
 
 To rebuild after replacing an earlier copy:
 
@@ -91,11 +94,11 @@ rm -rf .build
 
 - Server connections no longer launch Finder, Cyberduck, or another external GUI application.
 - SMB, WebDAV, NFS, and AFP use the macOS NetFS framework from inside nafi and appear as mounted folders in ordinary panes.
-- SFTP, FTP, FTPS, and S3-compatible storage are represented as internal remote roots and are rendered by the ordinary `FilePaneModel`, so local and remote tabs can be mixed freely. They do not require macFUSE, sshfs, Cyberduck, Finder, or another GUI client application.
+- SFTP, FTP, FTPS, and S3-compatible storage are represented as internal remote roots and are rendered by the ordinary `FilePaneModel`, so local and remote roots can be mixed freely across native window tabs and split panes. They do not require macFUSE, sshfs, Cyberduck, Finder, or another GUI client application.
 - SFTP password authentication uses the in-process SSH/SFTP client. Private-key authentication uses the macOS OpenSSH engine without opening another application, supporting the key formats and algorithms accepted by the installed macOS OpenSSH, including RSA, Ed25519, ECDSA, FIDO/security-key, OpenSSH, PEM, and PKCS#8 keys with or without a passphrase. Key passphrases are stored in Keychain; the key file itself remains at the selected path.
 - FTP supports plain FTP, explicit FTPS (`AUTH TLS`), and implicit FTPS. FTPS encrypts both control and passive data connections and validates the server certificate by default.
 - S3-compatible roots support AWS Signature Version 4, arbitrary HTTPS endpoints, AWS S3 virtual-host addressing, R2/MinIO-style path addressing, access-key/secret authentication, temporary session tokens, anonymous public buckets, prefix navigation, server-side copy, and multipart uploads. Cloudflare R2 uses its account endpoint and the `auto` region.
-- Copy, move, drag-and-drop, collision handling, tabs, panes, Favorites, Quick Look, and text Quick Edit operate across local and remote roots. Cross-protocol transfers are staged internally when the two endpoints cannot rename directly.
+- Copy, move, drag-and-drop, collision handling, native window tabs, split panes, Favorites, Quick Look, and text Quick Edit operate across local and remote roots. Cross-protocol transfers are staged internally when the two endpoints cannot rename directly.
 - “Open Terminal Here” creates a temporary `.command` file and asks macOS to open it with the application associated with that type. For SFTP, the command starts `ssh` and changes to the displayed remote directory; FTP/FTPS do not expose an interactive shell.
 - Private-key SFTP stores host keys in `~/Library/Application Support/nafi/known_hosts`, accepts a previously unseen host once, and rejects changed host keys. Password-based SFTP still needs the same host-key management migration.
 - Protocol availability and authentication behavior still depend on the installed macOS version and server configuration.

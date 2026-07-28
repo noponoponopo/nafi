@@ -118,9 +118,24 @@ struct ServerEditorView: View {
     }
     .frame(minWidth: 560, idealWidth: 620, minHeight: 480, idealHeight: 640)
     .onAppear {
-      password = serverManager.password(for: draft)
-      keyPassphrase = serverManager.keyPassphrase(for: draft)
-      sessionToken = serverManager.sessionToken(for: draft)
+      // Read only the secrets this connection type actually uses. This avoids
+      // unnecessary Keychain access prompts when editing a profile.
+      switch draft.kind {
+      case .sftp:
+        switch draft.sftpAuthentication {
+        case .password:
+          password = serverManager.password(for: draft)
+        case .privateKey:
+          keyPassphrase = serverManager.keyPassphrase(for: draft)
+        }
+      case .s3:
+        if !draft.s3Anonymous {
+          password = serverManager.password(for: draft)
+          sessionToken = serverManager.sessionToken(for: draft)
+        }
+      case .ftp, .smb, .webdav, .nfs, .afp:
+        password = serverManager.password(for: draft)
+      }
     }
     .alert(
       "保存できません",

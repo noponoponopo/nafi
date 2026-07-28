@@ -15,31 +15,32 @@ The SwiftUI surface is organized as a component tree rather than as feature-size
 
 ```text
 RootView
-└─ RootViewContent
-   ├─ SidebarView
-   │  ├─ SidebarFavoritesSection
-   │  │  ├─ SidebarSectionHeader
-   │  │  └─ SidebarDestinationRow
-   │  │     └─ SidebarReorderEndDropOverlay
-   │  ├─ SidebarICloudSection
-   │  ├─ SidebarVolumesSection
-   │  ├─ SidebarServersSection
-   │  │  └─ ServerSidebarRow
-   │  └─ SidebarFooter
-    └─ WorkspaceView
-       └─ PaneHostView
-          └─ FilePaneView
-             ├─ PaneSplitDropOverlay
-             ├─ PaneNavigationBar
-             │  ├─ PanePathControl
-             │  ├─ PaneSearchControl
-             │  │  └─ FileSearchOptionsPopover
-             │  └─ PaneDisplayOptionsMenu
-             ├─ SearchResultsView (recursive/global search)
-             │  ├─ SearchResultsHeader
-             │  └─ SearchResultRow
-             ├─ FileListView / FileMatrixView / FileColumnBrowserView / FileGalleryView
-             └─ FilePaneStatusBar
+└─ BrowserWindowHost (one workspace per native NSWindow tab)
+   └─ RootViewContent
+      ├─ ActiveWindowChromeCoordinator (native tab registration / title / represented URL)
+      ├─ SidebarView
+      │  ├─ SidebarFavoritesSection
+      │  │  ├─ SidebarSectionHeader
+      │  │  └─ SidebarDestinationRow
+      │  │     └─ SidebarReorderEndDropOverlay
+      │  ├─ SidebarICloudSection
+      │  ├─ SidebarVolumesSection
+      │  ├─ SidebarServersSection
+      │  │  └─ ServerSidebarRow
+      │  └─ SidebarFooter
+      └─ WorkspaceView
+         └─ PaneHostView
+            ├─ PaneNavigationBar
+            │  ├─ PanePathControl
+            │  ├─ PaneSearchControl
+            │  │  └─ FileSearchOptionsPopover
+            │  └─ PaneDisplayOptionsMenu
+            └─ FilePaneView
+               ├─ SearchResultsView (recursive/global search)
+               │  ├─ SearchResultsHeader
+               │  └─ SearchResultRow
+               ├─ FileListView / FileMatrixView / FileColumnBrowserView / FileGalleryView
+               └─ FilePaneStatusBar
 ```
 
 ## Search data flow

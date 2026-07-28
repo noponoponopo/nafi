@@ -52,21 +52,36 @@ DEFAULT_LOCAL_IDENTITY="nafi Local Development"
 SIGNING_IDENTITY="${NAFI_CODESIGN_IDENTITY:-}"
 
 if [[ -z "$SIGNING_IDENTITY" && "${CI:-false}" != "true" ]]; then
-  if security find-identity -v -p codesigning 2>/dev/null \
-    | grep -Fq "\"$DEFAULT_LOCAL_IDENTITY\""; then
+  AVAILABLE_IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+  if print -r -- "$AVAILABLE_IDENTITIES" | grep -Fq "\"$DEFAULT_LOCAL_IDENTITY\""; then
     SIGNING_IDENTITY="$DEFAULT_LOCAL_IDENTITY"
+  else
+    # Reuse an existing development identity when Xcode has installed one.
+    SIGNING_IDENTITY="$(
+      print -r -- "$AVAILABLE_IDENTITIES" \
+        | sed -nE 's/^[[:space:]]*[0-9]+\) [0-9A-F]+ "((Apple Development|Developer ID Application):[^"]+)".*/\1/p' \
+        | head -n 1
+    )"
   fi
 fi
 
 if [[ -n "$SIGNING_IDENTITY" ]]; then
-  echo "Signing with local identity: $SIGNING_IDENTITY"
   codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP"
 else
-  echo "Signing ad-hoc. For stable Keychain access, create '$DEFAULT_LOCAL_IDENTITY' or set NAFI_CODESIGN_IDENTITY." >&2
   codesign --force --deep --sign - "$APP"
 fi
 
 codesign --verify --deep --strict "$APP"
+
+# Force Launch Services to refresh nafi's document-type declarations. This is
+# especially important for local builds in .build, which Finder may not scan on
+# its own after Info.plist changes.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [[ -x "$LSREGISTER" ]]; then
+  if ! "$LSREGISTER" -f "$APP" >/dev/null 2>&1; then
+    echo "warning: Launch Services registration failed; move nafi.app to Applications and open it once." >&2
+  fi
+fi
 
 echo "Built: $APP"
 if [[ "${CI:-false}" != "true" ]]; then

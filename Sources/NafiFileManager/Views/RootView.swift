@@ -1,28 +1,58 @@
 import SwiftUI
 
 struct RootView: View {
+  let request: NativeTabRequest?
   @EnvironmentObject private var appState: AppState
+
+  var body: some View {
+    BrowserWindowHost(appState: appState, request: request)
+  }
+}
+
+private struct BrowserWindowHost: View {
+  @ObservedObject var appState: AppState
+  @StateObject private var windowState: BrowserWindowState
   @Environment(\.openWindow) private var openWindow
+
+  init(appState: AppState, request: NativeTabRequest?) {
+    self.appState = appState
+    _windowState = StateObject(wrappedValue: BrowserWindowState(request: request))
+  }
+
+  var body: some View {
+    BrowserWindowView(appState: appState, windowState: windowState)
+      .task {
+        appState.openServerEditor = { profile in
+          openWindow(id: "server-editor", value: profile)
+        }
+        appState.openInspector = { url in
+          openWindow(id: "file-inspector", value: url)
+        }
+      }
+  }
+}
+
+/// Browser content shared by the initial SwiftUI scene and AppKit-created
+/// native tabs. AppKit-created tabs do not call `openWindow`, which prevents a
+/// Finder open from first creating a separate visible SwiftUI window.
+struct BrowserWindowView: View {
+  @ObservedObject var appState: AppState
+  @ObservedObject var windowState: BrowserWindowState
 
   var body: some View {
     RootViewContent(
       appState: appState,
-      workspace: appState.workspace,
+      windowState: windowState,
+      workspace: windowState.workspace,
       serverManager: appState.serverManager
     )
-    .task {
-      appState.openServerEditor = { profile in
-        openWindow(id: "server-editor", value: profile)
-      }
-      appState.openInspector = { url in
-        openWindow(id: "file-inspector", value: url)
-      }
-    }
+    .task { windowState.start() }
   }
 }
 
 private struct RootViewContent: View {
   @ObservedObject var appState: AppState
+  @ObservedObject var windowState: BrowserWindowState
   @ObservedObject var workspace: WorkspaceModel
   @ObservedObject var serverManager: ServerManager
 
@@ -37,6 +67,9 @@ private struct RootViewContent: View {
         .background(Color(nsColor: .textBackgroundColor))
     }
     .navigationSplitViewStyle(.balanced)
+    .background(
+      ActiveWindowChromeCoordinator(appState: appState, windowState: windowState)
+    )
     .toolbarRole(.automatic)
     .toolbar { windowToolbar }
     .sheet(isPresented: $appState.isSidebarEditorPresented) {
@@ -67,13 +100,6 @@ private struct RootViewContent: View {
     }
 
     ToolbarItemGroup {
-      Button {
-        workspace.newTab()
-      } label: {
-        Image(systemName: "plus.rectangle.on.rectangle")
-      }
-      .help("新規タブ")
-
       Menu {
         Button("左右に追加") { workspace.splitActive(axis: .horizontal) }
         Button("上下に追加") { workspace.splitActive(axis: .vertical) }

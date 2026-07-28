@@ -84,8 +84,8 @@ private struct RequestIdentity: Hashable {
 }
 
 enum ThumbnailPreferenceKey {
-  static let localImages = "Nami.thumbnails.localImages"
-  static let localVideos = "Nami.thumbnails.localVideos"
-  static let remoteImages = "Nami.thumbnails.remoteImages"
-  static let remoteVideos = "Nami.thumbnails.remoteVideos"
+  static let localImages = "Nafi.thumbnails.localImages"
+  static let localVideos = "Nafi.thumbnails.localVideos"
+  static let remoteImages = "Nafi.thumbnails.remoteImages"
+  static let remoteVideos = "Nafi.thumbnails.remoteVideos"
 }

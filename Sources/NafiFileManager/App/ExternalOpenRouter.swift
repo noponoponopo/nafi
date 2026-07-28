@@ -56,15 +56,45 @@ final class NafiServiceProvider: NSObject {
 final class NafiAppDelegate: NSObject, NSApplicationDelegate {
   private let serviceProvider = NafiServiceProvider()
 
+  func applicationWillFinishLaunching(_ notification: Notification) {
+    // The macOS window tab bar is nafi's only tab UI. nafi groups windows
+    // explicitly so a Finder open never creates a second, temporary tab group.
+    NSWindow.allowsAutomaticWindowTabbing = false
+  }
+
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApplication.shared.servicesProvider = serviceProvider
     NSUpdateDynamicServices()
+
+    // Finder can launch the app with an external file event before SwiftUI
+    // creates the browser scene. Use the same native-window path as new tabs
+    // only when no browser scene appeared on its own.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+      guard
+        !NSApplication.shared.windows.contains(where: {
+          $0.title == "nafi" || $0.tabbingIdentifier == "app.nafi.filemanager.browser"
+        })
+      else { return }
+      NativeTabCommandRouter.shared.submit()
+    }
   }
 
   func application(_ application: NSApplication, open urls: [URL]) {
     Task { @MainActor in
       ExternalOpenRouter.shared.submit(urls)
       application.activate(ignoringOtherApps: true)
+    }
+  }
+
+  func application(_ application: NSApplication, openFiles filenames: [String]) {
+    self.application(application, open: filenames.map { URL(fileURLWithPath: $0) })
+    application.reply(toOpenOrPrint: .success)
+  }
+
+  /// Called by the + button in the native macOS tab bar and by Window > New Tab.
+  @IBAction func newWindowForTab(_ sender: Any?) {
+    Task { @MainActor in
+      NativeTabCommandRouter.shared.submit()
     }
   }
 
@@ -81,8 +111,8 @@ enum ExternalOpenBehavior: String, CaseIterable, Identifiable {
 
   var label: String {
     switch self {
-    case .currentTab: "現在のタブで開く"
-    case .newTab: "新しいタブで開く"
+    case .currentTab: "現在のウインドウタブで開く"
+    case .newTab: "新しいウインドウタブで開く"
     }
   }
 }
