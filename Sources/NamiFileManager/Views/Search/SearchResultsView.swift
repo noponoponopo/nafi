@@ -36,7 +36,7 @@ struct SearchResultsView: View {
                   .fileSelectionHitTarget(item.url, in: coordinateSpace)
                 }
               }
-              .padding(.vertical, 4)
+              .padding(.vertical, 2)
             }
             .contentShape(Rectangle())
           }
@@ -110,10 +110,7 @@ private struct SearchResultRow: View {
   var body: some View {
     HStack(spacing: 10) {
       HStack(spacing: 8) {
-        Image(nsImage: item.icon)
-          .resizable()
-          .interpolation(.high)
-          .frame(width: 20, height: 20)
+        FileThumbnailView(item: item, width: 20, height: 20, cornerRadius: 3)
 
         VStack(alignment: .leading, spacing: 1) {
           HStack(spacing: 5) {
@@ -164,12 +161,12 @@ private struct SearchResultRow: View {
       }
     }
     .font(.system(size: 13))
-    .padding(.horizontal, 13)
-    .frame(height: showsLocationColumn ? 32 : 42)
+    .padding(.horizontal, 10)
+    .frame(height: showsLocationColumn ? 30 : 40)
     .background {
       RoundedRectangle(cornerRadius: 6, style: .continuous)
         .fill(selection.isSelected ? Color.accentColor.opacity(0.19) : .clear)
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 3)
     }
     .contentShape(Rectangle())
     .highPriorityGesture(

@@ -226,7 +226,7 @@ struct FileListView: View {
                   .fileSelectionHitTarget(row.item.url, in: coordinateSpace)
                 }
               }
-              .padding(.vertical, 4)
+              .padding(.vertical, 2)
             }
             .contentShape(Rectangle())
           }
@@ -375,10 +375,7 @@ private struct TreeListRow: View {
     HStack(spacing: 6) {
       disclosure
       HStack(spacing: 8) {
-        Image(nsImage: row.item.icon)
-          .resizable()
-          .interpolation(.high)
-          .frame(width: 20, height: 20)
+        FileThumbnailView(item: row.item, width: 20, height: 20, cornerRadius: 3)
         Text(row.item.name)
           .lineLimit(1)
           .truncationMode(.middle)
@@ -402,13 +399,13 @@ private struct TreeListRow: View {
       }
     }
     .font(.system(size: 13))
-    .padding(.leading, CGFloat(row.depth) * 16 + 13)
-    .padding(.trailing, 13)
-    .frame(height: 30)
+    .padding(.leading, CGFloat(row.depth) * 16 + 10)
+    .padding(.trailing, 10)
+    .frame(height: 28)
     .background {
       RoundedRectangle(cornerRadius: 6, style: .continuous)
         .fill(selection.isSelected ? Color.accentColor.opacity(0.19) : .clear)
-        .padding(.horizontal, 4)
+        .padding(.horizontal, 3)
     }
     .contentShape(Rectangle())
     .highPriorityGesture(
@@ -458,6 +455,8 @@ struct FileMatrixView: View {
   @ObservedObject var model: FilePaneModel
 
   var body: some View {
+    let cellWidth = model.iconSize + 44
+
     FileSelectionSurface(
       model: model,
       scopeURL: model.currentURL,
@@ -470,22 +469,23 @@ struct FileMatrixView: View {
           LazyVGrid(
             columns: [
               GridItem(
-                .adaptive(minimum: model.iconSize + 54, maximum: model.iconSize + 98), spacing: 12)
+                .adaptive(minimum: cellWidth, maximum: cellWidth), spacing: 8)
             ],
             alignment: .leading,
-            spacing: 12
+            spacing: 8
           ) {
             ForEach(model.displayedItems) { item in
               MatrixCell(
                 model: model,
                 item: item,
                 iconSize: model.iconSize,
+                cellWidth: cellWidth,
                 selection: model.selectionFlag(for: item.url)
               )
               .fileSelectionHitTarget(item.url, in: coordinateSpace)
             }
           }
-          .padding(14)
+          .padding(10)
         }
         .contentShape(Rectangle())
       }
@@ -497,14 +497,18 @@ private struct MatrixCell: View {
   let model: FilePaneModel
   let item: FileItem
   let iconSize: Double
+  let cellWidth: Double
   @ObservedObject var selection: SelectionFlag
 
   var body: some View {
-    VStack(spacing: 7) {
-      Image(nsImage: item.icon)
-        .resizable()
-        .interpolation(.high)
-        .frame(width: iconSize, height: iconSize)
+    VStack(spacing: 5) {
+      FileThumbnailView(
+        item: item,
+        width: iconSize,
+        height: iconSize,
+        contentMode: .fit,
+        cornerRadius: 7
+      )
       Text(item.name)
         .font(.system(size: 12.5))
         .lineLimit(2)
@@ -518,8 +522,9 @@ private struct MatrixCell: View {
           .lineLimit(1)
       }
     }
-    .padding(8)
-    .frame(maxWidth: .infinity, minHeight: iconSize + 54, alignment: .top)
+    .padding(.vertical, 5)
+    .frame(width: cellWidth)
+    .frame(minHeight: iconSize + 48, alignment: .top)
     .background(
       selection.isSelected ? Color.accentColor.opacity(0.18) : Color.clear,
       in: RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -623,7 +628,7 @@ private struct GalleryFilmstrip: View {
           itemForURL: { model.item(for: $0) },
           content: { coordinateSpace in
             ScrollView(.horizontal, showsIndicators: false) {
-              LazyHStack(spacing: 8) {
+              LazyHStack(spacing: 6) {
                 ForEach(model.displayedItems) { item in
                   GalleryThumbnail(
                     model: model,
@@ -634,8 +639,8 @@ private struct GalleryFilmstrip: View {
                   .id(item.url)
                 }
               }
-              .padding(.horizontal, 10)
-              .padding(.vertical, 8)
+              .padding(.horizontal, 8)
+              .padding(.vertical, 5)
             }
           }
         )
@@ -658,17 +663,21 @@ private struct GalleryThumbnail: View {
 
   var body: some View {
     VStack(spacing: 5) {
-      Image(nsImage: item.icon)
-        .resizable()
-        .interpolation(.high)
-        .frame(width: 54, height: 54)
+      FileThumbnailView(
+        item: item,
+        width: 54,
+        height: 54,
+        contentMode: .fit,
+        cornerRadius: 5
+      )
       Text(item.name)
         .font(.caption)
         .lineLimit(1)
         .truncationMode(.middle)
-        .frame(width: 94)
+        .frame(width: 88)
     }
-    .padding(7)
+    .padding(.horizontal, 4)
+    .padding(.vertical, 4)
     .background(
       selection.isSelected ? Color.accentColor.opacity(0.19) : Color.clear,
       in: RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -834,7 +843,7 @@ private struct ColumnView: View {
                 .fileSelectionHitTarget(item.url, in: coordinateSpace)
               }
             }
-            .padding(.vertical, 4)
+            .padding(.vertical, 2)
           }
           if data.isLoading {
             ProgressView().controlSize(.small).padding(.top, 12)
@@ -854,7 +863,7 @@ private struct ColumnItemRow: View {
 
   var body: some View {
     HStack(spacing: 7) {
-      Image(nsImage: item.icon).resizable().frame(width: 18, height: 18)
+      FileThumbnailView(item: item, width: 18, height: 18, cornerRadius: 3)
       Text(item.name).lineLimit(1).truncationMode(.middle)
       Spacer()
       if item.isDirectory && !item.isPackage {
@@ -862,12 +871,12 @@ private struct ColumnItemRow: View {
       }
     }
     .font(.system(size: 12.5))
-    .padding(.horizontal, 9)
-    .frame(height: 28)
+    .padding(.horizontal, 7)
+    .frame(height: 26)
     .background {
       RoundedRectangle(cornerRadius: 5, style: .continuous)
         .fill(selection.isSelected ? Color.accentColor.opacity(0.19) : .clear)
-        .padding(.horizontal, 3)
+        .padding(.horizontal, 2)
     }
     .contentShape(Rectangle())
     .highPriorityGesture(TapGesture(count: 2).onEnded { model.activate(item) })

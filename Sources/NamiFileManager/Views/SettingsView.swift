@@ -4,6 +4,10 @@ struct SettingsView: View {
   @EnvironmentObject private var appState: AppState
   @AppStorage("Nami.defaultShowHidden") private var defaultShowHidden = false
   @AppStorage("Nami.defaultViewMode") private var defaultViewMode = FileViewMode.list.rawValue
+  @AppStorage(ThumbnailPreferenceKey.localImages) private var localImageThumbnails = true
+  @AppStorage(ThumbnailPreferenceKey.localVideos) private var localVideoThumbnails = true
+  @AppStorage(ThumbnailPreferenceKey.remoteImages) private var remoteImageThumbnails = false
+  @AppStorage(ThumbnailPreferenceKey.remoteVideos) private var remoteVideoThumbnails = false
 
   var body: some View {
     TabView {
@@ -45,6 +49,17 @@ struct SettingsView: View {
             appState.activeModel.viewMode = mode
           }
         }
+      }
+
+      Section("サムネイル") {
+        Toggle("ローカル画像のサムネイルを表示", isOn: $localImageThumbnails)
+        Toggle("ローカル動画のサムネイルを表示", isOn: $localVideoThumbnails)
+        Toggle("サーバー上の画像のサムネイルを表示", isOn: $remoteImageThumbnails)
+        Toggle("サーバー上の動画のサムネイルを表示", isOn: $remoteVideoThumbnails)
+
+        Text("サーバー上の項目は、サムネイル生成のため一時的にダウンロードします。特に動画は通信量と表示時間が増える場合があります。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
 
       Section {

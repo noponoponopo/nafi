@@ -33,6 +33,7 @@ let package = Package(
         .linkedFramework("NetFS"),
         .linkedFramework("Network"),
         .linkedFramework("QuickLook"),
+        .linkedFramework("QuickLookThumbnailing"),
         .linkedFramework("QuickLookUI"),
         .linkedFramework("Security"),
       ]

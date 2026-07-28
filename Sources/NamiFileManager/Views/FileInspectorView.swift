@@ -47,10 +47,13 @@ struct FileInspectorView: View {
   var body: some View {
     VStack(spacing: 0) {
       HStack(spacing: 14) {
-        Image(nsImage: item.icon)
-          .resizable()
-          .interpolation(.high)
-          .frame(width: 56, height: 56)
+        FileThumbnailView(
+          item: item,
+          width: 56,
+          height: 56,
+          contentMode: .fit,
+          cornerRadius: 7
+        )
         VStack(alignment: .leading, spacing: 4) {
           Text(item.name)
             .font(.title3.weight(.semibold))

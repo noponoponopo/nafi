@@ -200,6 +200,23 @@ struct UnifiedFileSystemService {
     return local
   }
 
+  static func withTemporaryLocalCopy<T>(
+    of url: URL,
+    operation: (URL) async throws -> T
+  ) async throws -> T {
+    guard NafiURL.isRemote(url) else {
+      return try await operation(url)
+    }
+
+    let directory = stagingDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+
+    let local = directory.appendingPathComponent(itemName(url) ?? "remote-item")
+    try await download(remoteURL: url, to: local)
+    return try await operation(local)
+  }
+
   static func uploadEditedLocalCopy(_ localURL: URL, to remoteURL: URL) async throws {
     try await upload(localURL: localURL, to: remoteURL, replacing: true)
   }

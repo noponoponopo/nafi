@@ -83,6 +83,17 @@ struct FileItem: Identifiable, Hashable, Sendable {
     )
   }
 
+  var thumbnailMediaKind: ThumbnailMediaKind? {
+    guard !isDirectory, !isPackage else { return nil }
+    let type =
+      contentTypeIdentifier.flatMap(UTType.init)
+      ?? UTType(filenameExtension: url.pathExtension)
+    guard let type else { return nil }
+    if type.conforms(to: .image) { return .image }
+    if type.conforms(to: .movie) || type.conforms(to: .video) { return .video }
+    return nil
+  }
+
   @MainActor
   var icon: NSImage {
     FileIconCache.shared.icon(for: self)
@@ -106,6 +117,11 @@ struct FileItem: Identifiable, Hashable, Sendable {
       tagNames: values.tagNames ?? []
     )
   }
+}
+
+enum ThumbnailMediaKind: Hashable, Sendable {
+  case image
+  case video
 }
 
 enum FileSort: String, CaseIterable, Identifiable, Sendable {

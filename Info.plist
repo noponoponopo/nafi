@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.8.0</string>
+	<string>0.8.1</string>
 	<key>CFBundleVersion</key>
-	<string>22</string>
+	<string>23</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHumanReadableCopyright</key>
@@ -82,6 +82,18 @@
 				<string>public.mount-point</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Files (Reveal in nafi)</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.item</string>
+			</array>
+		</dict>
 	</array>
 	<key>NSServices</key>
 	<array>
@@ -100,7 +112,7 @@
 				<string>public.item</string>
 			</array>
 			<key>NSServiceDescription</key>
-			<string>選択したファイルまたはフォルダをnafiで開きます。</string>
+			<string>ファイルの場合は含むフォルダをnafiで開いて選択し、フォルダの場合はそのフォルダを開きます。</string>
 		</dict>
 	</array>
 	<key>UTExportedTypeDeclarations</key>
