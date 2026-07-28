@@ -317,13 +317,6 @@ struct FileSystemService {
     NSWorkspace.shared.activateFileViewerSelecting([url])
   }
 
-  static func openTerminal(at url: URL) {
-    let directory = url.hasDirectoryPath ? url : url.deletingLastPathComponent()
-    let script =
-      "tell application \"Terminal\" to do script \"cd " + shellQuoted(directory.path) + "\""
-    NSAppleScript(source: script)?.executeAndReturnError(nil)
-  }
-
   static func notifyFileChanged(at url: URL) {
     notifyChanges(in: [url.deletingLastPathComponent()])
   }

@@ -22,6 +22,7 @@ final class QuickEditDocument: ObservableObject {
   private var encodingRawValue = String.Encoding.utf8.rawValue
   private var hasByteOrderMark = false
   private var modificationDate: Date?
+  private var workingURL: URL?
   private let onSaved: (URL) -> Void
   private var loadTask: Task<Void, Never>?
   private var saveTask: Task<Void, Never>?
@@ -46,16 +47,25 @@ final class QuickEditDocument: ObservableObject {
     errorMessage = nil
     statusMessage = "読み込み中…"
     hasExternalChangeConflict = false
-    let targetURL = url
+    let sourceURL = url
 
     loadTask = Task { [weak self] in
-      let result = await Task.detached(priority: .userInitiated) {
-        Result { try QuickEditService.read(targetURL) }
-      }.value
+      let result: Result<(URL, QuickEditSnapshot), Error>
+      do {
+        let localURL = try await UnifiedFileSystemService.prepareLocalCopy(of: sourceURL)
+        let snapshot = try await Task.detached(priority: .userInitiated) {
+          try QuickEditService.read(localURL)
+        }.value
+        result = .success((localURL, snapshot))
+      } catch {
+        result = .failure(error)
+      }
       guard let self, !Task.isCancelled else { return }
       self.isLoading = false
       switch result {
-      case .success(let snapshot):
+      case .success(let value):
+        let (localURL, snapshot) = value
+        self.workingURL = localURL
         self.text = snapshot.text
         self.encodingRawValue = snapshot.encodingRawValue
         self.encodingLabel = snapshot.encodingLabel
@@ -85,7 +95,12 @@ final class QuickEditDocument: ObservableObject {
     statusMessage = "保存中…"
     hasExternalChangeConflict = false
 
-    let targetURL = url
+    guard let targetURL = workingURL else {
+      errorMessage = QuickEditError.readFailed.localizedDescription
+      isSaving = false
+      return
+    }
+    let sourceURL = url
     let text = text
     let encodingRawValue = encodingRawValue
     let lineEnding = lineEnding
@@ -93,8 +108,9 @@ final class QuickEditDocument: ObservableObject {
     let expectedModificationDate = modificationDate
 
     saveTask = Task { [weak self] in
-      let result = await Task.detached(priority: .userInitiated) {
-        Result {
+      let result: Result<Date?, Error>
+      do {
+        let modificationDate = try await Task.detached(priority: .userInitiated) {
           try QuickEditService.write(
             text,
             to: targetURL,
@@ -104,8 +120,14 @@ final class QuickEditDocument: ObservableObject {
             expectedModificationDate: expectedModificationDate,
             force: force
           )
+        }.value
+        if NafiURL.isRemote(sourceURL) {
+          try await UnifiedFileSystemService.uploadEditedLocalCopy(targetURL, to: sourceURL)
         }
-      }.value
+        result = .success(modificationDate)
+      } catch {
+        result = .failure(error)
+      }
       guard let self, !Task.isCancelled else { return }
       self.isSaving = false
       switch result {
@@ -113,7 +135,7 @@ final class QuickEditDocument: ObservableObject {
         self.modificationDate = modificationDate
         self.isDirty = false
         self.statusMessage = "保存しました"
-        self.onSaved(targetURL)
+        self.onSaved(sourceURL)
       case .failure(let error as QuickEditError) where error == .changedExternally:
         self.hasExternalChangeConflict = true
         self.statusMessage = nil
@@ -220,11 +242,15 @@ struct QuickEditView: View {
         Text(document.url.lastPathComponent)
           .font(.headline)
           .lineLimit(1)
-        Text(document.url.deletingLastPathComponent().path)
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          .lineLimit(1)
-          .truncationMode(.middle)
+        Text(
+          NafiURL.isRemote(document.url)
+            ? (NafiURL.remotePath(in: NafiURL.parent(of: document.url)) ?? "/")
+            : document.url.deletingLastPathComponent().path
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .lineLimit(1)
+        .truncationMode(.middle)
       }
       Spacer()
       if document.isDirty {

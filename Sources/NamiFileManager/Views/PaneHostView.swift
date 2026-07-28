@@ -231,7 +231,7 @@ private struct PaneTabButton: View {
 
   var body: some View {
     HStack(spacing: 6) {
-      Image(systemName: "folder.fill")
+      Image(systemName: model.isRemote ? "network" : "folder.fill")
         .font(.caption)
         .foregroundStyle(isActive ? Color.accentColor : .secondary)
       Text(model.title)

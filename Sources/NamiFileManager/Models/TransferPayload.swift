@@ -8,18 +8,47 @@ extension UTType {
   static let nafiSidebarFavorite = UTType(exportedAs: "app.nafi.sidebar-favorite")
 }
 
-struct FileDragPayload: Codable {
+struct FileDragPayload: Codable, Sendable {
   let urls: [URL]
 }
 
-struct PaneDragPayload: Codable {
+struct PaneDragPayload: Codable, Sendable {
   let sourcePaneID: UUID
   let sourceTabID: UUID
   let url: URL
 }
 
-struct SidebarFavoriteDragPayload: Codable {
+struct SidebarFavoriteDragPayload: Codable, Sendable {
   let favoriteID: UUID
+}
+
+private struct PayloadDecoder<Payload: Decodable & Sendable>: @unchecked Sendable {
+  private let payloadType: Payload.Type
+
+  init(_ payloadType: Payload.Type) {
+    self.payloadType = payloadType
+  }
+
+  func decode(_ data: Data) -> Payload? {
+    try? JSONDecoder().decode(payloadType, from: data)
+  }
+}
+
+private final class LockedPayloadCollection<Element: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [Element] = []
+
+  func append(_ element: Element) {
+    lock.lock()
+    storage.append(element)
+    lock.unlock()
+  }
+
+  var values: [Element] {
+    lock.lock()
+    defer { lock.unlock() }
+    return storage
+  }
 }
 
 enum DragPayloadProvider {
@@ -33,7 +62,7 @@ enum DragPayloadProvider {
     let provider = NSItemProvider()
     if let firstURL = payload.urls.first {
       provider.suggestedName = firstURL.lastPathComponent
-      if let data = firstURL.absoluteString.data(using: .utf8) {
+      if firstURL.isFileURL, let data = firstURL.absoluteString.data(using: .utf8) {
         provider.registerDataRepresentation(
           forTypeIdentifier: UTType.fileURL.identifier,
           visibility: .all
@@ -96,7 +125,7 @@ enum DragPayloadProvider {
         from: customProviders,
         contentType: .nafiFileCollection
       ) { payloads in
-        completion(uniqueFileURLs(payloads.flatMap(\.urls)))
+        completion(uniqueLocations(payloads.flatMap(\.urls)))
       }
       return
     }
@@ -110,23 +139,20 @@ enum DragPayloadProvider {
     }
 
     let group = DispatchGroup()
-    let lock = NSLock()
-    var urls: [URL] = []
+    let urls = LockedPayloadCollection<URL>()
 
     for provider in fileProviders {
       group.enter()
       provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
         if let url = fileURL(from: item) {
-          lock.lock()
           urls.append(url)
-          lock.unlock()
         }
         group.leave()
       }
     }
 
     group.notify(queue: .main) {
-      completion(uniqueFileURLs(urls))
+      completion(uniqueLocations(urls.values))
     }
   }
 
@@ -168,7 +194,7 @@ enum DragPayloadProvider {
     return provider
   }
 
-  private static func loadPayloads<Payload: Decodable>(
+  private static func loadPayloads<Payload: Decodable & Sendable>(
     _ payloadType: Payload.Type,
     from providers: [NSItemProvider],
     contentType: UTType,
@@ -183,23 +209,21 @@ enum DragPayloadProvider {
     }
 
     let group = DispatchGroup()
-    let lock = NSLock()
-    var payloads: [Payload] = []
+    let decoder = PayloadDecoder(payloadType)
+    let payloads = LockedPayloadCollection<Payload>()
 
     for provider in matching {
       group.enter()
       provider.loadDataRepresentation(forTypeIdentifier: contentType.identifier) { data, _ in
-        if let data, let payload = try? JSONDecoder().decode(payloadType, from: data) {
-          lock.lock()
+        if let data, let payload = decoder.decode(data) {
           payloads.append(payload)
-          lock.unlock()
         }
         group.leave()
       }
     }
 
     group.notify(queue: .main) {
-      completion(payloads)
+      completion(payloads.values)
     }
   }
 
@@ -227,12 +251,11 @@ enum DragPayloadProvider {
     return url.standardizedFileURL
   }
 
-  private static func uniqueFileURLs(_ urls: [URL]) -> [URL] {
+  private static func uniqueLocations(_ urls: [URL]) -> [URL] {
     var seen = Set<URL>()
     return urls.compactMap { url in
-      guard url.isFileURL else { return nil }
-      let standardized = url.standardizedFileURL
-      return seen.insert(standardized).inserted ? standardized : nil
+      let normalized = NafiURL.normalized(url)
+      return seen.insert(normalized).inserted ? normalized : nil
     }
   }
 }

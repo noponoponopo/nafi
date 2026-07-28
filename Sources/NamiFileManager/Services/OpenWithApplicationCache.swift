@@ -14,7 +14,10 @@ final class OpenWithApplicationCache {
       : (item.contentTypeIdentifier ?? item.url.pathExtension.lowercased())
     if let cached = cache[key] { return cached }
 
-    var candidates = NSWorkspace.shared.urlsForApplications(toOpen: item.url)
+    var candidates =
+      item.url.isFileURL
+      ? NSWorkspace.shared.urlsForApplications(toOpen: item.url)
+      : []
     if item.isDirectory {
       candidates.append(contentsOf: NSWorkspace.shared.urlsForApplications(toOpen: .folder))
     } else if let identifier = item.contentTypeIdentifier, let type = UTType(identifier) {
@@ -35,7 +38,13 @@ final class OpenWithApplicationCache {
   }
 
   func defaultApplication(for item: FileItem) -> URL? {
-    NSWorkspace.shared.urlForApplication(toOpen: item.url)?.standardizedFileURL
+    if item.url.isFileURL {
+      return NSWorkspace.shared.urlForApplication(toOpen: item.url)?.standardizedFileURL
+    }
+    guard let identifier = item.contentTypeIdentifier, let type = UTType(identifier) else {
+      return nil
+    }
+    return NSWorkspace.shared.urlForApplication(toOpen: type)?.standardizedFileURL
   }
 
   func chooseApplication() -> URL? {

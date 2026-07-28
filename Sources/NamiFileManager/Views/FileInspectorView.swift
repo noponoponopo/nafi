@@ -35,7 +35,7 @@ struct FileInspectorView: View {
 
       Form {
         Section("一般") {
-          LabeledContent("場所", value: item.url.deletingLastPathComponent().path)
+          LabeledContent("場所", value: locationLabel)
           LabeledContent("サイズ", value: item.sizeLabel)
           LabeledContent("作成日", value: date(item.creationDate))
           LabeledContent("更新日", value: date(item.modificationDate))
@@ -93,7 +93,9 @@ struct FileInspectorView: View {
             Button("この項目だけ変更") {
               applyDefaultApplicationToItem()
             }
-            .disabled(selectedApplicationURL == nil || isApplyingDefaultApplication)
+            .disabled(
+              NafiURL.isRemote(item.url) || selectedApplicationURL == nil
+                || isApplyingDefaultApplication)
 
             Button(changeAllButtonLabel) {
               isChangeAllConfirmationPresented = true
@@ -127,10 +129,15 @@ struct FileInspectorView: View {
 
       Divider()
       HStack {
-        Button("Finderで表示") { FileSystemService.revealInFinder(item.url) }
+        if item.url.isFileURL {
+          Button("Finderで表示") { FileSystemService.revealInFinder(item.url) }
+        }
         Button("パスをコピー") {
           NSPasteboard.general.clearContents()
-          NSPasteboard.general.setString(item.url.path, forType: .string)
+          NSPasteboard.general.setString(
+            NafiURL.isRemote(item.url)
+              ? (NafiURL.remotePath(in: item.url) ?? item.url.absoluteString) : item.url.path,
+            forType: .string)
         }
         Spacer()
         Button("閉じる") { dismiss() }
@@ -141,7 +148,7 @@ struct FileInspectorView: View {
     .frame(width: 580, height: 650)
     .task(id: item.url) {
       let detailsTask = Task.detached(priority: .userInitiated) {
-        InspectorDetails.reading(item.url)
+        item.url.isFileURL ? InspectorDetails.reading(item.url) : .unavailable
       }
       loadApplications()
       details = await detailsTask.value
@@ -167,6 +174,13 @@ struct FileInspectorView: View {
     } message: {
       Text(applicationError ?? "不明なエラーです。")
     }
+  }
+
+  private var locationLabel: String {
+    if NafiURL.isRemote(item.url) {
+      return NafiURL.remotePath(in: NafiURL.parent(of: item.url)) ?? "/"
+    }
+    return item.url.deletingLastPathComponent().path
   }
 
   private var canChangeAll: Bool {
@@ -264,6 +278,7 @@ private struct InspectorDetails: Sendable {
   let permissionLabel: String
 
   static let loading = InspectorDetails(ownerName: "…", groupName: "…", permissionLabel: "…")
+  static let unavailable = InspectorDetails(ownerName: "—", groupName: "—", permissionLabel: "—")
 
   static func reading(_ url: URL) -> InspectorDetails {
     let attributes = (try? FileManager.default.attributesOfItem(atPath: url.path)) ?? [:]

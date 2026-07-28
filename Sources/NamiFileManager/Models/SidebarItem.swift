@@ -8,7 +8,10 @@ struct SidebarFavorite: Identifiable, Codable, Hashable {
   var isBuiltIn: Bool
 
   var url: URL {
-    URL(fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true)
+    if let parsed = URL(string: path), NafiURL.isRemote(parsed) {
+      return NafiURL.normalized(parsed)
+    }
+    return URL(fileURLWithPath: NSString(string: path).expandingTildeInPath, isDirectory: true)
   }
 
   static func builtIns() -> [SidebarFavorite] {

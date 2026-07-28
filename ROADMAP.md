@@ -14,9 +14,10 @@
 
 ## Remote-native layer
 
-- Direct SFTP browser without a mount helper
-- Connection-health monitoring, backoff, per-server bookmarks, and capability detection
-- Optional File Provider extension and cloud-provider integrations
+- Complete host-key management for password-based SFTP, host fingerprint UI, and resumable SFTP/FTP/FTPS/S3 transfers
+- Transfer progress, cancellation, checksum verification, partial-file cleanup, and retry across mixed local/remote roots
+- Connection-health monitoring, backoff, server capability detection, symlink semantics, permissions, and remote metadata editing
+- S3 multipart-copy optimization, versioned-object UI, storage-class/metadata editing, optional File Provider extension, and additional cloud-provider integrations
 
 ## Productization
 

@@ -271,7 +271,7 @@ private struct SidebarDestinationRow: View {
 
   private var isSelected: Bool {
     guard let destinationURL else { return false }
-    return activeModel.currentURL.standardizedFileURL == destinationURL.standardizedFileURL
+    return NafiURL.sameLocation(activeModel.currentURL, destinationURL)
   }
 
   private var acceptedDropTypes: [UTType] {
@@ -443,9 +443,13 @@ private struct SidebarReorderEndTarget: View {
 }
 
 private struct ServerSidebarRow: View {
+  @EnvironmentObject private var appState: AppState
   let profile: ServerProfile
   @ObservedObject var manager: ServerManager
   let edit: () -> Void
+
+  @State private var isDropTargeted = false
+  @State private var focusTask: Task<Void, Never>?
 
   var body: some View {
     HStack(spacing: 9) {
@@ -455,27 +459,107 @@ private struct ServerSidebarRow: View {
         Text(profile.host).font(.caption).foregroundStyle(.secondary).lineLimit(1)
       }
       Spacer(minLength: 0)
-      stateIndicator
+      if isDropTargeted {
+        Image(systemName: "arrow.down.to.line")
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(Color.accentColor)
+      } else {
+        stateIndicator
+      }
     }
     .padding(.leading, 8)
     .padding(.trailing, 11)
     .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+    .background(
+      isDropTargeted ? Color.accentColor.opacity(0.22) : Color.clear,
+      in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+    )
+    .overlay {
+      if isDropTargeted {
+        RoundedRectangle(cornerRadius: 7, style: .continuous)
+          .strokeBorder(Color.accentColor, lineWidth: 1.5)
+      }
+    }
     .contentShape(Rectangle())
-    .onTapGesture { Task { await manager.connect(profile) } }
+    .onTapGesture { activate() }
     .accessibilityElement(children: .combine)
     .accessibilityAddTraits(.isButton)
-    .accessibilityAction { Task { await manager.connect(profile) } }
+    .accessibilityAction { activate() }
     .listRowInsets(EdgeInsets(top: 1, leading: 4, bottom: 1, trailing: 8))
     .listRowBackground(Color.clear)
     .listRowSeparator(.hidden)
+    .onDrop(
+      of: DragPayloadProvider.fileDropTypes,
+      isTargeted: Binding(
+        get: { isDropTargeted },
+        set: { updateDropTarget($0) }
+      )
+    ) { providers in
+      focusTask?.cancel()
+      let move = !NSEvent.modifierFlags.contains(.option)
+      DragPayloadProvider.loadFileURLs(from: providers) { urls in
+        guard !urls.isEmpty else { return }
+        Task { @MainActor in
+          guard let destination = await manager.activate(profile) else { return }
+          appState.activeModel.transferItems(urls, to: destination, move: move)
+        }
+      }
+      return true
+    }
     .contextMenu {
-      Button("接続") { Task { await manager.connect(profile) } }
+      Button(manager.state(for: profile) == .idle ? "接続" : "開く") { activate() }
+      Button("新しいタブで開く") {
+        Task {
+          if let url = await manager.activate(profile) { appState.openInNewTab(url) }
+        }
+      }
+      Button("新しいペインで開く") {
+        Task {
+          if let url = await manager.activate(profile) { appState.openInNewPane(url) }
+        }
+      }
+      if profile.kind == .sftp {
+        Button("ここでターミナルを開く") {
+          Task {
+            guard let url = await manager.activate(profile) else { return }
+            do {
+              try await TerminalApplicationService.open(at: url)
+            } catch {
+              appState.presentationErrorMessage = error.localizedDescription
+            }
+          }
+        }
+      }
       Button("切断") { Task { await manager.disconnect(profile) } }
       Divider()
       Button("編集", action: edit)
       Button("削除", role: .destructive) { manager.remove(profile) }
     }
     .help(helpText)
+    .onDisappear { focusTask?.cancel() }
+  }
+
+  private func activate() {
+    Task {
+      if let url = await manager.activate(profile) {
+        appState.activeModel.navigate(to: url)
+      } else if case .failed(let message) = manager.state(for: profile) {
+        appState.presentationErrorMessage = message
+      } else if case .helperRequired(let message) = manager.state(for: profile) {
+        appState.presentationErrorMessage = message
+      }
+    }
+  }
+
+  private func updateDropTarget(_ targeted: Bool) {
+    focusTask?.cancel()
+    isDropTargeted = targeted
+    guard targeted else { return }
+    focusTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 850_000_000)
+      guard !Task.isCancelled, isDropTargeted else { return }
+      activate()
+    }
   }
 
   @ViewBuilder

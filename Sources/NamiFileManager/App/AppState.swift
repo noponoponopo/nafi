@@ -86,8 +86,11 @@ final class AppState: ObservableObject {
   }
 
   func quickEditDidSave(_ url: URL) {
-    let parent = url.deletingLastPathComponent().standardizedFileURL
-    for model in workspace.allModels where model.currentURL.standardizedFileURL == parent {
+    let parent =
+      NafiURL.isRemote(url)
+      ? NafiURL.parent(of: url)
+      : url.deletingLastPathComponent().standardizedFileURL
+    for model in workspace.allModels where NafiURL.sameLocation(model.currentURL, parent) {
       model.load()
     }
   }

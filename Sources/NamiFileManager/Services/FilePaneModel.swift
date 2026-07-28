@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 
 @MainActor
 final class FilePaneModel: ObservableObject, Identifiable {
@@ -63,8 +64,12 @@ final class FilePaneModel: ObservableObject, Identifiable {
       let selfCopyOnly =
         !move
         && conflictingURLs.allSatisfy { source in
-          source.standardizedFileURL
-            == destination.appendingPathComponent(source.lastPathComponent).standardizedFileURL
+          NafiURL.sameLocation(
+            source,
+            NafiURL.isRemote(destination)
+              ? NafiURL.appending(source.lastPathComponent, to: destination)
+              : destination.appendingPathComponent(source.lastPathComponent)
+          )
         }
 
       if selfCopyOnly {
@@ -77,8 +82,12 @@ final class FilePaneModel: ObservableObject, Identifiable {
 
     var canReplace: Bool {
       conflictingURLs.contains { source in
-        source.standardizedFileURL
-          != destination.appendingPathComponent(source.lastPathComponent).standardizedFileURL
+        !NafiURL.sameLocation(
+          source,
+          NafiURL.isRemote(destination)
+            ? NafiURL.appending(source.lastPathComponent, to: destination)
+            : destination.appendingPathComponent(source.lastPathComponent)
+        )
       }
     }
   }
@@ -88,6 +97,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
 
   @Published private(set) var currentURL: URL
   @Published private(set) var displayedItems: [FileItem] = []
+  @Published private(set) var remoteProfileName: String?
+  @Published private(set) var remoteProfileKind: ServerProfile.Kind?
   @Published var showHidden: Bool
   @Published var searchText = "" {
     didSet {
@@ -142,8 +153,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
         guard let directories = notification.userInfo?["directories"] as? [URL] else { return }
         Task { @MainActor [weak self] in
           guard let self, Date() >= self.ignoreFileSystemNotificationsUntil else { return }
-          let current = self.currentURL.standardizedFileURL
-          guard directories.contains(where: { $0.standardizedFileURL == current }) else { return }
+          let current = NafiURL.normalized(self.currentURL)
+          guard directories.contains(where: { NafiURL.sameLocation($0, current) }) else { return }
           self.scheduleReload()
         }
       }
@@ -151,7 +162,18 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
 
   var title: String {
-    currentURL.lastPathComponent.isEmpty ? currentURL.path : currentURL.lastPathComponent
+    if NafiURL.isRemote(currentURL) {
+      let path = NafiURL.remotePath(in: currentURL) ?? "/"
+      return path == "/" ? (remoteProfileName ?? "サーバー") : RemotePath.name(of: path)
+    }
+    return currentURL.lastPathComponent.isEmpty ? currentURL.path : currentURL.lastPathComponent
+  }
+  var isRemote: Bool { NafiURL.isRemote(currentURL) }
+  var canOpenTerminalHere: Bool { !isRemote || remoteProfileKind == .sftp }
+  var displayPath: String {
+    guard isRemote else { return currentURL.path }
+    let path = NafiURL.remotePath(in: currentURL) ?? "/"
+    return remoteProfileName.map { "\($0):\(path)" } ?? path
   }
   var canGoBack: Bool { !backStack.isEmpty }
   var canGoForward: Bool { !forwardStack.isEmpty }
@@ -198,29 +220,32 @@ final class FilePaneModel: ObservableObject, Identifiable {
     isLoading = true
 
     loadTask = Task { [weak self] in
-      let worker = Task.detached(priority: .userInitiated) {
-        do {
-          let items = try FileSystemService.contents(of: directory, showHidden: showHidden)
-          let displayed = Self.arranged(
-            items, query: query, sort: requestedSort, descending: descending)
-          return (items: items, displayed: displayed, error: Optional<String>.none)
-        } catch is CancellationError {
-          return (items: [FileItem](), displayed: [FileItem](), error: Optional<String>.none)
-        } catch {
-          return (items: [FileItem](), displayed: [FileItem](), error: error.localizedDescription)
-        }
+      let remoteProfile: ServerProfile?
+      if let profileID = NafiURL.profileID(in: directory) {
+        remoteProfile = await RemoteFileSystemRegistry.shared.profile(for: profileID)
+      } else {
+        remoteProfile = nil
       }
-      let result = await withTaskCancellationHandler {
-        await worker.value
-      } onCancel: {
-        worker.cancel()
+      let result: (items: [FileItem], displayed: [FileItem], error: String?)
+      do {
+        let items = try await UnifiedFileSystemService.contents(
+          of: directory, showHidden: showHidden)
+        let displayed = Self.arranged(
+          items, query: query, sort: requestedSort, descending: descending)
+        result = (items, displayed, nil)
+      } catch is CancellationError {
+        result = ([], [], nil)
+      } catch {
+        result = ([], [], error.localizedDescription)
       }
 
       guard let self, !Task.isCancelled, self.loadToken == token,
-        self.currentURL.standardizedFileURL == directory.standardizedFileURL
+        NafiURL.sameLocation(self.currentURL, directory)
       else { return }
 
       self.isLoading = false
+      self.remoteProfileName = remoteProfile?.name
+      self.remoteProfileKind = remoteProfile?.kind
       if let error = result.error {
         self.allItems = []
         self.itemLookup = [:]
@@ -254,12 +279,12 @@ final class FilePaneModel: ObservableObject, Identifiable {
         self.selectionController.contains($0.key)
       }
 
-      if let pendingURL = self.pendingSelectionURL?.standardizedFileURL,
+      if let pendingURL = self.pendingSelectionURL.map(NafiURL.normalized),
         let pendingItem = lookup[pendingURL]
       {
         self.selectionController.replace(with: [pendingItem.url], primary: pendingItem.url)
         self.selectionAnchor = pendingItem.url
-        self.selectionAnchorScope = directory.standardizedFileURL
+        self.selectionAnchorScope = NafiURL.normalized(directory)
         self.pendingSelectionURL = nil
       }
       self.errorMessage = nil
@@ -267,8 +292,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
 
   func navigate(to url: URL, recordingHistory: Bool = true) {
-    let standardized = url.standardizedFileURL
-    guard standardized != currentURL.standardizedFileURL else {
+    let standardized = NafiURL.normalized(url)
+    guard !NafiURL.sameLocation(standardized, currentURL) else {
       load()
       return
     }
@@ -292,9 +317,38 @@ final class FilePaneModel: ObservableObject, Identifiable {
   func activate(_ item: FileItem) {
     if item.isDirectory && !item.isPackage {
       navigate(to: item.url)
-    } else {
-      NSWorkspace.shared.open(item.url)
+      return
     }
+    Task { [weak self] in
+      do {
+        let localURL = try await UnifiedFileSystemService.prepareLocalCopy(of: item.url)
+        NSWorkspace.shared.open(localURL)
+      } catch {
+        self?.errorMessage = error.localizedDescription
+      }
+    }
+  }
+
+  func open(_ item: FileItem, withApplicationAt applicationURL: URL) {
+    Task { [weak self] in
+      do {
+        let localURL = try await UnifiedFileSystemService.prepareLocalCopy(of: item.url)
+        let configuration = NSWorkspace.OpenConfiguration()
+        NSWorkspace.shared.open(
+          [localURL],
+          withApplicationAt: applicationURL,
+          configuration: configuration,
+          completionHandler: nil
+        )
+      } catch {
+        self?.errorMessage = error.localizedDescription
+      }
+    }
+  }
+
+  func chooseApplicationAndOpen(_ item: FileItem) {
+    guard let applicationURL = OpenWithApplicationCache.shared.chooseApplication() else { return }
+    open(item, withApplicationAt: applicationURL)
   }
 
   func openSelected() {
@@ -303,8 +357,15 @@ final class FilePaneModel: ObservableObject, Identifiable {
     if items.count == 1, let item = items.first {
       activate(item)
     } else {
-      for item in items {
-        NSWorkspace.shared.open(item.url)
+      Task { [weak self] in
+        do {
+          for item in items {
+            let localURL = try await UnifiedFileSystemService.prepareLocalCopy(of: item.url)
+            NSWorkspace.shared.open(localURL)
+          }
+        } catch {
+          self?.errorMessage = error.localizedDescription
+        }
       }
     }
   }
@@ -322,8 +383,11 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
 
   func goUp() {
-    let parent = currentURL.deletingLastPathComponent()
-    guard parent.path != currentURL.path else { return }
+    let parent =
+      NafiURL.isRemote(currentURL)
+      ? NafiURL.parent(of: currentURL)
+      : currentURL.deletingLastPathComponent()
+    guard !NafiURL.sameLocation(parent, currentURL) else { return }
     navigate(to: parent)
   }
 
@@ -339,7 +403,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
   ) {
     supplementalItems[item.url] = item
     let modifiers = modifiers.intersection([.command, .shift])
-    let resolvedScope = (scope ?? currentURL).standardizedFileURL
+    let resolvedScope = NafiURL.normalized(scope ?? currentURL)
 
     if modifiers.contains(.shift) {
       let ordered = orderedItems ?? displayedItems
@@ -418,7 +482,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
 
     selectionController.replace(with: [item.url], primary: item.url)
     selectionAnchor = item.url
-    selectionAnchorScope = (scope ?? currentURL).standardizedFileURL
+    selectionAnchorScope = NafiURL.normalized(scope ?? currentURL)
     pruneSupplementalSelection()
   }
 
@@ -459,7 +523,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
   func finishMarqueeSelection(anchor: URL?, scope: URL) {
     if let anchor {
       selectionAnchor = anchor
-      selectionAnchorScope = scope.standardizedFileURL
+      selectionAnchorScope = NafiURL.normalized(scope)
     } else if selectionController.count == 0 {
       selectionAnchor = nil
       selectionAnchorScope = nil
@@ -477,7 +541,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
     let urls = Set(displayedItems.map(\.url))
     selectionController.replace(with: urls, primary: displayedItems.first?.url)
     selectionAnchor = displayedItems.first?.url
-    selectionAnchorScope = currentURL.standardizedFileURL
+    selectionAnchorScope = NafiURL.normalized(currentURL)
   }
 
   func moveSelection(by offset: Int) {
@@ -578,11 +642,11 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
 
   func selectAfterNextLoad(_ url: URL) {
-    let standardized = url.standardizedFileURL
+    let standardized = NafiURL.normalized(url)
     if let item = itemLookup[standardized] ?? supplementalItems[standardized] {
       selectionController.replace(with: [item.url], primary: item.url)
       selectionAnchor = item.url
-      selectionAnchorScope = currentURL.standardizedFileURL
+      selectionAnchorScope = NafiURL.normalized(currentURL)
       pendingSelectionURL = nil
       return
     }
@@ -590,10 +654,13 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
 
   func revealExternalItem(_ url: URL) {
-    let standardized = url.standardizedFileURL
-    let parent = standardized.deletingLastPathComponent().standardizedFileURL
+    let standardized = NafiURL.normalized(url)
+    let parent =
+      NafiURL.isRemote(standardized)
+      ? NafiURL.parent(of: standardized)
+      : standardized.deletingLastPathComponent().standardizedFileURL
     pendingSelectionURL = standardized
-    if currentURL.standardizedFileURL == parent {
+    if NafiURL.normalized(currentURL) == parent {
       load()
     } else {
       navigate(to: parent)
@@ -618,19 +685,23 @@ final class FilePaneModel: ObservableObject, Identifiable {
     switch prompt {
     case .newFile:
       let directory = currentURL
-      runOperation(label: "ファイルを作成中") {
-        [try FileSystemService.createFile(named: text, in: directory)]
+      runAsyncOperation(label: "ファイルを作成中") {
+        [try await UnifiedFileSystemService.createFile(named: text, in: directory)]
       }
     case .newFolder:
       let directory = currentURL
-      runOperation(label: "フォルダを作成中") {
-        [try FileSystemService.createFolder(named: text, in: directory)]
+      runAsyncOperation(label: "フォルダを作成中") {
+        [try await UnifiedFileSystemService.createFolder(named: text, in: directory)]
       }
     case .rename(let url):
-      runOperation(label: "名前を変更中") {
-        [try FileSystemService.rename(url, to: text)]
+      runAsyncOperation(label: "名前を変更中") {
+        [try await UnifiedFileSystemService.rename(url, to: text)]
       }
     case .tags(let urls):
+      guard urls.allSatisfy(\.isFileURL) else {
+        errorMessage = "サーバー上のタグは接続先のファイルシステムでサポートされていません。"
+        return
+      }
       let tags = text.replacingOccurrences(of: "、", with: ",")
         .split(separator: ",").map(String.init)
       runOperation(label: "タグを更新中", selectsResults: false) {
@@ -643,14 +714,20 @@ final class FilePaneModel: ObservableObject, Identifiable {
   func duplicateSelection() {
     let urls = selectedItems.map(\.url)
     guard !urls.isEmpty else { return }
-    runOperation(label: "複製中") {
-      try urls.map { try FileSystemService.duplicate($0) }
+    runAsyncOperation(label: "複製中") {
+      var results: [URL] = []
+      for url in urls { results.append(try await UnifiedFileSystemService.duplicate(url)) }
+      return results
     }
   }
 
   func createAliasSelection() {
     let urls = selectedItems.map(\.url)
     guard !urls.isEmpty else { return }
+    guard urls.allSatisfy(\.isFileURL) else {
+      errorMessage = "サーバー上ではmacOSエイリアスを作成できません。"
+      return
+    }
     runOperation(label: "エイリアスを作成中") {
       try urls.map { try FileSystemService.createAlias(to: $0) }
     }
@@ -660,16 +737,18 @@ final class FilePaneModel: ObservableObject, Identifiable {
     let urls = selectedItems.map(\.url)
     let directory = currentURL
     guard !urls.isEmpty else { return }
-    runOperation(label: "圧縮中") {
-      [try FileSystemService.compress(urls, in: directory)]
+    runAsyncOperation(label: "圧縮中") {
+      [try await UnifiedFileSystemService.compress(urls, in: directory)]
     }
   }
 
   func trashSelection() {
-    let urls = selectedItems.map(\.url)
-    guard !urls.isEmpty else { return }
-    runOperation(label: "ゴミ箱へ移動中", selectsResults: false, clearsSelection: true) {
-      for url in urls { try FileSystemService.trash(url) }
+    let items = selectedItems
+    guard !items.isEmpty else { return }
+    runAsyncOperation(label: "削除中", selectsResults: false, clearsSelection: true) {
+      for item in items {
+        try await UnifiedFileSystemService.remove(item.url, isDirectory: item.isDirectory)
+      }
       return []
     }
   }
@@ -685,13 +764,17 @@ final class FilePaneModel: ObservableObject, Identifiable {
       return
     }
 
-    let destinationURL = destination.standardizedFileURL
+    let destinationURL = NafiURL.normalized(destination)
     let safeURLs = urls.filter { url in
-      let source = url.standardizedFileURL
-      guard source != destinationURL, !destinationURL.path.hasPrefix(source.path + "/") else {
-        return false
-      }
-      if move, source.deletingLastPathComponent() == destinationURL { return false }
+      let source = NafiURL.normalized(url)
+      guard !NafiURL.sameLocation(source, destinationURL),
+        !NafiURL.isDescendant(destinationURL, of: source)
+      else { return false }
+      let parent =
+        NafiURL.isRemote(source)
+        ? NafiURL.parent(of: source)
+        : source.deletingLastPathComponent()
+      if move, NafiURL.sameLocation(parent, destinationURL) { return false }
       return true
     }
     guard !safeURLs.isEmpty else {
@@ -699,29 +782,28 @@ final class FilePaneModel: ObservableObject, Identifiable {
       return
     }
 
-    let conflicts = safeURLs.filter { url in
-      let candidate = destination.appendingPathComponent(url.lastPathComponent)
-      return FileManager.default.fileExists(atPath: candidate.path)
-    }
-
-    if !conflicts.isEmpty {
-      transferConflict = TransferConflictPrompt(
-        urls: safeURLs,
-        destination: destination,
+    Task { [weak self] in
+      let conflicts = await UnifiedFileSystemService.conflictingItems(
+        safeURLs, in: destinationURL)
+      guard let self else { return }
+      if !conflicts.isEmpty {
+        self.transferConflict = TransferConflictPrompt(
+          urls: safeURLs,
+          destination: destinationURL,
+          move: move,
+          conflictingURLs: conflicts,
+          clearPasteboardOnSuccess: clearPasteboardOnSuccess
+        )
+        return
+      }
+      self.performTransfer(
+        safeURLs,
+        to: destinationURL,
         move: move,
-        conflictingURLs: conflicts,
+        resolution: .keepBoth,
         clearPasteboardOnSuccess: clearPasteboardOnSuccess
       )
-      return
     }
-
-    performTransfer(
-      safeURLs,
-      to: destination,
-      move: move,
-      resolution: .keepBoth,
-      clearPasteboardOnSuccess: clearPasteboardOnSuccess
-    )
   }
 
   func resolveTransferConflict(_ resolution: TransferConflictResolution) {
@@ -747,20 +829,15 @@ final class FilePaneModel: ObservableObject, Identifiable {
     resolution: TransferConflictResolution,
     clearPasteboardOnSuccess: Bool
   ) {
-    let existingItemPolicy: FileSystemService.ExistingItemPolicy =
+    let existingItemPolicy: UnifiedFileSystemService.ExistingItemPolicy =
       resolution == .replace ? .replace : .keepBoth
 
-    runOperation(
+    runAsyncOperation(
       label: move ? "移動中" : "コピー中",
       clearPasteboardOnSuccess: clearPasteboardOnSuccess
     ) {
-      try urls.map { url in
-        move
-          ? try FileSystemService.move(
-            url, to: destination, existingItemPolicy: existingItemPolicy)
-          : try FileSystemService.copy(
-            url, to: destination, existingItemPolicy: existingItemPolicy)
-      }
+      try await UnifiedFileSystemService.transfer(
+        urls, to: destination, move: move, policy: existingItemPolicy)
     }
   }
 
@@ -788,18 +865,33 @@ final class FilePaneModel: ObservableObject, Identifiable {
     guard !urls.isEmpty else { return }
     let pasteboard = NSPasteboard.general
     pasteboard.clearContents()
-    pasteboard.writeObjects(urls.map { $0 as NSURL })
+    let localURLs = urls.filter(\.isFileURL)
+    if !localURLs.isEmpty { pasteboard.writeObjects(localURLs.map { $0 as NSURL }) }
+    if let data = try? JSONEncoder().encode(FileDragPayload(urls: urls)) {
+      pasteboard.setData(
+        data,
+        forType: NSPasteboard.PasteboardType(UTType.nafiFileCollection.identifier)
+      )
+    }
     pasteboard.setString(
       cut ? "cut" : "copy", forType: NSPasteboard.PasteboardType("app.nami.transfer-mode"))
   }
 
   func paste() {
     let pasteboard = NSPasteboard.general
-    guard
-      let objects = pasteboard.readObjects(
-        forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [NSURL]
-    else { return }
-    let urls = objects.compactMap { $0 as URL }
+    let urls: [URL]
+    if let data = pasteboard.data(
+      forType: NSPasteboard.PasteboardType(UTType.nafiFileCollection.identifier)),
+      let payload = try? JSONDecoder().decode(FileDragPayload.self, from: data)
+    {
+      urls = payload.urls
+    } else if let objects = pasteboard.readObjects(
+      forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [NSURL]
+    {
+      urls = objects.map { $0 as URL }
+    } else {
+      return
+    }
     let move =
       pasteboard.string(forType: NSPasteboard.PasteboardType("app.nami.transfer-mode")) == "cut"
     transferItems(
@@ -811,20 +903,61 @@ final class FilePaneModel: ObservableObject, Identifiable {
   }
 
   func previewSelected() {
-    let urls = selectedItems.map(\.url)
-    QuickLookService.shared.show(urls: urls, selected: selectedItem?.url)
+    let items = selectedItems
+    guard !items.isEmpty else { return }
+    Task { [weak self] in
+      do {
+        var localURLs: [URL] = []
+        for item in items {
+          localURLs.append(try await UnifiedFileSystemService.prepareLocalCopy(of: item.url))
+        }
+        QuickLookService.shared.show(urls: localURLs, selected: localURLs.first)
+      } catch {
+        self?.errorMessage = error.localizedDescription
+      }
+    }
+  }
+
+  func openTerminalHere(at location: URL? = nil) {
+    let requested = location ?? currentURL
+    let target: URL
+    if let item = item(for: requested), !item.isDirectory {
+      target =
+        NafiURL.isRemote(requested)
+        ? NafiURL.parent(of: requested)
+        : requested.deletingLastPathComponent()
+    } else {
+      target = requested
+    }
+    Task { [weak self] in
+      do {
+        try await TerminalApplicationService.open(at: target)
+      } catch {
+        self?.errorMessage = error.localizedDescription
+      }
+    }
   }
 
   func copySelectedPath() {
-    let paths = selectedItems.map { $0.url.path }.joined(separator: "\n")
-    guard !paths.isEmpty else { return }
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(paths, forType: .string)
+    let items = selectedItems
+    guard !items.isEmpty else { return }
+    Task {
+      var paths: [String] = []
+      for item in items {
+        paths.append(await UnifiedFileSystemService.displayPath(for: item.url))
+      }
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(paths.joined(separator: "\n"), forType: .string)
+    }
   }
 
   func revealSelection() {
     let urls = selectedItems.map(\.url)
     guard !urls.isEmpty else { return }
+    guard urls.allSatisfy(\.isFileURL) else {
+      errorMessage = "リモート項目はnafi内の現在位置に表示されています。"
+      return
+    }
     NSWorkspace.shared.activateFileViewerSelecting(urls)
   }
 
@@ -931,6 +1064,49 @@ final class FilePaneModel: ObservableObject, Identifiable {
     }
   }
 
+  private func runAsyncOperation(
+    label: String,
+    selectsResults: Bool = true,
+    clearsSelection: Bool = false,
+    clearPasteboardOnSuccess: Bool = false,
+    operation: @escaping @Sendable () async throws -> [URL]
+  ) {
+    guard operationLabel == nil else {
+      errorMessage = "別のファイル操作が進行中です。"
+      return
+    }
+
+    operationLabel = label
+    Task { [weak self] in
+      let result: Result<[URL], Error>
+      do {
+        result = .success(try await operation())
+      } catch {
+        result = .failure(error)
+      }
+
+      guard let self else { return }
+      self.operationLabel = nil
+      switch result {
+      case .failure(let error):
+        self.errorMessage = error.localizedDescription
+      case .success(let urls):
+        self.ignoreFileSystemNotificationsUntil = Date().addingTimeInterval(0.55)
+        if clearPasteboardOnSuccess { NSPasteboard.general.clearContents() }
+        if selectsResults {
+          self.selectionController.replace(with: Set(urls), primary: urls.first)
+          self.selectionAnchor = urls.first
+          self.selectionAnchorScope = NafiURL.normalized(self.currentURL)
+        } else if clearsSelection {
+          self.selectionController.removeAll()
+          self.selectionAnchor = nil
+          self.selectionAnchorScope = nil
+        }
+        self.load()
+      }
+    }
+  }
+
   private func runOperation(
     label: String,
     selectsResults: Bool = true,
@@ -967,7 +1143,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       if selectsResults {
         self.selectionController.replace(with: Set(result.urls), primary: result.urls.first)
         self.selectionAnchor = result.urls.first
-        self.selectionAnchorScope = self.currentURL.standardizedFileURL
+        self.selectionAnchorScope = NafiURL.normalized(self.currentURL)
       } else if clearsSelection {
         self.selectionController.removeAll()
         self.selectionAnchor = nil

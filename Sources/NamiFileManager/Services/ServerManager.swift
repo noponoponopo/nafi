@@ -1,6 +1,13 @@
 import AppKit
 import Combine
 import Foundation
+import NetFS
+import Security
+
+private enum NetworkMountResult: Sendable {
+  case success([URL])
+  case failure(String)
+}
 
 @MainActor
 final class ServerManager: ObservableObject {
@@ -10,10 +17,19 @@ final class ServerManager: ObservableObject {
 
   private let keychain = KeychainStore()
   private let persistenceURL: URL
+  private var remoteSessions: [UUID: any RemoteServerSession] = [:]
 
   init() {
     persistenceURL = AppStoragePaths.file(named: "servers.json")
     loadProfiles()
+    Task { [weak self] in
+      guard let self else { return }
+      await RemoteFileSystemRegistry.shared.registerProfiles(self.profiles)
+      await RemoteFileSystemRegistry.shared.configureConnector { [weak self] profileID in
+        guard let self else { throw RemoteServerError.notConnected }
+        try await self.connectProfileForFileSystem(profileID)
+      }
+    }
 
     NSWorkspace.shared.notificationCenter.addObserver(
       forName: NSWorkspace.didMountNotification,
@@ -35,25 +51,70 @@ final class ServerManager: ObservableObject {
     states[profile.id] ?? .idle
   }
 
-  func save(profile: ServerProfile, password: String) throws {
+  func destinationURL(for profile: ServerProfile) -> URL? {
+    guard case .connected(let mountedURL) = state(for: profile) else { return nil }
+    switch profile.kind {
+    case .sftp, .ftp, .s3:
+      return NafiURL.remoteRoot(for: profile)
+    case .smb, .webdav, .nfs, .afp:
+      return mountedURL
+    }
+  }
+
+  func save(
+    profile: ServerProfile,
+    password: String,
+    keyPassphrase: String,
+    sessionToken: String = ""
+  ) throws {
     if let index = profiles.firstIndex(where: { $0.id == profile.id }) {
       profiles[index] = profile
     } else {
       profiles.append(profile)
     }
     try keychain.save(password: password, for: profile)
+    try keychain.saveKeyPassphrase(keyPassphrase, for: profile)
+    try keychain.saveSessionToken(sessionToken, for: profile)
     try persistProfiles()
+    Task { await RemoteFileSystemRegistry.shared.update(profile: profile) }
   }
 
   func remove(_ profile: ServerProfile) {
+    if let session = remoteSessions.removeValue(forKey: profile.id) {
+      Task { await session.close() }
+    }
     profiles.removeAll { $0.id == profile.id }
     states[profile.id] = nil
-    try? keychain.deletePassword(for: profile)
+    try? keychain.deleteSecrets(for: profile)
     try? persistProfiles()
+    Task { await RemoteFileSystemRegistry.shared.unregister(profileID: profile.id) }
   }
 
   func password(for profile: ServerProfile) -> String {
     (try? keychain.password(for: profile)) ?? ""
+  }
+
+  func keyPassphrase(for profile: ServerProfile) -> String {
+    (try? keychain.keyPassphrase(for: profile)) ?? ""
+  }
+
+  func sessionToken(for profile: ServerProfile) -> String {
+    (try? keychain.sessionToken(for: profile)) ?? ""
+  }
+
+  private func connectProfileForFileSystem(_ profileID: UUID) async throws {
+    guard let profile = profiles.first(where: { $0.id == profileID }) else {
+      throw RemoteServerError.invalidResponse("接続プロファイルが見つかりません。")
+    }
+    await connect(profile)
+    switch state(for: profile) {
+    case .connected:
+      return
+    case .failed(let message), .helperRequired(let message):
+      throw RemoteServerError.invalidResponse(message)
+    case .idle, .connecting:
+      throw RemoteServerError.notConnected
+    }
   }
 
   func connectAutoProfiles() async {
@@ -80,21 +141,62 @@ final class ServerManager: ObservableObject {
       states[profile.id] = .failed("ホスト名がありません")
       return
     }
-    states[profile.id] = .connecting
 
+    if remoteSessions[profile.id] != nil {
+      states[profile.id] = .connected(NafiURL.remoteRoot(for: profile))
+      return
+    }
+    if case .connecting = state(for: profile) {
+      for _ in 0..<120 {
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        if case .connecting = state(for: profile) { continue }
+        return
+      }
+      states[profile.id] = .failed("接続がタイムアウトしました。")
+      return
+    }
+
+    states[profile.id] = .connecting
     switch profile.kind {
     case .sftp:
       await connectSFTP(profile)
-    default:
-      connectUsingSystem(profile)
+    case .ftp:
+      await connectFTP(profile)
+    case .s3:
+      await connectS3(profile)
+    case .smb, .webdav, .nfs, .afp:
+      await connectUsingNetFS(profile)
+    }
+  }
+
+  func activate(_ profile: ServerProfile) async -> URL? {
+    switch state(for: profile) {
+    case .connected(let url):
+      if remoteSessions[profile.id] != nil { return NafiURL.remoteRoot(for: profile) }
+      return url
+    case .connecting:
+      return nil
+    case .idle, .helperRequired, .failed:
+      await connect(profile)
+      if case .connected(let url) = state(for: profile) {
+        return remoteSessions[profile.id] != nil ? NafiURL.remoteRoot(for: profile) : url
+      }
+      return nil
     }
   }
 
   func disconnect(_ profile: ServerProfile) async {
-    refreshMountedVolumes()
+    if let session = remoteSessions.removeValue(forKey: profile.id) {
+      await session.close()
+      await RemoteFileSystemRegistry.shared.disconnect(profileID: profile.id)
+      states[profile.id] = .idle
+      return
+    }
+
     let target: URL? = {
+      if case .connected(let url) = state(for: profile), let url { return url }
       if !profile.localMountPath.isEmpty {
-        return URL(fileURLWithPath: profile.localMountPath)
+        return URL(fileURLWithPath: NSString(string: profile.localMountPath).expandingTildeInPath)
       }
       let share = profile.path.split(separator: "/").last.map(String.init)
       return mountedVolumes.first { volume in
@@ -108,16 +210,28 @@ final class ServerManager: ObservableObject {
       return
     }
 
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-    process.arguments = ["unmount", target.path]
-    do {
-      try process.run()
-      process.waitUntilExit()
-      states[profile.id] = process.terminationStatus == 0 ? .idle : .failed("アンマウントできませんでした")
+    let errorMessage = await Task.detached(priority: .userInitiated) { () -> String? in
+      let process = Process()
+      process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+      process.arguments = ["unmount", target.path]
+      let pipe = Pipe()
+      process.standardError = pipe
+      do {
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus != 0 else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8) ?? "アンマウントできませんでした"
+      } catch {
+        return error.localizedDescription
+      }
+    }.value
+
+    if let errorMessage {
+      states[profile.id] = .failed(errorMessage)
+    } else {
+      states[profile.id] = .idle
       refreshMountedVolumes()
-    } catch {
-      states[profile.id] = .failed(error.localizedDescription)
     }
   }
 
@@ -141,97 +255,146 @@ final class ServerManager: ObservableObject {
     .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
   }
 
-  private func connectUsingSystem(_ profile: ServerProfile) {
-    guard let url = profile.connectionURL else {
-      states[profile.id] = .failed("URLを作成できません")
-      return
-    }
-
-    let password = password(for: profile)
-    let escapedURL = appleScriptQuoted(url.absoluteString)
-    let escapedUser = appleScriptQuoted(profile.username)
-    let escapedPassword = appleScriptQuoted(password)
-
-    var command = "mount volume \"\(escapedURL)\""
-    if !profile.username.isEmpty {
-      command += " as user name \"\(escapedUser)\""
-      if !password.isEmpty { command += " with password \"\(escapedPassword)\"" }
-    }
-
-    var errorInfo: NSDictionary?
-    let result = NSAppleScript(source: command)?.executeAndReturnError(&errorInfo)
-    if result != nil {
-      states[profile.id] = .connected(nil)
-      refreshMountedVolumes()
-    } else {
-      // Some URL handlers do not implement AppleScript mounting; defer to the system.
-      NSWorkspace.shared.open(url)
-      if let message = errorInfo?[NSAppleScript.errorMessage] as? String,
-        !message.localizedCaseInsensitiveContains("already mounted")
-      {
-        states[profile.id] = .failed(message)
-      } else {
-        states[profile.id] = .connected(nil)
-      }
-    }
-  }
-
   private func connectSFTP(_ profile: ServerProfile) async {
-    guard let sshfs = findSSHFS() else {
-      states[profile.id] = .helperRequired("SFTP 自動マウントには macFUSE と sshfs が必要です。SSH 鍵認証を推奨します。")
-      if let url = profile.connectionURL { NSWorkspace.shared.open(url) }
-      return
-    }
-
-    let mountPath: String
-    if profile.localMountPath.isEmpty {
-      mountPath =
-        FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("nafi Mounts", isDirectory: true)
-        .appendingPathComponent(profile.name, isDirectory: true).path
-    } else {
-      mountPath = NSString(string: profile.localMountPath).expandingTildeInPath
-    }
-
     do {
-      try FileManager.default.createDirectory(
-        at: URL(fileURLWithPath: mountPath),
-        withIntermediateDirectories: true
-      )
-
-      let remoteUser =
-        profile.username.isEmpty ? profile.host : "\(profile.username)@\(profile.host)"
-      let remotePath =
-        profile.path.isEmpty
-        ? "/" : "/\(profile.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))"
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: sshfs)
-      process.arguments = [
-        "\(remoteUser):\(remotePath)", mountPath,
-        "-p", String(profile.port),
-        "-o", "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,volname=\(profile.name)",
-      ]
-      let errorPipe = Pipe()
-      process.standardError = errorPipe
-      try process.run()
-      process.waitUntilExit()
-
-      if process.terminationStatus == 0 {
-        states[profile.id] = .connected(URL(fileURLWithPath: mountPath))
-        refreshMountedVolumes()
-      } else {
-        let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        let message = String(data: data, encoding: .utf8) ?? "sshfs の接続に失敗しました"
-        states[profile.id] = .failed(message.trimmingCharacters(in: .whitespacesAndNewlines))
+      let session: any RemoteServerSession
+      switch profile.sftpAuthentication {
+      case .password:
+        session = try await SFTPRemoteSession.connect(
+          profile: profile,
+          password: password(for: profile),
+          keyPassphrase: ""
+        )
+      case .privateKey:
+        session = try await OpenSSHSFTPRemoteSession.connect(
+          profile: profile,
+          keyPassphrase: keyPassphrase(for: profile)
+        )
       }
+      remoteSessions[profile.id] = session
+      await RemoteFileSystemRegistry.shared.register(profile: profile, session: session)
+      states[profile.id] = .connected(NafiURL.remoteRoot(for: profile))
     } catch {
       states[profile.id] = .failed(error.localizedDescription)
     }
   }
 
-  private func findSSHFS() -> String? {
-    ["/opt/homebrew/bin/sshfs", "/usr/local/bin/sshfs", "/usr/bin/sshfs"]
-      .first { FileManager.default.isExecutableFile(atPath: $0) }
+  private func connectFTP(_ profile: ServerProfile) async {
+    do {
+      let session = try await FTPRemoteSession.connect(
+        profile: profile,
+        password: password(for: profile)
+      )
+      remoteSessions[profile.id] = session
+      await RemoteFileSystemRegistry.shared.register(profile: profile, session: session)
+      states[profile.id] = .connected(NafiURL.remoteRoot(for: profile))
+    } catch {
+      states[profile.id] = .failed(error.localizedDescription)
+    }
+  }
+
+  private func connectS3(_ profile: ServerProfile) async {
+    do {
+      let session = try await S3RemoteSession.connect(
+        profile: profile,
+        secretAccessKey: password(for: profile),
+        sessionToken: sessionToken(for: profile)
+      )
+      remoteSessions[profile.id] = session
+      await RemoteFileSystemRegistry.shared.register(profile: profile, session: session)
+      states[profile.id] = .connected(NafiURL.remoteRoot(for: profile))
+    } catch {
+      states[profile.id] = .failed(error.localizedDescription)
+    }
+  }
+
+  private func connectUsingNetFS(_ profile: ServerProfile) async {
+    guard let url = profile.connectionURL else {
+      states[profile.id] = .failed("接続URLを作成できません")
+      return
+    }
+
+    let username = profile.username
+    let password = password(for: profile)
+    let mountPath: URL? = {
+      guard !profile.localMountPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+      }
+      return URL(
+        fileURLWithPath: NSString(string: profile.localMountPath).expandingTildeInPath,
+        isDirectory: true
+      )
+    }()
+
+    let result = await Task.detached(priority: .userInitiated) {
+      Self.mountUsingNetFS(
+        url: url,
+        mountPath: mountPath,
+        username: username,
+        password: password
+      )
+    }.value
+
+    switch result {
+    case .success(let mountedURLs):
+      refreshMountedVolumes()
+      let destination = mountedURLs.first ?? findMountedURL(for: profile)
+      states[profile.id] = .connected(destination)
+    case .failure(let message):
+      states[profile.id] = .failed(message)
+    }
+  }
+
+  private nonisolated static func mountUsingNetFS(
+    url: URL,
+    mountPath: URL?,
+    username: String,
+    password: String
+  ) -> NetworkMountResult {
+    if let mountPath {
+      do {
+        try FileManager.default.createDirectory(at: mountPath, withIntermediateDirectories: true)
+      } catch {
+        return .failure(error.localizedDescription)
+      }
+    }
+
+    let mountURL: CFURL? = mountPath.map { $0 as CFURL }
+    let user: CFString? = username.isEmpty ? nil : username as CFString
+    let secret: CFString? = password.isEmpty ? nil : password as CFString
+    var mounted: Unmanaged<CFArray>?
+    let status = NetFSMountURLSync(
+      url as CFURL,
+      mountURL,
+      user,
+      secret,
+      nil,
+      nil,
+      &mounted
+    )
+    guard status == 0 else {
+      let systemMessage = SecCopyErrorMessageString(status, nil) as String?
+      let prefix = url.scheme?.uppercased() ?? "サーバー"
+      return .failure(systemMessage ?? "\(prefix)接続に失敗しました（\(status)）")
+    }
+
+    guard let array = mounted?.takeRetainedValue() else {
+      return .success(mountPath.map { [$0] } ?? [])
+    }
+    let urls = (array as NSArray).compactMap { value -> URL? in
+      if let url = value as? URL { return url }
+      if let string = value as? String { return URL(fileURLWithPath: string) }
+      return nil
+    }
+    return .success(urls)
+  }
+
+  private func findMountedURL(for profile: ServerProfile) -> URL? {
+    let share = profile.path.split(separator: "/").first.map(String.init)
+    return mountedVolumes.first { volume in
+      if let share, volume.name.localizedCaseInsensitiveContains(share) { return true }
+      return volume.name.localizedCaseInsensitiveContains(profile.host)
+    }?.url
   }
 
   private func loadProfiles() {
@@ -245,10 +408,5 @@ final class ServerManager: ObservableObject {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     try encoder.encode(profiles).write(to: persistenceURL, options: .atomic)
-  }
-
-  private func appleScriptQuoted(_ value: String) -> String {
-    value.replacingOccurrences(of: "\\", with: "\\\\")
-      .replacingOccurrences(of: "\"", with: "\\\"")
   }
 }

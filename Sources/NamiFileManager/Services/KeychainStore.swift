@@ -2,15 +2,60 @@ import Foundation
 import Security
 
 struct KeychainStore {
+  private enum SecretKind: String {
+    case password
+    case keyPassphrase = "key-passphrase"
+    case sessionToken = "session-token"
+  }
+
   private let service = "app.nami.filemanager.servers"
 
   func save(password: String, for profile: ServerProfile) throws {
-    guard !password.isEmpty else {
-      try deletePassword(for: profile)
+    try save(secret: password, kind: .password, for: profile)
+    // v0.6.0以前の保存場所を削除します。読み込み時は引き続き移行できます。
+    try? delete(account: profile.id.uuidString)
+  }
+
+  func password(for profile: ServerProfile) throws -> String? {
+    if let password = try secret(kind: .password, for: profile) {
+      return password
+    }
+    // 旧版はUUIDだけをアカウント名としていました。
+    return try read(account: profile.id.uuidString)
+  }
+
+  func saveKeyPassphrase(_ passphrase: String, for profile: ServerProfile) throws {
+    try save(secret: passphrase, kind: .keyPassphrase, for: profile)
+  }
+
+  func keyPassphrase(for profile: ServerProfile) throws -> String? {
+    try secret(kind: .keyPassphrase, for: profile)
+  }
+
+  func saveSessionToken(_ token: String, for profile: ServerProfile) throws {
+    try save(secret: token, kind: .sessionToken, for: profile)
+  }
+
+  func sessionToken(for profile: ServerProfile) throws -> String? {
+    try secret(kind: .sessionToken, for: profile)
+  }
+
+  func deleteSecrets(for profile: ServerProfile) throws {
+    try delete(account: account(for: profile, kind: .password))
+    try delete(account: account(for: profile, kind: .keyPassphrase))
+    try delete(account: account(for: profile, kind: .sessionToken))
+    try delete(account: profile.id.uuidString)
+  }
+
+  private func save(secret: String, kind: SecretKind, for profile: ServerProfile) throws {
+    let account = account(for: profile, kind: kind)
+    guard !secret.isEmpty else {
+      try delete(account: account)
       return
     }
-    let data = Data(password.utf8)
-    let query = baseQuery(for: profile)
+
+    let data = Data(secret.utf8)
+    let query = baseQuery(account: account)
     let attributes: [String: Any] = [kSecValueData as String: data]
     let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
     if status == errSecItemNotFound {
@@ -24,8 +69,12 @@ struct KeychainStore {
     }
   }
 
-  func password(for profile: ServerProfile) throws -> String? {
-    var query = baseQuery(for: profile)
+  private func secret(kind: SecretKind, for profile: ServerProfile) throws -> String? {
+    try read(account: account(for: profile, kind: kind))
+  }
+
+  private func read(account: String) throws -> String? {
+    var query = baseQuery(account: account)
     query[kSecReturnData as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne
     var result: CFTypeRef?
@@ -37,18 +86,22 @@ struct KeychainStore {
     return String(data: data, encoding: .utf8)
   }
 
-  func deletePassword(for profile: ServerProfile) throws {
-    let status = SecItemDelete(baseQuery(for: profile) as CFDictionary)
+  private func delete(account: String) throws {
+    let status = SecItemDelete(baseQuery(account: account) as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
       throw KeychainError.status(status)
     }
   }
 
-  private func baseQuery(for profile: ServerProfile) -> [String: Any] {
+  private func account(for profile: ServerProfile, kind: SecretKind) -> String {
+    "\(profile.id.uuidString).\(kind.rawValue)"
+  }
+
+  private func baseQuery(account: String) -> [String: Any] {
     [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: service,
-      kSecAttrAccount as String: profile.id.uuidString,
+      kSecAttrAccount as String: account,
     ]
   }
 }

@@ -42,8 +42,10 @@ struct NamiCommands: Commands {
         .keyboardShortcut("e", modifiers: [.command, .option])
         .disabled(!appState.canQuickEditSelection)
       Divider()
-      Button("ゴミ箱に入れる") { appState.activeModel.trashSelection() }
-        .keyboardShortcut(.delete, modifiers: .command)
+      Button(appState.activeModel.isRemote ? "削除" : "ゴミ箱に入れる") {
+        appState.activeModel.trashSelection()
+      }
+      .keyboardShortcut(.delete, modifiers: .command)
     }
 
     CommandMenu("移動") {
@@ -92,6 +94,9 @@ struct NamiCommands: Commands {
     }
 
     CommandMenu("サーバー") {
+      Button("ここでターミナルを開く") { appState.activeModel.openTerminalHere() }
+        .disabled(!appState.activeModel.canOpenTerminalHere)
+      Divider()
       Button("接続先を追加") { appState.isServerSheetPresented = true }
         .keyboardShortcut("k", modifiers: [.command, .shift])
       Button("自動接続を実行") { Task { await appState.serverManager.connectAutoProfiles() } }

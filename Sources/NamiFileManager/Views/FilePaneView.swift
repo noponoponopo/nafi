@@ -128,7 +128,8 @@ struct FilePaneView: View {
     Button("すべてを選択") { model.selectAll() }
     Divider()
     Button("再読み込み") { model.load() }
-    Button("ここでターミナルを開く") { FileSystemService.openTerminal(at: model.currentURL) }
+    Button("ここでターミナルを開く") { model.openTerminalHere() }
+      .disabled(!model.canOpenTerminalHere)
     Button("サイドバーへ追加") { appState.sidebarModel.add(url: model.currentURL) }
   }
 }
@@ -155,7 +156,7 @@ private struct FilePaneStatusBar: View {
         Text(operation)
       }
       Spacer(minLength: 12)
-      Text(model.currentURL.path)
+      Text(model.displayPath)
         .lineLimit(1)
         .truncationMode(.middle)
     }
@@ -169,6 +170,9 @@ private struct FilePaneStatusBar: View {
 
 struct FileListView: View {
   @ObservedObject var model: FilePaneModel
+  @State private var expandedURLs: Set<URL> = []
+  @State private var childItems: [URL: [FileItem]] = [:]
+  @State private var loadingURLs: Set<URL> = []
 
   var body: some View {
     GeometryReader { proxy in
@@ -182,18 +186,20 @@ struct FileListView: View {
           onSelect: { item, modifiers in
             model.select(item, modifiers: modifiers)
           },
-          itemForURL: { model.item(for: $0) },
+          itemForURL: { url in itemForURL(url) },
           content: { coordinateSpace in
             ScrollView {
               LazyVStack(spacing: 0) {
-                ForEach(model.displayedItems) { item in
-                  SelectableListRow(
+                ForEach(treeRows) { row in
+                  TreeListRow(
                     model: model,
-                    item: item,
+                    row: row,
                     showsDetails: showsDetails,
-                    selection: model.selectionFlag(for: item.url)
+                    isLoading: loadingURLs.contains(row.item.url),
+                    onToggle: { toggleExpansion(of: row.item.url) },
+                    selection: model.selectionFlag(for: row.item.url)
                   )
-                  .fileSelectionHitTarget(item.url, in: coordinateSpace)
+                  .fileSelectionHitTarget(row.item.url, in: coordinateSpace)
                 }
               }
               .padding(.vertical, 4)
@@ -202,8 +208,93 @@ struct FileListView: View {
           }
         )
       }
+      .onChange(of: model.displayedItems) { _, _ in reloadExpandedDescendants() }
+      .onChange(of: model.sort) { _, _ in reloadExpandedDescendants() }
+      .onChange(of: model.sortDescending) { _, _ in reloadExpandedDescendants() }
+      .onChange(of: model.searchText) { _, newValue in
+        if newValue.isEmpty { reloadExpandedDescendants() }
+      }
+      .onChange(of: model.currentURL) { _, _ in resetExpansionState() }
     }
   }
+
+  private var treeRows: [TreeRow] {
+    var rows: [TreeRow] = []
+    appendRows(model.displayedItems, depth: 0, into: &rows)
+    return rows
+  }
+
+  private func appendRows(_ items: [FileItem], depth: Int, into rows: inout [TreeRow]) {
+    for item in items {
+      let canExpand = item.isDirectory && !item.isPackage
+      let isExpanded = expandedURLs.contains(item.url)
+      rows.append(TreeRow(item: item, depth: depth, isExpanded: isExpanded, canExpand: canExpand))
+      if isExpanded, let children = childItems[item.url] {
+        appendRows(children, depth: depth + 1, into: &rows)
+      }
+    }
+  }
+
+  private func itemForURL(_ url: URL) -> FileItem? {
+    if let item = model.item(for: url) { return item }
+    for (_, items) in childItems {
+      if let item = items.first(where: { $0.url == url }) { return item }
+    }
+    return nil
+  }
+
+  private func toggleExpansion(of url: URL) {
+    if expandedURLs.contains(url) {
+      collapse(url)
+    } else {
+      expandedURLs.insert(url)
+      loadChildren(of: url)
+    }
+  }
+
+  private func collapse(_ url: URL) {
+    for descendant in expandedURLs where NafiURL.isDescendant(descendant, of: url) {
+      expandedURLs.remove(descendant)
+      childItems[descendant] = nil
+    }
+    expandedURLs.remove(url)
+    childItems[url] = nil
+  }
+
+  private func loadChildren(of url: URL) {
+    guard childItems[url] == nil, !loadingURLs.contains(url) else { return }
+    loadingURLs.insert(url)
+    let showHidden = model.showHidden
+    Task { @MainActor in
+      let raw =
+        (try? await UnifiedFileSystemService.contents(of: url, showHidden: showHidden)) ?? []
+      let arranged = await model.arrange(raw)
+      loadingURLs.remove(url)
+      guard expandedURLs.contains(url) else { return }
+      childItems[url] = arranged
+    }
+  }
+
+  private func reloadExpandedDescendants() {
+    for url in expandedURLs {
+      childItems[url] = nil
+      loadChildren(of: url)
+    }
+  }
+
+  private func resetExpansionState() {
+    expandedURLs.removeAll()
+    childItems.removeAll()
+    loadingURLs.removeAll()
+  }
+}
+
+private struct TreeRow: Identifiable {
+  let item: FileItem
+  let depth: Int
+  let isExpanded: Bool
+  let canExpand: Bool
+  var id: URL { item.url }
 }
 
 private struct FileListHeader: View {
@@ -248,42 +339,46 @@ private struct FileListHeader: View {
   }
 }
 
-private struct SelectableListRow: View {
+private struct TreeListRow: View {
   let model: FilePaneModel
-  let item: FileItem
+  let row: TreeRow
   let showsDetails: Bool
+  let isLoading: Bool
+  let onToggle: () -> Void
   @ObservedObject var selection: SelectionFlag
 
   var body: some View {
-    HStack(spacing: 10) {
+    HStack(spacing: 6) {
+      disclosure
       HStack(spacing: 8) {
-        Image(nsImage: item.icon)
+        Image(nsImage: row.item.icon)
           .resizable()
           .interpolation(.high)
           .frame(width: 20, height: 20)
-        Text(item.name)
+        Text(row.item.name)
           .lineLimit(1)
           .truncationMode(.middle)
-          .foregroundStyle(item.isHidden ? .secondary : .primary)
-        if !item.tagNames.isEmpty {
+          .foregroundStyle(row.item.isHidden ? .secondary : .primary)
+        if !row.item.tagNames.isEmpty {
           Image(systemName: "tag.fill")
             .font(.caption2)
             .foregroundStyle(.secondary)
-            .help(item.tagNames.joined(separator: ", "))
+            .help(row.item.tagNames.joined(separator: ", "))
         }
       }
       .frame(maxWidth: .infinity, alignment: .leading)
 
       if showsDetails {
-        Text(item.modifiedLabel).frame(width: 132, alignment: .leading).foregroundStyle(.secondary)
-        Text(item.sizeLabel).frame(width: 76, alignment: .trailing).foregroundStyle(.secondary)
+        Text(row.item.modifiedLabel).frame(width: 132, alignment: .leading).foregroundStyle(.secondary)
+        Text(row.item.sizeLabel).frame(width: 76, alignment: .trailing).foregroundStyle(.secondary)
           .monospacedDigit()
-        Text(item.kindLabel).frame(width: 110, alignment: .leading).foregroundStyle(.secondary)
+        Text(row.item.kindLabel).frame(width: 110, alignment: .leading).foregroundStyle(.secondary)
           .lineLimit(1)
       }
     }
     .font(.system(size: 13))
-    .padding(.horizontal, 13)
+    .padding(.leading, CGFloat(row.depth) * 16 + 13)
+    .padding(.trailing, 13)
     .frame(height: 30)
     .background {
       RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -293,21 +388,44 @@ private struct SelectableListRow: View {
     .contentShape(Rectangle())
     .highPriorityGesture(
       TapGesture(count: 2).onEnded {
-        model.ensureSelected(item)
-        model.activate(item)
+        model.ensureSelected(row.item)
+        model.activate(row.item)
       }
     )
     .onDrag {
-      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
+      DragPayloadProvider.fileProvider(for: model.dragPayload(for: row.item))
     }
     .modifier(
       FileFolderDropModifier(
         model: model,
-        destination: item.isDirectory && !item.isPackage ? item.url : nil,
-        open: { model.navigate(to: item.url) }
+        destination: row.item.isDirectory && !row.item.isPackage ? row.item.url : nil,
+        open: { model.navigate(to: row.item.url) }
       )
     )
-    .contextMenu { FileItemContextMenu(model: model, item: item) }
+    .contextMenu { FileItemContextMenu(model: model, item: row.item) }
+  }
+
+  @ViewBuilder
+  private var disclosure: some View {
+    if row.canExpand {
+      Button(action: onToggle) {
+        ZStack {
+          if isLoading {
+            ProgressView().controlSize(.mini)
+          } else {
+            Image(systemName: row.isExpanded ? "chevron.down" : "chevron.right")
+              .font(.system(size: 10, weight: .semibold))
+              .foregroundStyle(.secondary)
+          }
+        }
+        .frame(width: 16, height: 16)
+        .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .help(row.isExpanded ? "折りたたむ" : "展開")
+    } else {
+      Color.clear.frame(width: 16, height: 16)
+    }
   }
 }
 
@@ -638,9 +756,8 @@ struct FileColumnBrowserView: View {
     let targetURL = item.url
     let showHidden = model.showHidden
     loadTask = Task {
-      let raw = await Task.detached(priority: .userInitiated) {
-        (try? FileSystemService.contents(of: targetURL, showHidden: showHidden)) ?? []
-      }.value
+      let raw =
+        (try? await UnifiedFileSystemService.contents(of: targetURL, showHidden: showHidden)) ?? []
       guard !Task.isCancelled else { return }
       let arranged = await model.arrange(raw)
       guard !Task.isCancelled, columns.last?.url == targetURL else { return }
@@ -820,20 +937,14 @@ private struct FileItemContextMenu: View {
     Menu("このアプリケーションで開く") {
       ForEach(Array(applications.prefix(18)), id: \.self) { applicationURL in
         Button {
-          let configuration = NSWorkspace.OpenConfiguration()
-          NSWorkspace.shared.open(
-            [item.url],
-            withApplicationAt: applicationURL,
-            configuration: configuration,
-            completionHandler: nil
-          )
+          model.open(item, withApplicationAt: applicationURL)
         } label: {
           Text(applicationURL.deletingPathExtension().lastPathComponent)
         }
       }
       Divider()
       Button("その他…") {
-        OpenWithApplicationCache.shared.chooseApplicationAndOpen(item.url)
+        model.chooseApplicationAndOpen(item)
       }
     }
 
@@ -906,9 +1017,10 @@ private struct FileItemContextMenu: View {
       model.ensureSelected(item)
       model.revealSelection()
     }
-    Button("ここでターミナルを開く") { FileSystemService.openTerminal(at: item.url) }
+    Button("ここでターミナルを開く") { model.openTerminalHere(at: item.url) }
+      .disabled(!model.canOpenTerminalHere)
     Divider()
-    Button("ゴミ箱に入れる", role: .destructive) {
+    Button(NafiURL.isRemote(item.url) ? "削除" : "ゴミ箱に入れる", role: .destructive) {
       model.ensureSelected(item)
       model.trashSelection()
     }

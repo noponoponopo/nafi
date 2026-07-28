@@ -4,13 +4,18 @@ struct RootView: View {
   @EnvironmentObject private var appState: AppState
 
   var body: some View {
-    RootViewContent(appState: appState, workspace: appState.workspace)
+    RootViewContent(
+      appState: appState,
+      workspace: appState.workspace,
+      serverManager: appState.serverManager
+    )
   }
 }
 
 private struct RootViewContent: View {
   @ObservedObject var appState: AppState
   @ObservedObject var workspace: WorkspaceModel
+  @ObservedObject var serverManager: ServerManager
 
   var body: some View {
     NavigationSplitView(columnVisibility: $appState.sidebarVisibility) {

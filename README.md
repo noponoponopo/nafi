@@ -16,13 +16,13 @@ nafi is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 - Per-row selection state: clicking invalidates only the rows whose selection changed, not the whole pane
 - O(1) selection/range anchors through a displayed-item index instead of repeated full-array scans
 - Background directory enumeration, filtering, sorting, metadata formatting, file operations, and inspector reads
-- Short-lived shared directory snapshots so several panes do not immediately rescan the same server folder
+- The same pane, tab, sidebar, selection, and file-operation model for local and remote roots
 - Content-type icon caching, debounced search, coalesced file-change notifications, and cancellable stale loads
 - Trackpad/Magic Mouse horizontal swipe navigation for Back and Forward
 - Drag files to folders, tabs, sidebar destinations, or other panes to move; hold Option while dropping to copy
 - Clear insertion markers for tab/sidebar reordering and delayed hover-open for folders, tabs, and sidebar destinations
 - Return/Enter starts rename for the selected item
-- Cross-tab refresh notifications after local file operations
+- Cross-tab and cross-pane refresh notifications after local or remote file operations
 - Unified system toolbar, adaptive materials, current macOS spacing, rounded selection surfaces, and reduced per-pane chrome
 
 ### Browsing
@@ -48,9 +48,14 @@ nafi is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 - Full-row hit targets for favorites, volumes, servers, and footer actions
 - Stable top spacing before the first sidebar section and clear row backgrounds
 - Custom section visibility, favorite rename/remove/reorder, and current-folder insertion
-- SMB, WebDAV, NFS, AFP, FTP, and SFTP connection profiles
+- SMB, WebDAV, NFS, AFP, FTP/FTPS, SFTP, and S3-compatible connection profiles
+- SMB, WebDAV, NFS, and AFP connections initiated directly through macOS NetFS without launching Finder or another GUI app
+- SFTP, FTP, FTPS, AWS S3, Cloudflare R2, MinIO, Ceph, and other Signature V4-compatible object stores appear as ordinary roots in the same panes and tabs as local folders; there is no separate server browser
+- Local-to-server, server-to-local, and server-to-server drag, copy, move, rename, create-folder, delete, duplicate, ZIP, Quick Look, and Quick Edit flows use the same commands and collision dialog, including S3/R2 buckets and prefixes
+- Remote roots can be mixed with local tabs in any pane and saved in Favorites
+- “Open Terminal Here” works for local folders and SFTP roots; SFTP opens SSH at the current remote path
 - Launch-time auto-connect, reconnect, disconnect, and mounted-volume discovery
-- Passwords stored separately in macOS Keychain
+- Passwords, SFTP key passphrases, S3 secret keys, and temporary S3 session tokens stored separately in macOS Keychain
 
 ### macOS integration
 
@@ -82,10 +87,17 @@ rm -rf .build
 
 ## Server notes
 
-- Native mounts may trigger a macOS Automation permission prompt.
-- Protocol availability and authentication behavior depend on the installed macOS version and server configuration.
-- SFTP unattended reconnect uses SSH keys. Automatic SFTP mounting requires macFUSE and `sshfs`; passwords are never placed on a command line.
+- Server connections no longer launch Finder, Cyberduck, or another external GUI application.
+- SMB, WebDAV, NFS, and AFP use the macOS NetFS framework from inside nafi and appear as mounted folders in ordinary panes.
+- SFTP, FTP, FTPS, and S3-compatible storage are represented as internal remote roots and are rendered by the ordinary `FilePaneModel`, so local and remote tabs can be mixed freely. They do not require macFUSE, sshfs, Cyberduck, Finder, or another GUI client application.
+- SFTP password authentication uses the in-process SSH/SFTP client. Private-key authentication uses the macOS OpenSSH engine without opening another application, supporting the key formats and algorithms accepted by the installed macOS OpenSSH, including RSA, Ed25519, ECDSA, FIDO/security-key, OpenSSH, PEM, and PKCS#8 keys with or without a passphrase. Key passphrases are stored in Keychain; the key file itself remains at the selected path.
+- FTP supports plain FTP, explicit FTPS (`AUTH TLS`), and implicit FTPS. FTPS encrypts both control and passive data connections and validates the server certificate by default.
+- S3-compatible roots support AWS Signature Version 4, arbitrary HTTPS endpoints, AWS S3 virtual-host addressing, R2/MinIO-style path addressing, access-key/secret authentication, temporary session tokens, anonymous public buckets, prefix navigation, server-side copy, and multipart uploads. Cloudflare R2 uses its account endpoint and the `auto` region.
+- Copy, move, drag-and-drop, collision handling, tabs, panes, Favorites, Quick Look, and text Quick Edit operate across local and remote roots. Cross-protocol transfers are staged internally when the two endpoints cannot rename directly.
+- “Open Terminal Here” creates a temporary `.command` file and asks macOS to open it with the application associated with that type. For SFTP, the command starts `ssh` and changes to the displayed remote directory; FTP/FTPS do not expose an interactive shell.
+- Private-key SFTP stores host keys in `~/Library/Application Support/nafi/known_hosts`, accepts a previously unseen host once, and rejects changed host keys. Password-based SFTP still needs the same host-key management migration.
+- Protocol availability and authentication behavior still depend on the installed macOS version and server configuration.
 
 ## Honest scope
 
-This revision provides a substantially redesigned, usable architecture, but it is not literal Finder parity. Remaining production work includes a persistent transfer queue with progress/pause/collision UI, comprehensive Undo/Redo, Spotlight content search and smart folders, Finder comments and full xattr/ACL editing, archive extraction, batch rename, File Provider/cloud integrations, live FSEvents coordination at scale, accessibility/localization audits, notarization, and automated macOS UI tests.
+This revision provides a substantially redesigned, usable architecture, but it is not literal Finder parity. Remaining production work includes a persistent transfer queue with progress/pause UI, comprehensive Undo/Redo, resumable and checksum-verified remote transfers, SSH host-key management, Spotlight content search and smart folders, Finder comments and full xattr/ACL editing, archive extraction, batch rename, File Provider/cloud integrations, live FSEvents coordination at scale, accessibility/localization audits, notarization, and automated macOS and real-server integration tests.

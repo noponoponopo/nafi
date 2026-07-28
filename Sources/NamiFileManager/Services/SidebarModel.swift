@@ -23,18 +23,20 @@ final class SidebarModel: ObservableObject {
   }
 
   func contains(url: URL) -> Bool {
-    favorites.contains { $0.url.standardizedFileURL == url.standardizedFileURL }
+    favorites.contains { NafiURL.sameLocation($0.url, url) }
   }
 
   func add(url: URL, title: String? = nil) {
-    guard !favorites.contains(where: { $0.url.standardizedFileURL == url.standardizedFileURL })
+    guard !favorites.contains(where: { NafiURL.sameLocation($0.url, url) })
     else { return }
     favorites.append(
       SidebarFavorite(
         id: UUID(),
-        title: title ?? (url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent),
-        systemImage: "folder",
-        path: url.path,
+        title: title
+          ?? (url.lastPathComponent.isEmpty
+            ? (NafiURL.remotePath(in: url) ?? url.path) : url.lastPathComponent),
+        systemImage: NafiURL.isRemote(url) ? "network" : "folder",
+        path: NafiURL.isRemote(url) ? url.absoluteString : url.path,
         isBuiltIn: false
       ))
     persist()

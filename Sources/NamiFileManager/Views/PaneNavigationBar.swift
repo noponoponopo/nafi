@@ -65,19 +65,26 @@ struct PaneNavigationBar: View {
         .onExitCommand { isEditingPath = false }
     } else {
       Button {
-        pathText = model.currentURL.path
+        pathText =
+          NafiURL.isRemote(model.currentURL)
+          ? (NafiURL.remotePath(in: model.currentURL) ?? "/")
+          : model.currentURL.path
         isEditingPath = true
       } label: {
         HStack(spacing: 7) {
-          Image(systemName: "folder.fill")
+          Image(systemName: NafiURL.isRemote(model.currentURL) ? "network" : "folder.fill")
             .foregroundStyle(Color.accentColor)
           Text(model.title)
             .fontWeight(.medium)
             .lineLimit(1)
-          Text(model.currentURL.deletingLastPathComponent().path)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .truncationMode(.head)
+          Text(
+            NafiURL.isRemote(model.currentURL)
+              ? (NafiURL.remotePath(in: NafiURL.parent(of: model.currentURL)) ?? "/")
+              : model.currentURL.deletingLastPathComponent().path
+          )
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+          .truncationMode(.head)
           Spacer(minLength: 0)
         }
         .padding(.horizontal, 9)
@@ -93,6 +100,12 @@ struct PaneNavigationBar: View {
   }
 
   private func commitPath() {
+    if let profileID = NafiURL.profileID(in: model.currentURL) {
+      model.navigate(to: NafiURL.remoteURL(profileID: profileID, path: pathText))
+      isEditingPath = false
+      return
+    }
+
     let expanded = NSString(string: pathText).expandingTildeInPath
     var isDirectory: ObjCBool = false
     if FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory),
