@@ -51,4 +51,4 @@ fi
 codesign --force --deep --sign - "$APP"
 
 echo "Built: $APP"
-open -R "$APP"
+[[ -z "${CI:-}" ]] && open -R "$APP"
