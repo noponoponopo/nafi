@@ -1,6 +1,6 @@
-# Nami — native multi-pane file manager for macOS
+# nafi — native multi-pane file manager for macOS
 
-Nami is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A workspace starts with one pane. Tabs can be dragged into another pane or dropped on any pane edge to create additional left, right, top, or bottom panes. Split dividers remain draggable through the native macOS split views.
+nafi is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A workspace starts with one pane. Tabs can be dragged into another pane or dropped on any pane edge to create additional left, right, top, or bottom panes. Split dividers remain draggable through the native macOS split views.
 
 ## Implemented in this revision
 
@@ -19,7 +19,9 @@ Nami is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 - Short-lived shared directory snapshots so several panes do not immediately rescan the same server folder
 - Content-type icon caching, debounced search, coalesced file-change notifications, and cancellable stale loads
 - Trackpad/Magic Mouse horizontal swipe navigation for Back and Forward
-- Drag files to folders or other panes to copy; Command-drag to move
+- Drag files to folders, tabs, sidebar destinations, or other panes to move; hold Option while dropping to copy
+- Clear insertion markers for tab/sidebar reordering and delayed hover-open for folders, tabs, and sidebar destinations
+- Return/Enter starts rename for the selected item
 - Cross-tab refresh notifications after local file operations
 - Unified system toolbar, adaptive materials, current macOS spacing, rounded selection surfaces, and reduced per-pane chrome
 
@@ -29,6 +31,8 @@ Nami is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 - Search, name/date/size/kind sorting, hidden-file toggle, adjustable matrix icon size
 - History navigation, parent navigation, direct path entry, and mounted-volume browsing
 - Quick Look panel and embedded gallery preview with a fixed, non-collapsing filmstrip
+- Quick Edit directly below Quick Look for text files up to 8 MB, preserving detected encoding and line endings with external-change conflict checks
+- iCloud Drive sidebar access with automatic location detection, bookmark fallback, and on-demand download before Quick Edit
 - Native file icons, packages, Finder tags, and file information including POSIX permissions
 
 ### File operations
@@ -48,9 +52,16 @@ Nami is a SwiftUI/AppKit file manager foundation for macOS 14 or later. A worksp
 - Launch-time auto-connect, reconnect, disconnect, and mounted-volume discovery
 - Passwords stored separately in macOS Keychain
 
+### macOS integration
+
+- Registers folders, directories, volumes, and mount points as supported document types
+- Settings control to request nafi as the default application for those types and to restore Finder
+- Opens folders received from Finder, Services, other apps, or Launch Services in the current tab or a new tab
+- Finder Services entry for opening selected files and folders in nafi
+
 ### Metadata policy
 
-Nami stores application state under `~/Library/Application Support/Nami` and does not write its own view metadata into browsed folders. It therefore does not create `.DS_Store`; Finder may still create one if the folder is opened in Finder.
+nafi stores application state under `~/Library/Application Support/nafi` and does not write its own view metadata into browsed folders. It therefore does not create `.DS_Store`; Finder may still create one if the folder is opened in Finder.
 
 ## Build
 
@@ -60,7 +71,7 @@ Install Xcode 16 or newer and its command-line tools, then open `Package.swift` 
 ./scripts/build-app.sh
 ```
 
-The script builds `.build/Nami.app` and applies an ad-hoc signature for local use.
+The script builds `.build/nafi.app` and applies an ad-hoc signature for local use.
 
 To rebuild after replacing an earlier copy:
 

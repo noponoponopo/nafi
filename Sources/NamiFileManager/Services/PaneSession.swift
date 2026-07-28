@@ -23,7 +23,9 @@ final class PaneSession: ObservableObject, Identifiable {
     tabs.first(where: { $0.id == activeTabID }) ?? tabs[0]
   }
 
-  func newTab(at url: URL, showHidden: Bool? = nil, viewMode: FileViewMode? = nil) {
+  @discardableResult
+  func newTab(at url: URL, showHidden: Bool? = nil, viewMode: FileViewMode? = nil) -> FilePaneModel
+  {
     let source = activeModel
     let model = FilePaneModel(
       initialURL: url,
@@ -33,6 +35,7 @@ final class PaneSession: ObservableObject, Identifiable {
     tabs.append(model)
     activeTabID = model.id
     model.load()
+    return model
   }
 
   func addClonedTab(from source: FilePaneModel) {
@@ -60,6 +63,13 @@ final class PaneSession: ObservableObject, Identifiable {
     let model = tabs.remove(at: sourceIndex)
     let adjustedIndex = sourceIndex < destinationIndex ? destinationIndex - 1 : destinationIndex
     tabs.insert(model, at: max(0, adjustedIndex))
+    activeTabID = model.id
+  }
+
+  func moveTabToEnd(_ tabID: UUID) {
+    guard let sourceIndex = tabs.firstIndex(where: { $0.id == tabID }) else { return }
+    let model = tabs.remove(at: sourceIndex)
+    tabs.append(model)
     activeTabID = model.id
   }
 

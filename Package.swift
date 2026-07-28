@@ -7,7 +7,7 @@ let package = Package(
     .macOS(.v14)
   ],
   products: [
-    .executable(name: "Nami", targets: ["NamiFileManager"])
+    .executable(name: "nafi", targets: ["NamiFileManager"])
   ],
   targets: [
     .executableTarget(

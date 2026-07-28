@@ -63,13 +63,13 @@ struct ServerEditorView: View {
         }
 
         Section("自動化") {
-          Toggle("Nami起動時に自動接続", isOn: $draft.autoConnect)
+          Toggle("nafi起動時に自動接続", isOn: $draft.autoConnect)
           if draft.kind == .webdav {
             Toggle("TLSを使用", isOn: $draft.useTLS)
           }
           if draft.kind == .sftp {
             TextField(
-              "ローカルマウント先（任意）", text: $draft.localMountPath, prompt: Text("~/Nami Mounts/Server"))
+              "ローカルマウント先（任意）", text: $draft.localMountPath, prompt: Text("~/nafi Mounts/Server"))
           }
           Toggle("保存後すぐ接続", isOn: $connectAfterSave)
         }

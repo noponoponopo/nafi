@@ -72,6 +72,11 @@ private final class FileSystemRuntime: @unchecked Sendable {
 }
 
 struct FileSystemService {
+  enum ExistingItemPolicy: Sendable, Equatable {
+    case keepBoth
+    case replace
+  }
+
   private static let runtime = FileSystemRuntime()
 
   static let resourceKeys: Set<URLResourceKey> = [
@@ -195,32 +200,73 @@ struct FileSystemService {
     notifyChanges(in: [directory])
   }
 
-  static func copy(_ source: URL, to directory: URL) throws -> URL {
-    let destination = uniqueURL(for: source.lastPathComponent, in: directory)
-    try FileManager.default.copyItem(at: source, to: destination)
+  static func copy(
+    _ source: URL,
+    to directory: URL,
+    existingItemPolicy: ExistingItemPolicy = .keepBoth
+  ) throws -> URL {
+    let requestedDestination = directory.appendingPathComponent(source.lastPathComponent)
+    let sourceURL = source.standardizedFileURL
+    let requestedURL = requestedDestination.standardizedFileURL
+
+    // Replacing an item with itself would destroy the source. A same-folder copy is always kept
+    // as a second item instead.
+    let destination =
+      existingItemPolicy == .keepBoth || sourceURL == requestedURL
+      ? uniqueURL(for: source.lastPathComponent, in: directory)
+      : requestedDestination
+
+    if existingItemPolicy == .replace, sourceURL != requestedURL,
+      FileManager.default.fileExists(atPath: destination.path)
+    {
+      try replaceExistingItem(at: destination) {
+        try FileManager.default.copyItem(at: source, to: destination)
+      }
+    } else {
+      try FileManager.default.copyItem(at: source, to: destination)
+    }
+
     notifyChanges(in: [directory])
     return destination
   }
 
-  static func move(_ source: URL, to directory: URL) throws -> URL {
+  static func move(
+    _ source: URL,
+    to directory: URL,
+    existingItemPolicy: ExistingItemPolicy = .keepBoth
+  ) throws -> URL {
     if source.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL {
       return source
     }
 
     let sourceDirectory = source.deletingLastPathComponent()
-    let destination = uniqueURL(for: source.lastPathComponent, in: directory)
-    do {
-      try FileManager.default.moveItem(at: source, to: destination)
-    } catch {
-      // FileManager.moveItem may fail across volumes. Fall back to copy + remove.
-      try FileManager.default.copyItem(at: source, to: destination)
+    let requestedDestination = directory.appendingPathComponent(source.lastPathComponent)
+    let destination =
+      existingItemPolicy == .keepBoth
+      ? uniqueURL(for: source.lastPathComponent, in: directory)
+      : requestedDestination
+
+    let performMove = {
       do {
-        try FileManager.default.removeItem(at: source)
+        try FileManager.default.moveItem(at: source, to: destination)
       } catch {
-        try? FileManager.default.removeItem(at: destination)
-        throw error
+        // FileManager.moveItem may fail across volumes. Fall back to copy + remove.
+        try FileManager.default.copyItem(at: source, to: destination)
+        do {
+          try FileManager.default.removeItem(at: source)
+        } catch {
+          try? FileManager.default.removeItem(at: destination)
+          throw error
+        }
       }
     }
+
+    if existingItemPolicy == .replace, FileManager.default.fileExists(atPath: destination.path) {
+      try replaceExistingItem(at: destination, operation: performMove)
+    } else {
+      try performMove()
+    }
+
     notifyChanges(in: [sourceDirectory, directory])
     return destination
   }
@@ -278,12 +324,44 @@ struct FileSystemService {
     NSAppleScript(source: script)?.executeAndReturnError(nil)
   }
 
+  static func notifyFileChanged(at url: URL) {
+    notifyChanges(in: [url.deletingLastPathComponent()])
+  }
+
   private static func validatedName(_ name: String) throws -> String {
     let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !value.isEmpty, value != ".", value != "..", !value.contains("/") else {
       throw FileOperationError.invalidName
     }
     return value
+  }
+
+  private static func replaceExistingItem(
+    at destination: URL,
+    operation: () throws -> Void
+  ) throws {
+    let fileManager = FileManager.default
+    let directory = destination.deletingLastPathComponent()
+    let backup = directory.appendingPathComponent(
+      ".nafi-replaced-\(UUID().uuidString)",
+      isDirectory: false
+    )
+
+    try fileManager.moveItem(at: destination, to: backup)
+    do {
+      try operation()
+      try fileManager.removeItem(at: backup)
+    } catch {
+      try? fileManager.removeItem(at: destination)
+      do {
+        try fileManager.moveItem(at: backup, to: destination)
+      } catch let restoreError {
+        throw FileOperationError.processFailed(
+          "置き換えに失敗し、元の項目も復元できませんでした。バックアップ: \(backup.path)\n\(restoreError.localizedDescription)"
+        )
+      }
+      throw error
+    }
   }
 
   private static func uniqueURL(for name: String, in directory: URL) -> URL {

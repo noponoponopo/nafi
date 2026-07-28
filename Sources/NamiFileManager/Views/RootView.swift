@@ -17,7 +17,7 @@ private struct RootViewContent: View {
       SidebarView(
         serverManager: appState.serverManager, model: appState.sidebarModel, workspace: workspace
       )
-      .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 430)
+      .navigationSplitViewColumnWidth(min: 180, ideal: 240, max: 380)
     } detail: {
       WorkspaceView(workspace: workspace)
         .background(Color(nsColor: .textBackgroundColor))
@@ -38,6 +38,22 @@ private struct RootViewContent: View {
         ContentUnavailableView("選択項目なし", systemImage: "info.circle")
           .frame(width: 420, height: 280)
       }
+    }
+    .sheet(item: $appState.quickEditRequest) { request in
+      QuickEditView(url: request.url) { savedURL in
+        appState.quickEditDidSave(savedURL)
+      }
+    }
+    .alert(
+      "nafi",
+      isPresented: Binding(
+        get: { appState.presentationErrorMessage != nil },
+        set: { if !$0 { appState.presentationErrorMessage = nil } }
+      )
+    ) {
+      Button("OK", role: .cancel) { appState.presentationErrorMessage = nil }
+    } message: {
+      Text(appState.presentationErrorMessage ?? "")
     }
   }
 

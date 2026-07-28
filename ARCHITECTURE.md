@@ -1,4 +1,4 @@
-# Nami architecture
+# nafi architecture
 
 ## State hierarchy
 
@@ -8,9 +8,9 @@ This hierarchy prevents one pane's navigation or selection from leaking into ano
 
 ## Pane and tab drag flow
 
-Tabs use a typed `Transferable` payload. Dropping on a tab strip inserts or reorders the tab. Dropping on a 12-point edge target asks `WorkspaceModel` to replace the target leaf with a new split node. A source pane with multiple tabs transfers the model; a source pane with only one tab clones it so the pane tree never becomes invalid.
+Tabs use a typed `Transferable` payload. Dropping on a tab strip inserts or reorders the tab. Dropping on a 24-point edge target asks `WorkspaceModel` to replace the target leaf with a new split node. A source pane with multiple tabs transfers the model; a source pane with only one tab clones it so the pane tree never becomes invalid.
 
-Files use a separate typed payload. Drops resolve to the target folder represented by a pane or directory row. Copy is the default; Command-drag requests a move.
+Files use a separate typed payload. Drops resolve to the target folder represented by a pane or directory row. Move is the default; holding Option at the destination requests a copy. Folder, tab, pane-edge, and sidebar targets expose visible destination indicators, and hover targets activate after a short delay.
 
 ## Selection and rendering
 

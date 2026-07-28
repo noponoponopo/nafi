@@ -18,7 +18,7 @@ private struct PaneTreeView: View {
     case .pane(let paneID):
       if let session = workspace.session(for: paneID) {
         PaneHostView(session: session, workspace: workspace)
-          .frame(minWidth: 320, minHeight: 230)
+          .frame(minWidth: 220, minHeight: 160)
       }
     case .split(_, let axis, let first, let second):
       if axis == .horizontal {

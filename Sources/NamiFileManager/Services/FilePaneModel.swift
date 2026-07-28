@@ -36,6 +36,53 @@ final class FilePaneModel: ObservableObject, Identifiable {
     }
   }
 
+  enum TransferConflictResolution: Equatable {
+    case keepBoth
+    case replace
+  }
+
+  struct TransferConflictPrompt: Identifiable {
+    let id = UUID()
+    let urls: [URL]
+    let destination: URL
+    let move: Bool
+    let conflictingURLs: [URL]
+    let clearPasteboardOnSuccess: Bool
+
+    var title: String {
+      conflictingURLs.count == 1
+        ? "同じ名前の項目があります"
+        : "同じ名前の項目が \(conflictingURLs.count) 件あります"
+    }
+
+    var message: String {
+      let names = conflictingURLs.prefix(3).map { "「\($0.lastPathComponent)」" }
+      let remainder = conflictingURLs.count - names.count
+      let nameList = names.joined(separator: "、") + (remainder > 0 ? " ほか \(remainder) 件" : "")
+      let action = move ? "移動先" : "コピー先"
+      let selfCopyOnly =
+        !move
+        && conflictingURLs.allSatisfy { source in
+          source.standardizedFileURL
+            == destination.appendingPathComponent(source.lastPathComponent).standardizedFileURL
+        }
+
+      if selfCopyOnly {
+        return "\(action)に\(nameList)があります。同じ場所へコピーするため、置き換えはできません。「両方残す」を選ぶと番号を付けてコピーします。"
+      }
+
+      return
+        "\(action)に\(nameList)があります。「置き換える」は既存項目を入れ替え、「両方残す」は新しい項目へ番号を付けます。この選択は今回の同名項目すべてに適用されます。"
+    }
+
+    var canReplace: Bool {
+      conflictingURLs.contains { source in
+        source.standardizedFileURL
+          != destination.appendingPathComponent(source.lastPathComponent).standardizedFileURL
+      }
+    }
+  }
+
   let id: UUID
   let selectionController = FileSelectionController()
 
@@ -64,6 +111,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
   @Published var errorMessage: String?
   @Published var prompt: Prompt?
   @Published var promptText = ""
+  @Published var transferConflict: TransferConflictPrompt?
 
   private var allItems: [FileItem] = []
   private var itemLookup: [URL: FileItem] = [:]
@@ -80,6 +128,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
   private var loadToken = UUID()
   private var contentRevision = 0
   private var ignoreFileSystemNotificationsUntil = Date.distantPast
+  private var pendingSelectionURL: URL?
 
   init(id: UUID = UUID(), initialURL: URL, showHidden: Bool = false, viewMode: FileViewMode = .list)
   {
@@ -203,6 +252,15 @@ final class FilePaneModel: ObservableObject, Identifiable {
       self.selectionController.retain(available, plus: Set(preserved))
       self.supplementalItems = self.supplementalItems.filter {
         self.selectionController.contains($0.key)
+      }
+
+      if let pendingURL = self.pendingSelectionURL?.standardizedFileURL,
+        let pendingItem = lookup[pendingURL]
+      {
+        self.selectionController.replace(with: [pendingItem.url], primary: pendingItem.url)
+        self.selectionAnchor = pendingItem.url
+        self.selectionAnchorScope = directory.standardizedFileURL
+        self.pendingSelectionURL = nil
       }
       self.errorMessage = nil
     }
@@ -512,9 +570,34 @@ final class FilePaneModel: ObservableObject, Identifiable {
     prompt = .rename(url)
   }
 
-  func requestRenameSelected() {
-    guard let url = selectedItem?.url else { return }
+  @discardableResult
+  func requestRenameSelected() -> Bool {
+    guard let url = selectedItem?.url else { return false }
     requestRename(url)
+    return true
+  }
+
+  func selectAfterNextLoad(_ url: URL) {
+    let standardized = url.standardizedFileURL
+    if let item = itemLookup[standardized] ?? supplementalItems[standardized] {
+      selectionController.replace(with: [item.url], primary: item.url)
+      selectionAnchor = item.url
+      selectionAnchorScope = currentURL.standardizedFileURL
+      pendingSelectionURL = nil
+      return
+    }
+    pendingSelectionURL = standardized
+  }
+
+  func revealExternalItem(_ url: URL) {
+    let standardized = url.standardizedFileURL
+    let parent = standardized.deletingLastPathComponent().standardizedFileURL
+    pendingSelectionURL = standardized
+    if currentURL.standardizedFileURL == parent {
+      load()
+    } else {
+      navigate(to: parent)
+    }
   }
 
   func requestTagsForSelection() {
@@ -591,23 +674,107 @@ final class FilePaneModel: ObservableObject, Identifiable {
     }
   }
 
-  func transferItems(_ urls: [URL], to destination: URL, move: Bool) {
-    let safeURLs = urls.filter { $0 != destination && !destination.path.hasPrefix($0.path + "/") }
-    guard !safeURLs.isEmpty else { return }
-    runOperation(label: move ? "移動中" : "コピー中") {
-      try safeURLs.map { url in
+  func transferItems(
+    _ urls: [URL],
+    to destination: URL,
+    move: Bool,
+    clearPasteboardOnSuccess: Bool = false
+  ) {
+    guard operationLabel == nil else {
+      errorMessage = "別のファイル操作が進行中です。"
+      return
+    }
+
+    let destinationURL = destination.standardizedFileURL
+    let safeURLs = urls.filter { url in
+      let source = url.standardizedFileURL
+      guard source != destinationURL, !destinationURL.path.hasPrefix(source.path + "/") else {
+        return false
+      }
+      if move, source.deletingLastPathComponent() == destinationURL { return false }
+      return true
+    }
+    guard !safeURLs.isEmpty else {
+      if clearPasteboardOnSuccess { NSPasteboard.general.clearContents() }
+      return
+    }
+
+    let conflicts = safeURLs.filter { url in
+      let candidate = destination.appendingPathComponent(url.lastPathComponent)
+      return FileManager.default.fileExists(atPath: candidate.path)
+    }
+
+    if !conflicts.isEmpty {
+      transferConflict = TransferConflictPrompt(
+        urls: safeURLs,
+        destination: destination,
+        move: move,
+        conflictingURLs: conflicts,
+        clearPasteboardOnSuccess: clearPasteboardOnSuccess
+      )
+      return
+    }
+
+    performTransfer(
+      safeURLs,
+      to: destination,
+      move: move,
+      resolution: .keepBoth,
+      clearPasteboardOnSuccess: clearPasteboardOnSuccess
+    )
+  }
+
+  func resolveTransferConflict(_ resolution: TransferConflictResolution) {
+    guard let conflict = transferConflict else { return }
+    transferConflict = nil
+    performTransfer(
+      conflict.urls,
+      to: conflict.destination,
+      move: conflict.move,
+      resolution: resolution,
+      clearPasteboardOnSuccess: conflict.clearPasteboardOnSuccess
+    )
+  }
+
+  func cancelTransferConflict() {
+    transferConflict = nil
+  }
+
+  private func performTransfer(
+    _ urls: [URL],
+    to destination: URL,
+    move: Bool,
+    resolution: TransferConflictResolution,
+    clearPasteboardOnSuccess: Bool
+  ) {
+    let existingItemPolicy: FileSystemService.ExistingItemPolicy =
+      resolution == .replace ? .replace : .keepBoth
+
+    runOperation(
+      label: move ? "移動中" : "コピー中",
+      clearPasteboardOnSuccess: clearPasteboardOnSuccess
+    ) {
+      try urls.map { url in
         move
-          ? try FileSystemService.move(url, to: destination)
-          : try FileSystemService.copy(url, to: destination)
+          ? try FileSystemService.move(
+            url, to: destination, existingItemPolicy: existingItemPolicy)
+          : try FileSystemService.copy(
+            url, to: destination, existingItemPolicy: existingItemPolicy)
       }
     }
   }
 
-  func acceptDrop(_ payloads: [FileDragPayload], to destination: URL) -> Bool {
-    let urls = payloads.flatMap(\.urls)
-    guard !urls.isEmpty else { return false }
-    let move = NSEvent.modifierFlags.contains(.command) && !NSEvent.modifierFlags.contains(.option)
-    transferItems(urls, to: destination, move: move)
+  func acceptDrop(_ providers: [NSItemProvider], to destination: URL) -> Bool {
+    guard DragPayloadProvider.canLoadFileURLs(from: providers) else { return false }
+
+    // Internal and Finder drags move by default. Hold Option while dropping to copy instead.
+    let move = !NSEvent.modifierFlags.contains(.option)
+    DragPayloadProvider.loadFileURLs(from: providers) { [weak self] urls in
+      guard !urls.isEmpty else { return }
+      Task { @MainActor [weak self] in
+        self?.transferItems(urls, to: destination, move: move)
+      }
+    }
     return true
   }
 
@@ -635,8 +802,12 @@ final class FilePaneModel: ObservableObject, Identifiable {
     let urls = objects.compactMap { $0 as URL }
     let move =
       pasteboard.string(forType: NSPasteboard.PasteboardType("app.nami.transfer-mode")) == "cut"
-    transferItems(urls, to: currentURL, move: move)
-    if move { pasteboard.clearContents() }
+    transferItems(
+      urls,
+      to: currentURL,
+      move: move,
+      clearPasteboardOnSuccess: move
+    )
   }
 
   func previewSelected() {
@@ -764,6 +935,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
     label: String,
     selectsResults: Bool = true,
     clearsSelection: Bool = false,
+    clearPasteboardOnSuccess: Bool = false,
     operation: @escaping @Sendable () throws -> [URL]
   ) {
     guard operationLabel == nil else {
@@ -789,6 +961,9 @@ final class FilePaneModel: ObservableObject, Identifiable {
       }
 
       self.ignoreFileSystemNotificationsUntil = Date().addingTimeInterval(0.55)
+      if clearPasteboardOnSuccess {
+        NSPasteboard.general.clearContents()
+      }
       if selectsResults {
         self.selectionController.replace(with: Set(result.urls), primary: result.urls.first)
         self.selectionAnchor = result.urls.first

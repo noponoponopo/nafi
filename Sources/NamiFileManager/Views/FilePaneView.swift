@@ -5,6 +5,7 @@ import SwiftUI
 struct FilePaneView: View {
   @EnvironmentObject private var appState: AppState
   @ObservedObject var model: FilePaneModel
+  @State private var paneDropTargeted = false
 
   var body: some View {
     VStack(spacing: 0) {
@@ -13,8 +14,30 @@ struct FilePaneView: View {
       FilePaneStatusBar(model: model)
     }
     .background(Color(nsColor: .textBackgroundColor))
-    .dropDestination(for: FileDragPayload.self) { payloads, _ in
-      model.acceptDrop(payloads, to: model.currentURL)
+    .overlay {
+      if paneDropTargeted {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+          .fill(Color.accentColor.opacity(0.08))
+          .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+              .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [7, 5]))
+          }
+          .overlay {
+            Label("このフォルダへ移動（Optionでコピー）", systemImage: "arrow.down.to.line")
+              .font(.caption.weight(.semibold))
+              .padding(.horizontal, 10)
+              .padding(.vertical, 6)
+              .background(.regularMaterial, in: Capsule())
+          }
+          .padding(6)
+          .allowsHitTesting(false)
+      }
+    }
+    .onDrop(
+      of: DragPayloadProvider.fileDropTypes,
+      isTargeted: $paneDropTargeted
+    ) { providers in
+      model.acceptDrop(providers, to: model.currentURL)
     }
     .contextMenu { backgroundContextMenu }
     .alert(
@@ -28,6 +51,24 @@ struct FilePaneView: View {
       Button("キャンセル", role: .cancel) { model.prompt = nil }
       Button("実行") { model.commitPrompt() }
         .keyboardShortcut(.defaultAction)
+    }
+    .alert(
+      model.transferConflict?.title ?? "同じ名前の項目があります",
+      isPresented: Binding(
+        get: { model.transferConflict != nil },
+        set: { if !$0 { model.cancelTransferConflict() } }
+      )
+    ) {
+      Button("キャンセル", role: .cancel) { model.cancelTransferConflict() }
+      Button("両方残す") { model.resolveTransferConflict(.keepBoth) }
+        .keyboardShortcut(.defaultAction)
+      if model.transferConflict?.canReplace == true {
+        Button("置き換える", role: .destructive) {
+          model.resolveTransferConflict(.replace)
+        }
+      }
+    } message: {
+      Text(model.transferConflict?.message ?? "")
     }
     .alert(
       "ファイル操作エラー",
@@ -256,11 +297,16 @@ private struct SelectableListRow: View {
         model.activate(item)
       }
     )
-    .draggable(model.dragPayload(for: item))
-    .dropDestination(for: FileDragPayload.self) { payloads, _ in
-      guard item.isDirectory, !item.isPackage else { return false }
-      return model.acceptDrop(payloads, to: item.url)
+    .onDrag {
+      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
     }
+    .modifier(
+      FileFolderDropModifier(
+        model: model,
+        destination: item.isDirectory && !item.isPackage ? item.url : nil,
+        open: { model.navigate(to: item.url) }
+      )
+    )
     .contextMenu { FileItemContextMenu(model: model, item: item) }
   }
 }
@@ -342,11 +388,16 @@ private struct MatrixCell: View {
         model.activate(item)
       }
     )
-    .draggable(model.dragPayload(for: item))
-    .dropDestination(for: FileDragPayload.self) { payloads, _ in
-      guard item.isDirectory, !item.isPackage else { return false }
-      return model.acceptDrop(payloads, to: item.url)
+    .onDrag {
+      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
     }
+    .modifier(
+      FileFolderDropModifier(
+        model: model,
+        destination: item.isDirectory && !item.isPackage ? item.url : nil,
+        open: { model.navigate(to: item.url) }
+      )
+    )
     .contextMenu { FileItemContextMenu(model: model, item: item) }
   }
 }
@@ -375,16 +426,36 @@ struct FileGalleryView: View {
 }
 
 private struct GalleryPreview: View {
+  @EnvironmentObject private var appState: AppState
   let model: FilePaneModel
   let selectedURL: URL?
 
   var body: some View {
     ZStack {
       if let selected = model.item(for: selectedURL) {
-        EmbeddedQuickLookView(url: selected.url)
-          .padding(18)
-          .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-          .padding(18)
+        VStack(spacing: 0) {
+          EmbeddedQuickLookView(url: selected.url)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+          if QuickEditSupport.isEditable(selected) {
+            Divider()
+            HStack {
+              Spacer()
+              Button {
+                appState.presentQuickEdit(for: selected)
+              } label: {
+                Label("クイックエディット", systemImage: "square.and.pencil")
+              }
+              .buttonStyle(.bordered)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 46)
+            .background(.bar)
+          }
+        }
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(18)
       } else {
         ContentUnavailableView("項目を選択", systemImage: "rectangle.on.rectangle.angled")
       }
@@ -461,7 +532,16 @@ private struct GalleryThumbnail: View {
     )
     .contentShape(Rectangle())
     .highPriorityGesture(TapGesture(count: 2).onEnded { model.activate(item) })
-    .draggable(model.dragPayload(for: item))
+    .onDrag {
+      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
+    }
+    .modifier(
+      FileFolderDropModifier(
+        model: model,
+        destination: item.isDirectory && !item.isPackage ? item.url : nil,
+        open: { model.navigate(to: item.url) }
+      )
+    )
     .contextMenu { FileItemContextMenu(model: model, item: item) }
   }
 }
@@ -502,9 +582,16 @@ struct FileColumnBrowserView: View {
     ScrollView(.horizontal) {
       LazyHStack(spacing: 0) {
         ForEach(Array(columns.enumerated()), id: \.element.id) { index, column in
-          ColumnView(model: model, data: column) { item, modifiers in
-            select(item, modifiers: modifiers, in: index)
-          }
+          ColumnView(
+            model: model,
+            data: column,
+            select: { item, modifiers in
+              select(item, modifiers: modifiers, in: index)
+            },
+            openOnHover: { item in
+              select(item, modifiers: [], in: index)
+            }
+          )
           Divider()
         }
       }
@@ -583,6 +670,7 @@ private struct ColumnView: View {
   let model: FilePaneModel
   let data: ColumnData
   let select: (FileItem, NSEvent.ModifierFlags) -> Void
+  let openOnHover: (FileItem) -> Void
 
   var body: some View {
     FileSelectionSurface(
@@ -598,7 +686,8 @@ private struct ColumnView: View {
                 ColumnItemRow(
                   model: model,
                   item: item,
-                  selection: model.selectionFlag(for: item.url)
+                  selection: model.selectionFlag(for: item.url),
+                  openOnHover: { openOnHover(item) }
                 )
                 .fileSelectionHitTarget(item.url, in: coordinateSpace)
               }
@@ -619,6 +708,7 @@ private struct ColumnItemRow: View {
   let model: FilePaneModel
   let item: FileItem
   @ObservedObject var selection: SelectionFlag
+  let openOnHover: () -> Void
 
   var body: some View {
     HStack(spacing: 7) {
@@ -639,12 +729,80 @@ private struct ColumnItemRow: View {
     }
     .contentShape(Rectangle())
     .highPriorityGesture(TapGesture(count: 2).onEnded { model.activate(item) })
-    .draggable(model.dragPayload(for: item))
-    .dropDestination(for: FileDragPayload.self) { payloads, _ in
-      guard item.isDirectory, !item.isPackage else { return false }
-      return model.acceptDrop(payloads, to: item.url)
+    .onDrag {
+      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
     }
+    .modifier(
+      FileFolderDropModifier(
+        model: model,
+        destination: item.isDirectory && !item.isPackage ? item.url : nil,
+        open: openOnHover
+      )
+    )
     .contextMenu { FileItemContextMenu(model: model, item: item) }
+  }
+}
+
+private struct FileFolderDropModifier: ViewModifier {
+  @ObservedObject var model: FilePaneModel
+  let destination: URL?
+  let open: () -> Void
+
+  @State private var targeted = false
+  @State private var focusTask: Task<Void, Never>?
+
+  func body(content: Content) -> some View {
+    content
+      .overlay {
+        if targeted {
+          RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .fill(Color.accentColor.opacity(0.16))
+            .overlay {
+              RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .strokeBorder(Color.accentColor, lineWidth: 2)
+            }
+            .allowsHitTesting(false)
+        }
+      }
+      .overlay(alignment: .topTrailing) {
+        if targeted {
+          Image(systemName: "arrow.down.to.line")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(Color.accentColor)
+            .padding(5)
+            .background(.regularMaterial, in: Circle())
+            .padding(4)
+            .allowsHitTesting(false)
+        }
+      }
+      .onDrop(
+        of: DragPayloadProvider.fileDropTypes,
+        isTargeted: Binding(
+          get: { targeted },
+          set: { updateTargeted($0 && destination != nil) }
+        )
+      ) { providers in
+        guard let destination else { return false }
+        cancelFocusTask()
+        return model.acceptDrop(providers, to: destination)
+      }
+      .onDisappear { cancelFocusTask() }
+  }
+
+  private func updateTargeted(_ isTargeted: Bool) {
+    targeted = isTargeted
+    cancelFocusTask()
+    guard isTargeted else { return }
+    focusTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 850_000_000)
+      guard !Task.isCancelled, targeted else { return }
+      open()
+    }
+  }
+
+  private func cancelFocusTask() {
+    focusTask?.cancel()
+    focusTask = nil
   }
 }
 
@@ -699,6 +857,12 @@ private struct FileItemContextMenu: View {
     Button("Quick Look") {
       model.ensureSelected(item)
       model.previewSelected()
+    }
+    if QuickEditSupport.isEditable(item) {
+      Button("クイックエディット") {
+        model.ensureSelected(item)
+        appState.presentQuickEdit(for: item)
+      }
     }
     Divider()
     Button("コピー") {

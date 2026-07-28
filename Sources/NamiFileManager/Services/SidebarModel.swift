@@ -18,11 +18,7 @@ final class SidebarModel: ObservableObject {
   private let persistenceURL: URL
 
   init() {
-    let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-      .first!
-      .appendingPathComponent("Nami", isDirectory: true)
-    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    persistenceURL = directory.appendingPathComponent("sidebar.json")
+    persistenceURL = AppStoragePaths.file(named: "sidebar.json")
     load()
   }
 
@@ -63,6 +59,13 @@ final class SidebarModel: ObservableObject {
     let adjustedDestination =
       sourceIndex < destinationIndex ? destinationIndex - 1 : destinationIndex
     favorites.insert(item, at: max(0, adjustedDestination))
+    persist()
+  }
+
+  func moveToEnd(itemID: UUID) {
+    guard let sourceIndex = favorites.firstIndex(where: { $0.id == itemID }) else { return }
+    let item = favorites.remove(at: sourceIndex)
+    favorites.append(item)
     persist()
   }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PaneHostView: View {
   @ObservedObject var session: PaneSession
@@ -18,6 +19,7 @@ struct PaneHostView: View {
         moveSelection: session.activeModel.moveSelection,
         clearSelection: session.activeModel.clearSelection,
         previewSelection: session.activeModel.previewSelected,
+        renameSelection: session.activeModel.requestRenameSelected,
         canGoBack: { session.activeModel.canGoBack },
         canGoForward: { session.activeModel.canGoForward },
         goBack: session.activeModel.goBack,
@@ -31,7 +33,6 @@ struct PaneHostView: View {
 private struct PaneTabStripView: View {
   @ObservedObject var session: PaneSession
   @ObservedObject var workspace: WorkspaceModel
-  @State private var tabDropTargeted = false
 
   var body: some View {
     HStack(spacing: 0) {
@@ -52,15 +53,26 @@ private struct PaneTabStripView: View {
                 }
               }
             )
-            .draggable(
-              PaneDragPayload(sourcePaneID: session.id, sourceTabID: tab.id, url: tab.currentURL)
-            )
-            .dropDestination(for: PaneDragPayload.self) { payloads, _ in
-              guard let payload = payloads.first else { return false }
-              workspace.placeTabPayload(payload, in: session.id, before: tab.id)
-              return true
+            .onDrag {
+              DragPayloadProvider.paneProvider(
+                for: PaneDragPayload(
+                  sourcePaneID: session.id,
+                  sourceTabID: tab.id,
+                  url: tab.currentURL
+                )
+              )
             }
+            .modifier(
+              TabDestinationDropModifier(
+                session: session,
+                workspace: workspace,
+                model: tab,
+                tabID: tab.id
+              )
+            )
           }
+
+          TabAppendDropTarget(session: session, workspace: workspace)
         }
         .padding(.horizontal, 6)
       }
@@ -78,16 +90,135 @@ private struct PaneTabStripView: View {
       .help("新規タブ")
     }
     .frame(height: 35)
-    .background(tabDropTargeted ? Color.accentColor.opacity(0.11) : Color.clear)
     .background(.bar)
     .overlay(alignment: .bottom) { Divider() }
-    .dropDestination(for: PaneDragPayload.self) { payloads, _ in
-      guard let payload = payloads.first else { return false }
-      workspace.placeTabPayload(payload, in: session.id)
-      return true
-    } isTargeted: {
-      tabDropTargeted = $0
+  }
+}
+
+private struct TabDestinationDropModifier: ViewModifier {
+  @ObservedObject var session: PaneSession
+  @ObservedObject var workspace: WorkspaceModel
+  @ObservedObject var model: FilePaneModel
+  let tabID: UUID
+
+  @State private var fileTargeted = false
+  @State private var reorderTargeted = false
+  @State private var focusTask: Task<Void, Never>?
+
+  func body(content: Content) -> some View {
+    content
+      .overlay {
+        if fileTargeted {
+          RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.accentColor.opacity(0.16))
+            .overlay {
+              RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.accentColor, lineWidth: 2)
+            }
+            .allowsHitTesting(false)
+        }
+      }
+      .overlay(alignment: .trailing) {
+        if fileTargeted {
+          Image(systemName: "arrow.down.to.line")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(Color.accentColor)
+            .padding(.trailing, 7)
+            .allowsHitTesting(false)
+        }
+      }
+      .overlay(alignment: .leading) {
+        if reorderTargeted {
+          RoundedRectangle(cornerRadius: 2, style: .continuous)
+            .fill(Color.accentColor)
+            .frame(width: 4, height: 24)
+            .offset(x: -3)
+            .shadow(radius: 1)
+            .allowsHitTesting(false)
+        }
+      }
+      .onDrop(
+        of: DragPayloadProvider.tabDropTypes,
+        isTargeted: Binding(
+          get: { fileTargeted || reorderTargeted },
+          set: { updateTargeted($0) }
+        )
+      ) { providers in
+        cancelFocusTask()
+
+        if DragPayloadProvider.containsPanePayload(in: providers) {
+          DragPayloadProvider.loadPanePayload(from: providers) { payload in
+            guard let payload else { return }
+            Task { @MainActor in
+              workspace.placeTabPayload(payload, in: session.id, before: tabID)
+            }
+          }
+          return true
+        }
+
+        guard DragPayloadProvider.canLoadFileURLs(from: providers) else { return false }
+        workspace.focus(session.id)
+        session.selectTab(tabID)
+        return model.acceptDrop(providers, to: model.currentURL)
+      }
+      .onDisappear { cancelFocusTask() }
+  }
+
+  private func updateTargeted(_ isTargeted: Bool) {
+    cancelFocusTask()
+    guard isTargeted else {
+      fileTargeted = false
+      reorderTargeted = false
+      return
     }
+
+    let isTabReorder = DragPayloadProvider.draggingPasteboardContains(.nafiPaneTab)
+    reorderTargeted = isTabReorder
+    fileTargeted = !isTabReorder
+
+    focusTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 700_000_000)
+      guard !Task.isCancelled, fileTargeted || reorderTargeted else { return }
+      workspace.focus(session.id)
+      session.selectTab(tabID)
+    }
+  }
+
+  private func cancelFocusTask() {
+    focusTask?.cancel()
+    focusTask = nil
+  }
+}
+
+private struct TabAppendDropTarget: View {
+  @ObservedObject var session: PaneSession
+  @ObservedObject var workspace: WorkspaceModel
+  @State private var targeted = false
+
+  var body: some View {
+    Rectangle()
+      .fill(targeted ? Color.accentColor.opacity(0.1) : Color.clear)
+      .frame(width: 28, height: 28)
+      .overlay(alignment: .leading) {
+        if targeted {
+          RoundedRectangle(cornerRadius: 2, style: .continuous)
+            .fill(Color.accentColor)
+            .frame(width: 4, height: 24)
+            .allowsHitTesting(false)
+        }
+      }
+      .contentShape(Rectangle())
+      .onDrop(of: [.nafiPaneTab], isTargeted: $targeted) { providers in
+        guard DragPayloadProvider.containsPanePayload(in: providers) else { return false }
+        DragPayloadProvider.loadPanePayload(from: providers) { payload in
+          guard let payload else { return }
+          Task { @MainActor in
+            workspace.placeTabPayload(payload, in: session.id)
+          }
+        }
+        return true
+      }
+      .help("ここへ移動")
   }
 }
 
@@ -120,7 +251,7 @@ private struct PaneTabButton: View {
     .font(.system(size: 12.5))
     .padding(.horizontal, 10)
     .frame(height: 28)
-    .frame(minWidth: 104, maxWidth: 200)
+    .frame(minWidth: 92, maxWidth: 200)
     .background(
       isActive ? Color(nsColor: .controlBackgroundColor) : Color.clear,
       in: RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -145,16 +276,41 @@ private struct PaneSplitDropOverlay: View {
 
   var body: some View {
     GeometryReader { proxy in
+      let chromeHeight: CGFloat = 74
+      let contentHeight = max(0, proxy.size.height - chromeHeight)
+
       ZStack {
-        edgeZone(.leading, frame: CGRect(x: 0, y: 0, width: 12, height: proxy.size.height))
+        edgeZone(
+          .leading,
+          frame: CGRect(x: 0, y: chromeHeight, width: 24, height: contentHeight)
+        )
         edgeZone(
           .trailing,
-          frame: CGRect(x: proxy.size.width - 12, y: 0, width: 12, height: proxy.size.height))
-        edgeZone(.top, frame: CGRect(x: 12, y: 0, width: max(0, proxy.size.width - 24), height: 12))
+          frame: CGRect(
+            x: proxy.size.width - 24,
+            y: chromeHeight,
+            width: 24,
+            height: contentHeight
+          )
+        )
+        edgeZone(
+          .top,
+          frame: CGRect(
+            x: 24,
+            y: chromeHeight,
+            width: max(0, proxy.size.width - 48),
+            height: 24
+          )
+        )
         edgeZone(
           .bottom,
           frame: CGRect(
-            x: 12, y: proxy.size.height - 12, width: max(0, proxy.size.width - 24), height: 12))
+            x: 24,
+            y: max(chromeHeight, proxy.size.height - 24),
+            width: max(0, proxy.size.width - 48),
+            height: min(24, contentHeight)
+          )
+        )
       }
     }
   }
@@ -174,7 +330,7 @@ private struct PaneEdgeDropZone: View {
 
   var body: some View {
     Rectangle()
-      .fill(targeted ? Color.accentColor.opacity(0.28) : Color.clear)
+      .fill(targeted ? Color.accentColor.opacity(0.3) : Color.clear)
       .overlay {
         if targeted {
           Image(
@@ -184,12 +340,20 @@ private struct PaneEdgeDropZone: View {
           .foregroundStyle(Color.accentColor)
         }
       }
-      .dropDestination(for: PaneDragPayload.self) { payloads, _ in
-        guard let payload = payloads.first else { return false }
-        workspace.splitTabPayload(payload, targetPaneID: targetPaneID, edge: edge)
+      .overlay {
+        if targeted {
+          Rectangle().strokeBorder(Color.accentColor, lineWidth: 2)
+        }
+      }
+      .onDrop(of: [.nafiPaneTab], isTargeted: $targeted) { providers in
+        guard DragPayloadProvider.containsPanePayload(in: providers) else { return false }
+        DragPayloadProvider.loadPanePayload(from: providers) { payload in
+          guard let payload else { return }
+          Task { @MainActor in
+            workspace.splitTabPayload(payload, targetPaneID: targetPaneID, edge: edge)
+          }
+        }
         return true
-      } isTargeted: {
-        targeted = $0
       }
   }
 }

@@ -12,12 +12,7 @@ final class ServerManager: ObservableObject {
   private let persistenceURL: URL
 
   init() {
-    let appSupport = FileManager.default.urls(
-      for: .applicationSupportDirectory, in: .userDomainMask
-    ).first!
-    .appendingPathComponent("Nami", isDirectory: true)
-    try? FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
-    persistenceURL = appSupport.appendingPathComponent("servers.json")
+    persistenceURL = AppStoragePaths.file(named: "servers.json")
     loadProfiles()
 
     NSWorkspace.shared.notificationCenter.addObserver(
@@ -192,7 +187,7 @@ final class ServerManager: ObservableObject {
     if profile.localMountPath.isEmpty {
       mountPath =
         FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Nami Mounts", isDirectory: true)
+        .appendingPathComponent("nafi Mounts", isDirectory: true)
         .appendingPathComponent(profile.name, isDirectory: true).path
     } else {
       mountPath = NSString(string: profile.localMountPath).expandingTildeInPath

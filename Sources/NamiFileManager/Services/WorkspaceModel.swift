@@ -73,11 +73,12 @@ final class WorkspaceModel: ObservableObject {
     }
   }
 
-  func newTab(in paneID: UUID? = nil, at url: URL? = nil) {
+  @discardableResult
+  func newTab(in paneID: UUID? = nil, at url: URL? = nil) -> FilePaneModel? {
     let targetID = paneID ?? activePaneID
-    guard let session = sessions[targetID] else { return }
+    guard let session = sessions[targetID] else { return nil }
     focus(targetID)
-    session.newTab(at: url ?? session.activeModel.currentURL)
+    return session.newTab(at: url ?? session.activeModel.currentURL)
   }
 
   func closeActiveTab() {
@@ -108,7 +109,7 @@ final class WorkspaceModel: ObservableObject {
       if let tabID {
         target.moveTab(payload.sourceTabID, before: tabID)
       } else {
-        target.selectTab(payload.sourceTabID)
+        target.moveTabToEnd(payload.sourceTabID)
       }
       focus(paneID)
       return

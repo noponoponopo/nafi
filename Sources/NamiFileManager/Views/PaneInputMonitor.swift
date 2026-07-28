@@ -7,6 +7,7 @@ struct PaneInputMonitor: NSViewRepresentable {
   let moveSelection: (Int) -> Void
   let clearSelection: () -> Void
   let previewSelection: () -> Void
+  let renameSelection: () -> Bool
   let canGoBack: () -> Bool
   let canGoForward: () -> Bool
   let goBack: () -> Void
@@ -19,6 +20,7 @@ struct PaneInputMonitor: NSViewRepresentable {
       moveSelection: moveSelection,
       clearSelection: clearSelection,
       previewSelection: previewSelection,
+      renameSelection: renameSelection,
       canGoBack: canGoBack,
       canGoForward: canGoForward,
       goBack: goBack,
@@ -39,6 +41,7 @@ struct PaneInputMonitor: NSViewRepresentable {
       moveSelection: moveSelection,
       clearSelection: clearSelection,
       previewSelection: previewSelection,
+      renameSelection: renameSelection,
       canGoBack: canGoBack,
       canGoForward: canGoForward,
       goBack: goBack,
@@ -59,6 +62,7 @@ struct PaneInputMonitor: NSViewRepresentable {
     private var moveSelection: (Int) -> Void
     private var clearSelection: () -> Void
     private var previewSelection: () -> Void
+    private var renameSelection: () -> Bool
     private var canGoBack: () -> Bool
     private var canGoForward: () -> Bool
     private var goBack: () -> Void
@@ -74,6 +78,7 @@ struct PaneInputMonitor: NSViewRepresentable {
       moveSelection: @escaping (Int) -> Void,
       clearSelection: @escaping () -> Void,
       previewSelection: @escaping () -> Void,
+      renameSelection: @escaping () -> Bool,
       canGoBack: @escaping () -> Bool,
       canGoForward: @escaping () -> Bool,
       goBack: @escaping () -> Void,
@@ -84,6 +89,7 @@ struct PaneInputMonitor: NSViewRepresentable {
       self.moveSelection = moveSelection
       self.clearSelection = clearSelection
       self.previewSelection = previewSelection
+      self.renameSelection = renameSelection
       self.canGoBack = canGoBack
       self.canGoForward = canGoForward
       self.goBack = goBack
@@ -96,6 +102,7 @@ struct PaneInputMonitor: NSViewRepresentable {
       moveSelection: @escaping (Int) -> Void,
       clearSelection: @escaping () -> Void,
       previewSelection: @escaping () -> Void,
+      renameSelection: @escaping () -> Bool,
       canGoBack: @escaping () -> Bool,
       canGoForward: @escaping () -> Bool,
       goBack: @escaping () -> Void,
@@ -106,6 +113,7 @@ struct PaneInputMonitor: NSViewRepresentable {
       self.moveSelection = moveSelection
       self.clearSelection = clearSelection
       self.previewSelection = previewSelection
+      self.renameSelection = renameSelection
       self.canGoBack = canGoBack
       self.canGoForward = canGoForward
       self.goBack = goBack
@@ -136,6 +144,10 @@ struct PaneInputMonitor: NSViewRepresentable {
           case 53:
             self.clearSelection()
             return nil
+          case 36,
+            76
+          where event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty:
+            return self.renameSelection() ? nil : event
           case 49 where event.modifierFlags.intersection([.command, .option, .control]).isEmpty:
             self.previewSelection()
             return nil
@@ -162,7 +174,7 @@ struct PaneInputMonitor: NSViewRepresentable {
 
     private func shouldHandleKeyboardEvent(_ event: NSEvent) -> Bool {
       guard isActive, let window = view?.window, event.window === window else { return false }
-      if let editor = window.firstResponder as? NSTextView, editor.isFieldEditor { return false }
+      if window.firstResponder is NSTextView { return false }
       return true
     }
 
@@ -209,14 +221,14 @@ struct PaneInputMonitor: NSViewRepresentable {
       }
 
       let threshold: CGFloat = 72
-      if horizontalAccumulator >= threshold, canGoBack() {
-        didTriggerNavigation = true
-        goBack()
-        return nil
-      }
-      if horizontalAccumulator <= -threshold, canGoForward() {
+      if horizontalAccumulator >= threshold, canGoForward() {
         didTriggerNavigation = true
         goForward()
+        return nil
+      }
+      if horizontalAccumulator <= -threshold, canGoBack() {
+        didTriggerNavigation = true
+        goBack()
         return nil
       }
 

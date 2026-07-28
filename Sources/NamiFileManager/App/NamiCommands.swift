@@ -38,6 +38,9 @@ struct NamiCommands: Commands {
       Button("圧縮") { appState.activeModel.compressSelection() }
       Button("Quick Look") { appState.activeModel.previewSelected() }
         .keyboardShortcut(.space, modifiers: [])
+      Button("クイックエディット") { appState.quickEditSelected() }
+        .keyboardShortcut("e", modifiers: [.command, .option])
+        .disabled(!appState.canQuickEditSelection)
       Divider()
       Button("ゴミ箱に入れる") { appState.activeModel.trashSelection() }
         .keyboardShortcut(.delete, modifiers: .command)

@@ -14,13 +14,13 @@ fi
 
 swift build -c release
 BIN_DIR="$(swift build -c release --show-bin-path)"
-APP="$ROOT/.build/Nami.app"
+APP="$ROOT/.build/nafi.app"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN_DIR/Nami" "$APP/Contents/MacOS/Nami"
+cp "$BIN_DIR/nafi" "$APP/Contents/MacOS/nafi"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
-chmod +x "$APP/Contents/MacOS/Nami"
+chmod +x "$APP/Contents/MacOS/nafi"
 
 if [[ -f "$ICON_SRC" ]]; then
   if ! command -v rsvg-convert >/dev/null 2>&1; then

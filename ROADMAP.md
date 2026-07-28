@@ -1,4 +1,4 @@
-# Nami roadmap after the workspace redesign
+# nafi roadmap after the workspace redesign
 
 ## Transfer reliability
 
