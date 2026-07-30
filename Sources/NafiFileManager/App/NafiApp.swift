@@ -37,6 +37,15 @@ struct NafiApp: App {
     .windowResizability(.contentMinSize)
     .handlesExternalEvents(matching: [])
 
+    WindowGroup("Drop Stack", id: "drop-stack") {
+      DropStackView(model: appState.dropStack)
+        .environmentObject(appState)
+        .background(WindowTabbingDisabler())
+    }
+    .defaultSize(width: 700, height: 480)
+    .windowResizability(.contentMinSize)
+    .handlesExternalEvents(matching: [])
+
     Settings {
       SettingsView()
         .environmentObject(appState)

@@ -28,6 +28,9 @@ private struct BrowserWindowHost: View {
         appState.openInspector = { url in
           openWindow(id: "file-inspector", value: url)
         }
+        appState.openDropStack = {
+          openWindow(id: "drop-stack")
+        }
       }
   }
 }
@@ -83,9 +86,6 @@ private struct RootViewContent: View {
     .sheet(isPresented: $appState.isQuickOpenPresented) {
       QuickOpenView(model: appState.quickOpenModel) { appState.openQuickOpenResult($0) }
     }
-    .sheet(isPresented: $appState.isDropStackPresented) {
-      DropStackView(model: appState.dropStack, destination: workspace.activeModel.currentURL)
-    }
     .sheet(isPresented: $appState.isSyncCenterPresented) {
       SyncCenterView(manager: appState.syncManager, currentURL: workspace.activeModel.currentURL)
     }
@@ -123,7 +123,6 @@ private struct RootViewContent: View {
         Button("同期") { appState.isSyncCenterPresented = true }
         Button("選択をDrop Stackへ追加") { appState.addSelectionToDropStack() }
           .disabled(workspace.activeModel.selectedItems.isEmpty)
-        Button("Drop Stackを開く") { appState.isDropStackPresented = true }
         Button("ワークスペース") { appState.isWorkspaceLibraryPresented = true }
         Divider()
         Button("ここでターミナルを開く") { workspace.activeModel.openTerminalHere() }
@@ -140,6 +139,15 @@ private struct RootViewContent: View {
         Label("クイック操作", systemImage: "ellipsis.circle")
       }
       .help("クイック操作")
+    }
+
+    ToolbarItem {
+      Button {
+        appState.openDropStack?()
+      } label: {
+        Image(systemName: "tray.full.fill")
+      }
+      .help("Drop Stack")
     }
 
     ToolbarItem {

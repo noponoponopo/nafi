@@ -77,7 +77,7 @@ SMB、WebDAV、NFS、AFPの接続でFinderや他のGUIクライアントは起�
 
 - 起動時の自動接続を有効にしたプロファイルは、バックオフを挟んで最大3回再試行します。
 - FTP、`AUTH TLS`を使う明示的FTPS、暗黙的FTPSに対応します。FTPSではTLS 1.2以降を使い、証明書検証は既定で有効です。
-- SFTPは両方の認証方式でmacOSのOpenSSHを使い、`StrictHostKeyChecking=yes`を指定します。初回接続前に設定画面でサーバー鍵の指紋を取得・表示して明示的に承認し、信頼した鍵を`~/Library/Application Support/nafi/known_hosts`へ保存します。未登録または変更された鍵は拒否します。
+- SFTPは両方の認証方式でmacOSのOpenSSHを使い、`StrictHostKeyChecking=yes`を指定します。初回接続前にサーバー鍵を取得して自動的に信頼し、標準の`~/.ssh/known_hosts`へ保存します。未登録または変更された鍵は拒否します。
 - 「ここでターミナルを開く」はローカルフォルダとSFTPルートで利用できます。FTPとFTPSには対話的なシェルがありません。
 - パスワード、SFTP秘密鍵のパスフレーズ、S3シークレットキー、一時S3セッショントークンはmacOS Keychainに分けて保存します。秘密鍵ファイルの内容は選択した場所に残し、接続時だけ読み込みます。
 
@@ -96,7 +96,7 @@ SMB、WebDAV、NFS、AFPの接続でFinderや他のGUIクライアントは起�
 - `servers.json`にはサーバープロファイルを保存します。秘密情報は含めません。
 - `sidebar.json`にはサイドバーの構成を保存します。
 - `icloud-drive.bookmark`には、手動で選択したiCloud Driveのセキュリティスコープ付きブックマークを保存します。
-- `known_hosts`には、明示的に信頼したSFTPホストキーを保存します。
+- `~/.ssh/known_hosts`には、信頼したSFTPホストキーを保存します。
 - `transfers.json`には、件数とサイズに上限を設けた永続転送キューと直近の完了履歴を保存します。
 
 nafiは閲覧したフォルダへ独自の表示メタデータを書き込まず、`.DS_Store`を作成しません。Finderや他のアプリケーションが作成するメタデータは抑止しません。リモート項目のQuick Look、サムネイル、編集、ルート間転送では、操作中に一時的なローカルファイルを作成する場合があります。

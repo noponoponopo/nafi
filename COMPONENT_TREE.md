@@ -131,7 +131,7 @@ SettingsView
 ├─ server profile editor → native protocols / named rclone provider presets
 │  ├─ RcloneProviderEditor → provider fields / browser authentication / config questions
 │  └─ ServerManager / SSHHostKeyService
-│     └─ app known_hosts / matching OpenSSH known_hosts key import
+│     └─ user's ~/.ssh/known_hosts
 ├─ rclone OAuth refresh → RcloneRuntime token monitor
 │  └─ ServerManager → Keychain / active RcloneRemoteSession
 └─ transfer tab → TransferQueueModel → TransferQueue

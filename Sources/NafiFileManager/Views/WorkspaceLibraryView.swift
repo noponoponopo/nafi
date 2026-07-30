@@ -11,6 +11,13 @@ struct WorkspaceLibraryView: View {
   var body: some View {
     VStack(spacing: 0) {
       HStack {
+        Text("ワークスペース").font(.title3.weight(.semibold))
+        Spacer()
+        Button("完了", action: { dismiss() }).keyboardShortcut(.defaultAction)
+      }
+      .padding(16)
+      Divider()
+      HStack {
         TextField("ワークスペース名", text: $name)
           .textFieldStyle(.roundedBorder)
         Button("現在の状態を保存") {

@@ -7,6 +7,7 @@ final class SidebarModel: ObservableObject {
   @Published var showsFavorites = true { didSet { persistUnlessLoading() } }
   @Published var showsVolumes = true { didSet { persistUnlessLoading() } }
   @Published var showsServers = true { didSet { persistUnlessLoading() } }
+  @Published var showsICloud = true { didSet { persistUnlessLoading() } }
   @Published private(set) var persistenceErrorMessage: String?
 
   private struct Persistence: Codable {
@@ -14,6 +15,7 @@ final class SidebarModel: ObservableObject {
     var showsFavorites: Bool
     var showsVolumes: Bool
     var showsServers: Bool
+    var showsICloud: Bool?
   }
 
   private let persistenceURL: URL
@@ -97,6 +99,7 @@ final class SidebarModel: ObservableObject {
     showsFavorites = true
     showsVolumes = true
     showsServers = true
+    showsICloud = true
     isLoading = false
     persistUnlessLoading()
   }
@@ -137,6 +140,7 @@ final class SidebarModel: ObservableObject {
       showsFavorites = decoded.showsFavorites
       showsVolumes = decoded.showsVolumes
       showsServers = decoded.showsServers
+      showsICloud = decoded.showsICloud ?? true
       isLoading = false
       persistenceErrorMessage = nil
     } catch {
@@ -153,7 +157,8 @@ final class SidebarModel: ObservableObject {
       favorites: favorites,
       showsFavorites: showsFavorites,
       showsVolumes: showsVolumes,
-      showsServers: showsServers
+      showsServers: showsServers,
+      showsICloud: showsICloud
     )
     do {
       let encoder = JSONEncoder()

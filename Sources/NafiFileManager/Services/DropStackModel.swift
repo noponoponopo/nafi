@@ -70,25 +70,6 @@ final class DropStackModel: ObservableObject {
     if !persist() { entries = previous }
   }
 
-  func enqueueTransfer(to destination: URL, move: Bool) {
-    let urls = entries.map { $0.resolvedURL() }
-    guard !urls.isEmpty else { return }
-    Task {
-      do {
-        _ = try await TransferQueue.shared.enqueue(
-          sources: urls,
-          destination: destination,
-          move: move,
-          policy: .keepBoth
-        )
-        // Keep entries until the user removes them. Enqueueing is not completion:
-        // a queued move can still fail or be retried after relaunch.
-      } catch {
-        await MainActor.run { self.errorMessage = error.localizedDescription }
-      }
-    }
-  }
-
   private func load() {
     guard FileManager.default.fileExists(atPath: persistenceURL.path) else { return }
     do {

@@ -32,6 +32,9 @@ enum AppStoragePaths {
     return url
   }()
 
+  static let sshKnownHostsURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".ssh/known_hosts", isDirectory: false)
+
   static func directory(named relativePath: String) -> URL {
     let components = relativePath.split(separator: "/", omittingEmptySubsequences: true)
     precondition(!components.isEmpty, "App storage directory name must not be empty")

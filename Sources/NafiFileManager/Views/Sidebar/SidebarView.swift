@@ -20,10 +20,12 @@ struct SidebarView: View {
         )
       }
 
-      SidebarICloudSection(
-        cloudStorage: appState.cloudStorage,
-        workspace: workspace
-      )
+      if model.showsICloud {
+        SidebarICloudSection(
+          cloudStorage: appState.cloudStorage,
+          workspace: workspace
+        )
+      }
 
       if model.showsVolumes {
         SidebarVolumesSection(
@@ -62,6 +64,8 @@ private struct SidebarFavoritesSection: View {
   let openInNewTab: (URL) -> Void
   let openInNewPane: (URL) -> Void
 
+  @State private var renamingFavorite: SidebarFavorite?
+
   private var isCurrentFolderFavorite: Bool { model.contains(url: currentURL) }
   private var lastFavoriteID: UUID? { model.favorites.last?.id }
 
@@ -99,12 +103,24 @@ private struct SidebarFavoritesSection: View {
         .contextMenu {
           Button("新しいタブで開く") { openInNewTab(favorite.url) }
           Button("新しいペインで開く") { openInNewPane(favorite.url) }
+          Divider()
+          Button("名前を変更…") { renamingFavorite = favorite }
           if !favorite.isBuiltIn {
             Divider()
             Button("サイドバーから削除", role: .destructive) { model.remove(favorite) }
           }
         }
       }
+    }
+    .sheet(item: $renamingFavorite) { favorite in
+      RenameFavoriteDialog(
+        originalTitle: favorite.title,
+        onCancel: { renamingFavorite = nil },
+        onConfirm: { newTitle in
+          model.rename(favorite, to: newTitle)
+          renamingFavorite = nil
+        }
+      )
     }
   }
 }
@@ -233,5 +249,46 @@ private struct SidebarFooter: View {
     .padding(.horizontal, 12)
     .frame(height: 34)
     .background(.ultraThinMaterial)
+  }
+}
+
+private struct RenameFavoriteDialog: View {
+  let originalTitle: String
+  let onCancel: () -> Void
+  let onConfirm: (String) -> Void
+
+  @State private var text: String = ""
+  @FocusState private var isFocused: Bool
+
+  private var trimmed: String {
+    text.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  var body: some View {
+    VStack(spacing: 14) {
+      Text("名前を変更").font(.headline)
+      TextField("名前", text: $text)
+        .textFieldStyle(.roundedBorder)
+        .focused($isFocused)
+        .onSubmit { confirm() }
+      HStack {
+        Spacer()
+        Button("キャンセル", action: onCancel).keyboardShortcut(.cancelAction)
+        Button("変更", action: confirm)
+          .keyboardShortcut(.defaultAction)
+          .disabled(trimmed.isEmpty)
+      }
+    }
+    .padding(20)
+    .frame(width: 320)
+    .onAppear {
+      text = originalTitle
+      isFocused = true
+    }
+  }
+
+  private func confirm() {
+    guard !trimmed.isEmpty else { return }
+    onConfirm(trimmed)
   }
 }

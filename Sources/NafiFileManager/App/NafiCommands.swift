@@ -94,7 +94,7 @@ struct NafiCommands: Commands {
 
       Divider()
       Button("同期") { appState.isSyncCenterPresented = true }
-      Button("Drop Stack") { appState.isDropStackPresented = true }
+      Button("Drop Stack") { appState.openDropStack?() }
       Button("ワークスペース") { appState.isWorkspaceLibraryPresented = true }
       Divider()
       Button("ここでターミナルを開く") { appState.activeModel.openTerminalHere() }

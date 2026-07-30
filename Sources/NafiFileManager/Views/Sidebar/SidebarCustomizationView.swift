@@ -40,6 +40,7 @@ private struct SidebarCustomizationForm: View {
     Form {
       Section("表示するセクション") {
         Toggle("よく使う項目", isOn: $model.showsFavorites)
+        Toggle("iCloud", isOn: $model.showsICloud)
         Toggle("ボリューム", isOn: $model.showsVolumes)
         Toggle("サーバー", isOn: $model.showsServers)
       }
@@ -91,18 +92,14 @@ private struct SidebarCustomizationRow: View {
         .help("ドラッグして並べ替え")
 
       Image(systemName: favorite.systemImage).frame(width: 18)
-      if favorite.isBuiltIn {
-        Text(favorite.title)
-      } else {
-        TextField(
-          "名前",
-          text: Binding(
-            get: { favorite.title },
-            set: { model.rename(favorite, to: $0) }
-          )
+      TextField(
+        "名前",
+        text: Binding(
+          get: { favorite.title },
+          set: { model.rename(favorite, to: $0) }
         )
-        .textFieldStyle(.plain)
-      }
+      )
+      .textFieldStyle(.plain)
       Spacer(minLength: 8)
       if !favorite.isBuiltIn {
         Button(role: .destructive) {

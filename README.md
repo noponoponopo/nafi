@@ -77,7 +77,7 @@ Additional server behavior:
 
 - Launch-time auto-connect retries each enabled profile up to three times with backoff.
 - FTP supports plain FTP, explicit FTPS with `AUTH TLS`, and implicit FTPS. TLS 1.2 or later is required for FTPS, and certificate verification is enabled by default.
-- Both SFTP authentication modes use the installed macOS OpenSSH engine with `StrictHostKeyChecking=yes`. Before the first connection, Settings scans and displays the server key fingerprints for explicit approval; trusted keys are stored in `~/Library/Application Support/nafi/known_hosts`, and changed or unknown keys are rejected.
+- Both SFTP authentication modes use the installed macOS OpenSSH engine with `StrictHostKeyChecking=yes`. Before the first connection, nafi scans and automatically trusts the server key, storing it in the standard `~/.ssh/known_hosts`; changed or unknown keys are rejected.
 - Open Terminal Here works for local folders and SFTP roots. FTP and FTPS do not provide an interactive shell.
 - Passwords, SFTP key passphrases, S3 secret keys, and temporary S3 session tokens are stored separately in the macOS Keychain. Private-key file contents remain at the selected path and are read only when connecting.
 
@@ -96,7 +96,7 @@ Application state is stored under `~/Library/Application Support/nafi`:
 - `servers.json` stores server profiles without their secret values.
 - `sidebar.json` stores sidebar configuration.
 - `icloud-drive.bookmark` stores the selected iCloud Drive security-scoped bookmark when one is configured.
-- `known_hosts` stores explicitly trusted SFTP host keys.
+- `~/.ssh/known_hosts` stores trusted SFTP host keys.
 - `transfers.json` stores the bounded persistent transfer queue and recent terminal history.
 
 nafi does not write its own view metadata into browsed folders and does not create `.DS_Store`. Finder or another application may still create its own metadata. Remote Quick Look, thumbnails, editing, and cross-root transfers may create temporary local staging files while an operation is running.

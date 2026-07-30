@@ -46,7 +46,7 @@ enum RcloneConfiguration {
       result.set("host", profile.host)
       result.set("user", profile.username)
       result.set("port", profile.port)
-      result.set("known_hosts_file", AppStoragePaths.file(named: "known_hosts").path)
+      result.set("known_hosts_file", AppStoragePaths.sshKnownHostsURL.path)
       result.set("host_key_algorithms", sftpHostKeyAlgorithms.joined(separator: " "))
       if let shellType = profile.sftpShellType.rcloneValue {
         result.set("shell_type", shellType)

@@ -17,6 +17,21 @@ final class RobustnessTests: XCTestCase {
     XCTAssertEqual(try SSHHostKeyService.validatedUsername("nafi-user"), "nafi-user")
   }
 
+  func testUnknownSFTPHostKeyErrorIsEligibleForAutomaticRecovery() {
+    XCTAssertTrue(
+      RcloneRemoteSession.isUnknownHostKeyError(
+        RcloneRuntimeError.invalidResponse(
+          "NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key is unknown"
+        )
+      )
+    )
+    XCTAssertFalse(
+      RcloneRemoteSession.isUnknownHostKeyError(
+        RcloneRuntimeError.invalidResponse("rclone connection failed")
+      )
+    )
+  }
+
   func testOpenSSHKnownHostIdentityParsingIgnoresCommentsAndMalformedKeys() {
     let algorithm = "ssh-ed25519"
     var keyData = Data([0, 0, 0, UInt8(algorithm.utf8.count)])

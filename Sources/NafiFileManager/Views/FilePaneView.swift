@@ -686,7 +686,7 @@ private struct GalleryThumbnail: View {
   }
 }
 
-private final class EmbeddedQuickLookContainer: NSView {
+final class EmbeddedQuickLookContainer: NSView {
   let previewView: QLPreviewView?
 
   override init(frame frameRect: NSRect) {
@@ -710,7 +710,7 @@ private final class EmbeddedQuickLookContainer: NSView {
   required init?(coder: NSCoder) { nil }
 }
 
-private struct EmbeddedQuickLookView: NSViewRepresentable {
+struct EmbeddedQuickLookView: NSViewRepresentable {
   let url: URL
 
   func makeNSView(context: Context) -> EmbeddedQuickLookContainer {

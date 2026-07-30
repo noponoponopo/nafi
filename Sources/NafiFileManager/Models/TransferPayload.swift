@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 extension UTType {
   static let nafiFileCollection = UTType(exportedAs: "app.nafi.file-collection")
   static let nafiSidebarFavorite = UTType(exportedAs: "app.nafi.sidebar-favorite")
+  static let nafiDropStackInternal = UTType(exportedAs: "app.nafi.drop-stack-internal")
 }
 
 enum DragPayloadLimits {
@@ -123,6 +124,24 @@ enum DragPayloadProvider {
       contentType: .nafiSidebarFavorite,
       on: NSItemProvider()
     )
+  }
+
+  static func dropStackFileProvider(for payload: FileDragPayload) -> NSItemProvider {
+    let provider = fileProvider(for: payload)
+    provider.registerDataRepresentation(
+      forTypeIdentifier: UTType.nafiDropStackInternal.identifier,
+      visibility: .ownProcess
+    ) { completion in
+      completion(Data(), nil)
+      return nil
+    }
+    return provider
+  }
+
+  static func containsDropStackInternal(in providers: [NSItemProvider]) -> Bool {
+    providers.contains {
+      $0.hasItemConformingToTypeIdentifier(UTType.nafiDropStackInternal.identifier)
+    }
   }
 
   static func canLoadFileURLs(from providers: [NSItemProvider]) -> Bool {

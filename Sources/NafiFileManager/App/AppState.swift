@@ -10,13 +10,13 @@ final class AppState: ObservableObject {
   @Published var presentationErrorMessage: String?
   @Published var sidebarVisibility: NavigationSplitViewVisibility = .all
   @Published var isQuickOpenPresented = false
-  @Published var isDropStackPresented = false
   @Published var isSyncCenterPresented = false
   @Published var isWorkspaceLibraryPresented = false
   @Published private(set) var activeWindowID: UUID?
 
   var openServerEditor: ((ServerProfile) -> Void)?
   var openInspector: ((URL) -> Void)?
+  var openDropStack: (() -> Void)?
 
   let serverManager = ServerManager()
   let sidebarModel = SidebarModel()
@@ -235,7 +235,7 @@ final class AppState: ObservableObject {
     case .syncCenter:
       isSyncCenterPresented = true
     case .dropStack:
-      isDropStackPresented = true
+      openDropStack?()
     case .workspaces:
       isWorkspaceLibraryPresented = true
     }

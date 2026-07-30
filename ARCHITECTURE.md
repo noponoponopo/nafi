@@ -49,7 +49,7 @@ Quick Edit uses `QuickEditService` and `NSFileCoordinator`. It supports recogniz
 `ServerManager` persists non-secret `ServerProfile` values in `servers.json`, keeps credentials in `KeychainStore`, and registers live sessions with `RemoteFileSystemRegistry`.
 
 - SMB, WebDAV, NFS, and AFP call macOS NetFS directly and expose the resulting mount as an ordinary local file URL.
-- SFTP password and private-key authentication both use the installed macOS `/usr/bin/sftp` process without opening a GUI client. A private temporary askpass helper supplies the secret. `SSHHostKeyService` scans fingerprints for explicit approval, stores trusted keys in the app-owned `known_hosts`, and all connections use `StrictHostKeyChecking=yes` with the global known-hosts files disabled.
+- SFTP password and private-key authentication both use the installed macOS `/usr/bin/sftp` process without opening a GUI client. A private temporary askpass helper supplies the secret. `SSHHostKeyService` scans fingerprints and stores trusted keys in the user's `~/.ssh/known_hosts`; all connections use that standard file with `StrictHostKeyChecking=yes`.
 - FTP, explicit FTPS, and implicit FTPS use the in-process SwiftNIO client. FTPS uses TLS 1.2 or later, supports protected passive data channels, and verifies certificates by default.
 - S3-compatible storage uses `URLSession`, AWS Signature V4, paginated prefix listing, server-side copy where possible, and multipart upload for local files at least 128 MiB. Objects and common prefixes are mapped to ordinary file items.
 
@@ -64,7 +64,7 @@ External OpenSSH, `ssh-keyscan`, `ssh-keygen`, `zip`, `unzip`, and `ditto` invoc
 - `servers.json` for server profiles
 - `sidebar.json` for sidebar configuration
 - `icloud-drive.bookmark` for a user-selected security-scoped iCloud Drive location
-- `known_hosts` for explicitly trusted SFTP host keys
+- the user's `~/.ssh/known_hosts` for explicitly trusted SFTP host keys
 - `transfers.json` for the bounded persistent transfer queue and recent terminal history
 
 Passwords, SFTP key passphrases, S3 secret access keys, and temporary S3 session tokens are stored separately in the macOS Keychain. Private-key file contents are not copied into the profile. nafi does not write its own view metadata or `.DS_Store` files into browsed folders. Temporary local staging files can exist during remote preview, editing, or cross-root transfer operations.

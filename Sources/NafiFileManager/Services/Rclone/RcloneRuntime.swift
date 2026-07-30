@@ -310,6 +310,10 @@ actor RcloneRuntime {
     return persistedOAuthTokens[profile.id]
   }
 
+  func invalidateConfiguration(profileID: UUID) {
+    configuredProfiles[profileID] = nil
+  }
+
   private func preparePrivateKey(
     _ rawPath: String,
     passphrase: String,

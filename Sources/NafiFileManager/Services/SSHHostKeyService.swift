@@ -41,9 +41,7 @@ actor SSHHostKeyService {
     }
   }
 
-  private let knownHostsURL = AppStoragePaths.file(named: "known_hosts")
-  private let openSSHKnownHostsURL = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".ssh/known_hosts")
+  private let knownHostsURL = AppStoragePaths.sshKnownHostsURL
   private let keyscanURL = URL(fileURLWithPath: "/usr/bin/ssh-keyscan")
   private let keygenURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
 
@@ -52,41 +50,17 @@ actor SSHHostKeyService {
     try Self.validatePort(port)
     let endpoint = Self.knownHostsEndpoint(host: host, port: port)
     if try await isTrusted(host: host, port: port) {
-      return try await trustedAlgorithms(endpoint: endpoint, fileURL: knownHostsURL)
+      let algorithms = try await trustedAlgorithms(endpoint: endpoint, fileURL: knownHostsURL)
+      if !algorithms.isEmpty { return algorithms }
     }
 
-    // Check ~/.ssh/known_hosts for a matching key from OpenSSH usage.
-    if FileManager.default.fileExists(atPath: openSSHKnownHostsURL.path) {
-      _ = try? AppStoragePaths.readRegularFile(
-        at: openSSHKnownHostsURL,
-        maximumBytes: 16 * 1_024 * 1_024
-      )
-      try requireExecutable(keygenURL)
-      let result = try await BoundedProcessRunner.run(
-        executableURL: keygenURL,
-        arguments: ["-F", endpoint, "-f", openSSHKnownHostsURL.path],
-        timeout: 10,
-        maximumStandardOutputBytes: 256 * 1_024,
-        maximumStandardErrorBytes: 64 * 1_024
-      )
-      if result.terminationStatus == 0 {
-        let trustedIdentities = Self.knownHostIdentities(in: result.stdout)
-        if !trustedIdentities.isEmpty {
-          let scan = try await scan(host: host, port: port)
-          let matchedKeys = scan.keys.filter {
-            trustedIdentities.contains("\($0.algorithm) \($0.fingerprint)")
-          }
-          if !matchedKeys.isEmpty {
-            try await trust(
-              SSHHostKeyScan(host: scan.host, port: scan.port, scannedAt: scan.scannedAt, keys: matchedKeys)
-            )
-            return matchedKeys.map(\.algorithm)
-          }
-        }
-      }
-    }
+    return try await refreshKnownHosts(host: host, port: port)
+  }
 
-    // Trust on first use: scan and register the server's keys automatically.
+  func refreshKnownHosts(host rawHost: String, port: Int) async throws -> [String] {
+    let host = try Self.validatedHost(rawHost)
+    try Self.validatePort(port)
+    // Match the manual flow exactly: scan the live server, then trust the scan.
     let scan = try await scan(host: host, port: port)
     try await trust(scan)
     return scan.keys.map(\.algorithm)
