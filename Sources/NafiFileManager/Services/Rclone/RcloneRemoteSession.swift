@@ -42,7 +42,7 @@ actor RcloneRemoteSession: RemoteServerSession {
       )
       guard !sftpHostKeyAlgorithms.isEmpty else {
         throw RemoteServerError.invalidResponse(
-          "SSHホストキーが未登録か、登録後に変更されています。接続設定の「SFTPホストキー」で鍵指紋を確認して信頼してください。"
+          "SSHホストキーを自動登録できませんでした。接続先のホスト名とポートを確認してください。"
         )
       }
     } else {
