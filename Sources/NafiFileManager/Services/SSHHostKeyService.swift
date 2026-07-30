@@ -197,10 +197,7 @@ actor SSHHostKeyService {
     }
 
     do {
-      let current = try AppStoragePaths.readRegularFile(
-        at: knownHostsURL,
-        maximumBytes: 4 * 1_024 * 1_024
-      )
+      let current = try loadKnownHostsData()
       try current.write(to: temporaryURL, options: [.atomic, .completeFileProtectionUnlessOpen])
       try FileManager.default.setAttributes(
         [.posixPermissions: 0o600],
@@ -208,10 +205,15 @@ actor SSHHostKeyService {
       )
       try await removeEndpoint(endpoint, from: temporaryURL)
 
-      let updated = try AppStoragePaths.readRegularFile(
-        at: temporaryURL,
-        maximumBytes: 4 * 1_024 * 1_024
-      )
+      let updated: Data
+      do {
+        updated = try AppStoragePaths.readRegularFile(
+          at: temporaryURL,
+          maximumBytes: 4 * 1_024 * 1_024
+        )
+      } catch {
+        throw ServiceError.persistence("known_hostsの更新結果を読み込めませんでした。")
+      }
       guard let decoded = String(data: updated, encoding: .utf8) else {
         throw ServiceError.persistence("known_hostsをUTF-8として読み込めませんでした。")
       }
@@ -241,11 +243,7 @@ actor SSHHostKeyService {
   func isTrusted(host rawHost: String, port: Int) async throws -> Bool {
     let host = try Self.validatedHost(rawHost)
     try Self.validatePort(port)
-    guard FileManager.default.fileExists(atPath: knownHostsURL.path) else { return false }
-    _ = try AppStoragePaths.readRegularFile(
-      at: knownHostsURL,
-      maximumBytes: 4 * 1_024 * 1_024
-    )
+    _ = try loadKnownHostsData()
     try requireExecutable(keygenURL)
     let endpoint = Self.knownHostsEndpoint(host: host, port: port)
     do {
@@ -279,16 +277,18 @@ actor SSHHostKeyService {
     }
 
     do {
-      let current = try AppStoragePaths.readRegularFile(
-        at: knownHostsURL,
-        maximumBytes: 4 * 1_024 * 1_024
-      )
+      let current = try loadKnownHostsData()
       try current.write(to: temporaryURL, options: [.atomic, .completeFileProtectionUnlessOpen])
       try await removeEndpoint(Self.knownHostsEndpoint(host: host, port: port), from: temporaryURL)
-      let updated = try AppStoragePaths.readRegularFile(
-        at: temporaryURL,
-        maximumBytes: 4 * 1_024 * 1_024
-      )
+      let updated: Data
+      do {
+        updated = try AppStoragePaths.readRegularFile(
+          at: temporaryURL,
+          maximumBytes: 4 * 1_024 * 1_024
+        )
+      } catch {
+        throw ServiceError.persistence("known_hostsの更新結果を読み込めませんでした。")
+      }
       try updated.write(to: knownHostsURL, options: [.atomic, .completeFileProtectionUnlessOpen])
       try FileManager.default.setAttributes(
         [.posixPermissions: 0o600],
@@ -301,27 +301,43 @@ actor SSHHostKeyService {
     }
   }
 
-  private func ensureKnownHostsFile() throws {
-    if !FileManager.default.fileExists(atPath: knownHostsURL.path) {
-      guard
-        FileManager.default.createFile(
-          atPath: knownHostsURL.path,
-          contents: nil,
-          attributes: [.posixPermissions: 0o600]
-        )
-      else {
-        throw ServiceError.persistence("known_hostsを作成できませんでした。")
-      }
-    } else {
-      _ = try AppStoragePaths.readRegularFile(
+  private func loadKnownHostsData() throws -> Data {
+    try ensureKnownHostsFile()
+    do {
+      return try AppStoragePaths.readRegularFile(
         at: knownHostsURL,
         maximumBytes: 4 * 1_024 * 1_024
       )
+    } catch {
+      AppStoragePaths.quarantineCorruptFile(at: knownHostsURL, label: "unreadable-known-hosts")
+      try ensureKnownHostsFile()
+      return Data()
     }
-    try FileManager.default.setAttributes(
-      [.posixPermissions: 0o600],
-      ofItemAtPath: knownHostsURL.path
+  }
+
+  private func ensureKnownHostsFile() throws {
+    let manager = FileManager.default
+    if manager.fileExists(atPath: knownHostsURL.path) {
+      let values = try knownHostsURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+      if values.isRegularFile == true, values.isSymbolicLink != true {
+        try? manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: knownHostsURL.path)
+        return
+      }
+      AppStoragePaths.quarantineCorruptFile(at: knownHostsURL, label: "invalid-known-hosts")
+    }
+    let parent = knownHostsURL.deletingLastPathComponent()
+    try? manager.createDirectory(
+      at: parent,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
     )
+    guard manager.createFile(
+      atPath: knownHostsURL.path,
+      contents: nil,
+      attributes: [.posixPermissions: 0o600]
+    ) else {
+      throw ServiceError.persistence("known_hostsを作成できませんでした。")
+    }
   }
 
   private func removeEndpoint(_ endpoint: String, from fileURL: URL) async throws {

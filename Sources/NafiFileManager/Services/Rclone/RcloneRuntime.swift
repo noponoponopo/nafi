@@ -247,9 +247,27 @@ actor RcloneRuntime {
       return nil
     }
 
+    var configuredProfile = profile
+    var configuredSecrets = secrets
+    if profile.kind == .sftp,
+      profile.sftpAuthentication == .privateKey,
+      !secrets.keyPassphrase.isEmpty
+    {
+      let current = try await requireState()
+      configuredProfile.privateKeyPath = try await preparePrivateKey(
+        profile.privateKeyPath,
+        passphrase: secrets.keyPassphrase,
+        runtimeRoot: current.configURL.deletingLastPathComponent()
+      )
+      configuredSecrets = RcloneProfileSecrets(
+        password: secrets.password,
+        keyPassphrase: "",
+        sessionToken: secrets.sessionToken
+      )
+    }
     let parameters = try RcloneConfiguration.parameters(
-      for: profile,
-      secrets: secrets,
+      for: configuredProfile,
+      secrets: configuredSecrets,
       sftpHostKeyAlgorithms: sftpHostKeyAlgorithms
     )
     if profile.kind == .rclone, let token = parameters["token"]?.stringValue, !token.isEmpty {
@@ -290,6 +308,81 @@ actor RcloneRuntime {
     configuredProfiles[profile.id] = signature
     try await persistUpdatedOAuthTokens()
     return persistedOAuthTokens[profile.id]
+  }
+
+  private func preparePrivateKey(
+    _ rawPath: String,
+    passphrase: String,
+    runtimeRoot: URL
+  ) async throws -> String {
+    let expandedPath = NSString(string: rawPath).expandingTildeInPath
+    let sourceURL = URL(fileURLWithPath: expandedPath).standardizedFileURL.resolvingSymlinksInPath()
+    let values: URLResourceValues
+    do {
+      values = try sourceURL.resourceValues(
+        forKeys: [.isRegularFileKey, .fileSizeKey]
+      )
+    } catch {
+      throw RcloneRuntimeError.remoteConfiguration("SFTP秘密鍵を読み取れません。\n\(error.localizedDescription)")
+    }
+    guard values.isRegularFile == true,
+      let size = values.fileSize,
+      size >= 0,
+      size <= 4 * 1_024 * 1_024
+    else {
+      throw RcloneRuntimeError.remoteConfiguration("SFTP秘密鍵を読み取れません。")
+    }
+
+    let keyDirectory = runtimeRoot.appendingPathComponent("keys", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: keyDirectory,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    let temporaryURL = keyDirectory.appendingPathComponent(
+      "private-key-\(UUID().uuidString)",
+      isDirectory: false
+    )
+    do {
+      let keyData = try Data(contentsOf: sourceURL, options: [.mappedIfSafe])
+      guard keyData.count <= 4 * 1_024 * 1_024 else {
+        throw RcloneRuntimeError.remoteConfiguration("SFTP秘密鍵が大きすぎます。")
+      }
+      try keyData.write(to: temporaryURL, options: [.atomic, .completeFileProtectionUnlessOpen])
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: temporaryURL.path
+      )
+      let keygenURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+      guard FileManager.default.isExecutableFile(atPath: keygenURL.path) else {
+        throw RcloneRuntimeError.remoteConfiguration("ssh-keygenが見つかりません。")
+      }
+      let result = try await BoundedProcessRunner.run(
+        executableURL: keygenURL,
+        arguments: ["-p", "-f", temporaryURL.path, "-P", passphrase, "-N", ""],
+        timeout: 20,
+        maximumStandardOutputBytes: 64 * 1_024,
+        maximumStandardErrorBytes: 64 * 1_024
+      )
+      guard result.terminationStatus == 0 else {
+        let message = String(data: result.stderr, encoding: .utf8)?
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        throw RcloneRuntimeError.remoteConfiguration(
+          message?.isEmpty == false ? message! : "SFTP秘密鍵のパスフレーズを確認してください。"
+        )
+      }
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600],
+        ofItemAtPath: temporaryURL.path
+      )
+      return temporaryURL.path
+    } catch let error as RcloneRuntimeError {
+      try? FileManager.default.removeItem(at: temporaryURL)
+      throw error
+    } catch {
+      try? FileManager.default.removeItem(at: temporaryURL)
+      throw RcloneRuntimeError.remoteConfiguration(error.localizedDescription)
+    }
   }
 
   func removeConfiguration(profileID: UUID) async {

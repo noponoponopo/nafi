@@ -124,6 +124,36 @@ final class RcloneIntegrationTests: XCTestCase {
     XCTAssertEqual(parameters["host_key_algorithms"]?.stringValue, "ssh-ed25519 ssh-rsa")
   }
 
+  func testSFTPPrivateKeyConfigurationPassesKeyPassphrase() throws {
+    let profile = ServerProfile(
+      id: profileID,
+      name: "SFTP private key",
+      kind: .sftp,
+      host: "example.com",
+      port: 22,
+      path: "",
+      username: "user",
+      useTLS: true,
+      autoConnect: false,
+      localMountPath: "",
+      sftpAuthentication: .privateKey,
+      privateKeyPath: "/tmp/id_ed25519"
+    )
+    let secrets = RcloneProfileSecrets(
+      password: "",
+      keyPassphrase: "correct horse battery staple",
+      sessionToken: ""
+    )
+
+    let parameters = try RcloneConfiguration.parameters(for: profile, secrets: secrets)
+
+    XCTAssertEqual(parameters["key_file"]?.stringValue, "/tmp/id_ed25519")
+    XCTAssertEqual(
+      parameters["key_file_pass"]?.stringValue,
+      "correct horse battery staple"
+    )
+  }
+
   func testOAuthPortProbeDetectsAnOccupiedCallbackPort() throws {
     #if canImport(Darwin)
     XCTAssertTrue(RcloneRuntime.canBindOAuthPort())

@@ -80,7 +80,7 @@ final class ServerManager: ObservableObject {
     profile.privateKeyPath = profile.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines)
     profile.s3Bucket = profile.s3Bucket.trimmingCharacters(in: .whitespacesAndNewlines)
     profile.s3Region = profile.s3Region.trimmingCharacters(in: .whitespacesAndNewlines)
-    try validate(profile, keyPassphrase: keyPassphrase)
+    try validate(profile)
     if profile.kind == .rclone {
       let secretText = password.trimmingCharacters(in: .whitespacesAndNewlines)
       if !secretText.isEmpty { try RcloneConfiguration.validateParametersJSON(secretText) }
@@ -207,13 +207,12 @@ final class ServerManager: ObservableObject {
     return failures
   }
 
-  private func validate(_ profile: ServerProfile, keyPassphrase: String) throws {
-    try validate(profile, keyPassphrase: keyPassphrase, checkExternalResources: true)
+  private func validate(_ profile: ServerProfile) throws {
+    try validate(profile, checkExternalResources: true)
   }
 
   private func validate(
     _ profile: ServerProfile,
-    keyPassphrase: String,
     checkExternalResources: Bool
   ) throws {
     let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -268,14 +267,6 @@ final class ServerManager: ObservableObject {
             !isDirectory.boolValue, FileManager.default.isReadableFile(atPath: expanded)
           else {
             throw RemoteServerError.invalidResponse("SFTP秘密鍵を読み取れません。")
-          }
-          if profile.sftpAuthentication == .privateKey, !keyPassphrase.isEmpty,
-            let prefix = try? Self.readPrefix(of: URL(fileURLWithPath: expanded), maximumBytes: 96),
-            String(decoding: prefix, as: UTF8.self).contains("BEGIN OPENSSH PRIVATE KEY")
-          {
-            throw RemoteServerError.invalidResponse(
-              "暗号化された新形式OpenSSH鍵はrcloneで直接復号できません。認証方式をssh-agentへ変更してください。"
-            )
           }
         }
       }
@@ -596,13 +587,6 @@ final class ServerManager: ObservableObject {
     .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
   }
 
-  private nonisolated static func readPrefix(of url: URL, maximumBytes: Int) throws -> Data {
-    guard maximumBytes > 0 else { return Data() }
-    let handle = try FileHandle(forReadingFrom: url)
-    defer { try? handle.close() }
-    return try handle.read(upToCount: maximumBytes) ?? Data()
-  }
-
   private func connectRclone(_ profile: ServerProfile) async {
     do {
       let secrets = RcloneProfileSecrets(
@@ -766,7 +750,7 @@ final class ServerManager: ObservableObject {
           continue
         }
         do {
-          try validate(profile, keyPassphrase: "", checkExternalResources: false)
+          try validate(profile, checkExternalResources: false)
           valid.append(profile)
         } catch {
           discarded = true
@@ -811,7 +795,7 @@ final class ServerManager: ObservableObject {
       let valid = decoded.indices.allSatisfy { index in
         decoded[index].transferPolicy.clamp()
         return seen.insert(decoded[index].id).inserted
-          && (try? validate(decoded[index], keyPassphrase: "", checkExternalResources: false)) != nil
+          && (try? validate(decoded[index], checkExternalResources: false)) != nil
       }
       guard valid, (try? persistProfiles(decoded)) != nil else { continue }
       decoded.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
