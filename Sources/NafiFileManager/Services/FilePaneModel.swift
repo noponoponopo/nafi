@@ -1038,10 +1038,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
     return true
   }
 
-  func dragPayload(for item: FileItem) -> FileDragPayload {
-    FileDragPayload(
-      urls: selectionController.contains(item.url) ? selectionController.dragURLs : [item.url])
-  }
+  var currentDragURLs: [URL] { selectionController.dragURLs }
 
   func copySelection(cut: Bool = false) {
     let urls = selectedItems.map(\.url)

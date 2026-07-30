@@ -9,6 +9,18 @@ private struct SelectionItemFramePreferenceKey: PreferenceKey {
   }
 }
 
+enum FileDragHitTesting {
+  static func selectedItemURL(
+    at point: CGPoint,
+    itemFrames: [URL: CGRect],
+    selectedURLs: Set<URL>
+  ) -> URL? {
+    itemFrames.first { url, frame in
+      selectedURLs.contains(url) && frame.contains(point)
+    }?.key
+  }
+}
+
 extension View {
   func fileSelectionHitTarget(_ url: URL, in coordinateSpace: String) -> some View {
     background {
@@ -89,7 +101,16 @@ struct FileSelectionSurface<Content: View>: View {
         mouseDragged: { point in
           handleMouseDragged(to: point, itemFrames: itemFrames)
         },
-        mouseUp: handleMouseUp
+        mouseUp: handleMouseUp,
+        beginDrag: { event, mouseDownPoint, view, source in
+          handleBeginDrag(
+            event: event,
+            mouseDownPoint: mouseDownPoint,
+            view: view,
+            source: source,
+            itemFrames: itemFrames
+          )
+        }
       )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
       .allowsHitTesting(false)
@@ -219,6 +240,63 @@ struct FileSelectionSurface<Content: View>: View {
     marqueeModifiers = []
   }
 
+  private func handleBeginDrag(
+    event: NSEvent,
+    mouseDownPoint: CGPoint,
+    view: NSView,
+    source: NSDraggingSource,
+    itemFrames: [URL: CGRect]
+  ) -> Bool {
+    let urls = model.currentDragURLs
+    guard
+      !event.modifierFlags.contains(.control),
+      let draggedURL = FileDragHitTesting.selectedItemURL(
+        at: mouseDownPoint,
+        itemFrames: itemFrames,
+        selectedURLs: model.currentSelectionURLs
+      ),
+      !urls.isEmpty
+    else { return false }
+
+    pendingItemClick = nil
+    pendingItemModifiers = []
+    marqueeStart = nil
+    marqueeRect = nil
+    marqueeURLs = []
+    marqueeAnchorURL = nil
+    marqueeBaseSelection = []
+    marqueeModifiers = []
+
+    let fallbackOrigin = itemFrames[draggedURL]?.origin
+      ?? CGPoint(x: mouseDownPoint.x - 14, y: mouseDownPoint.y - 14)
+    let draggingItems: [NSDraggingItem] = urls.map { url in
+      let pbItem = DragPayloadProvider.pasteboardItem(for: FileDragPayload(urls: [url]))
+      let item = NSDraggingItem(pasteboardWriter: pbItem)
+      let icon = dragIcon(for: url)
+      let origin = itemFrames[url]?.origin ?? fallbackOrigin
+      item.setDraggingFrame(CGRect(origin: origin, size: icon.size), contents: icon)
+      return item
+    }
+
+    view.beginDraggingSession(with: draggingItems, event: event, source: source)
+    return true
+  }
+
+  private func dragIcon(for url: URL) -> NSImage {
+    let pixelSize = NSSize(width: 28, height: 28)
+    if url.isFileURL {
+      let icon = NSWorkspace.shared.icon(forFile: url.path)
+      icon.size = pixelSize
+      return icon
+    }
+    let symbolName = (model.item(for: url)?.isDirectory ?? false) ? "folder.fill" : "doc.fill"
+    let config = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
+    let icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+      .withSymbolConfiguration(config) ?? NSImage()
+    icon.size = pixelSize
+    return icon
+  }
+
   private func center(of frame: CGRect?) -> CGPoint? {
     guard let frame else { return nil }
     return CGPoint(x: frame.midX, y: frame.midY)
@@ -243,12 +321,14 @@ private struct SelectionEventBridge: NSViewRepresentable {
   let mouseDown: (CGPoint, SelectionMouseButton, NSEvent.ModifierFlags) -> Void
   let mouseDragged: (CGPoint) -> Void
   let mouseUp: () -> Void
+  let beginDrag: (NSEvent, CGPoint, NSView, NSDraggingSource) -> Bool
 
   func makeCoordinator() -> Coordinator {
     Coordinator(
       mouseDown: mouseDown,
       mouseDragged: mouseDragged,
-      mouseUp: mouseUp
+      mouseUp: mouseUp,
+      beginDrag: beginDrag
     )
   }
 
@@ -262,7 +342,8 @@ private struct SelectionEventBridge: NSViewRepresentable {
     context.coordinator.update(
       mouseDown: mouseDown,
       mouseDragged: mouseDragged,
-      mouseUp: mouseUp
+      mouseUp: mouseUp,
+      beginDrag: beginDrag
     )
   }
 
@@ -275,29 +356,36 @@ private struct SelectionEventBridge: NSViewRepresentable {
     private var monitor: Any?
     private var isTrackingPrimaryMouse = false
     private var startedInside = false
+    private var mouseDownEvent: NSEvent?
+    private let dragSource = PaneDragSource()
 
     private var mouseDown: (CGPoint, SelectionMouseButton, NSEvent.ModifierFlags) -> Void
     private var mouseDragged: (CGPoint) -> Void
     private var mouseUp: () -> Void
+    private var beginDrag: (NSEvent, CGPoint, NSView, NSDraggingSource) -> Bool
 
     init(
       mouseDown: @escaping (CGPoint, SelectionMouseButton, NSEvent.ModifierFlags) -> Void,
       mouseDragged: @escaping (CGPoint) -> Void,
-      mouseUp: @escaping () -> Void
+      mouseUp: @escaping () -> Void,
+      beginDrag: @escaping (NSEvent, CGPoint, NSView, NSDraggingSource) -> Bool
     ) {
       self.mouseDown = mouseDown
       self.mouseDragged = mouseDragged
       self.mouseUp = mouseUp
+      self.beginDrag = beginDrag
     }
 
     func update(
       mouseDown: @escaping (CGPoint, SelectionMouseButton, NSEvent.ModifierFlags) -> Void,
       mouseDragged: @escaping (CGPoint) -> Void,
-      mouseUp: @escaping () -> Void
+      mouseUp: @escaping () -> Void,
+      beginDrag: @escaping (NSEvent, CGPoint, NSView, NSDraggingSource) -> Bool
     ) {
       self.mouseDown = mouseDown
       self.mouseDragged = mouseDragged
       self.mouseUp = mouseUp
+      self.beginDrag = beginDrag
     }
 
     func attach(to view: FlippedPassiveView) {
@@ -312,6 +400,7 @@ private struct SelectionEventBridge: NSViewRepresentable {
           let inside = self.contains(event)
           self.startedInside = inside
           self.isTrackingPrimaryMouse = inside
+          self.mouseDownEvent = inside ? event : nil
           guard inside, let point = self.localPoint(for: event) else { return event }
 
           let isControlClick = event.modifierFlags.contains(.control)
@@ -328,6 +417,20 @@ private struct SelectionEventBridge: NSViewRepresentable {
           return event
 
         case .leftMouseDragged:
+          if let downEvent = self.mouseDownEvent,
+            self.startedInside, let view = self.view,
+            let downPoint = self.localPoint(for: downEvent),
+            let point = self.localPoint(for: event)
+          {
+            let distance = hypot(point.x - downPoint.x, point.y - downPoint.y)
+            if distance >= 4, self.beginDrag(event, downPoint, view, self.dragSource) {
+              self.isTrackingPrimaryMouse = false
+              self.startedInside = false
+              self.mouseDownEvent = nil
+              return event
+            }
+          }
+
           guard self.isTrackingPrimaryMouse, self.startedInside,
             let point = self.localPoint(for: event)
           else { return event }
@@ -340,6 +443,7 @@ private struct SelectionEventBridge: NSViewRepresentable {
           }
           self.isTrackingPrimaryMouse = false
           self.startedInside = false
+          self.mouseDownEvent = nil
           return event
 
         default:
@@ -369,6 +473,15 @@ private struct SelectionEventBridge: NSViewRepresentable {
       guard let view, let window = view.window, event.window === window else { return nil }
       return view.convert(event.locationInWindow, from: nil)
     }
+  }
+}
+
+private final class PaneDragSource: NSObject, NSDraggingSource {
+  func draggingSession(
+    _ session: NSDraggingSession,
+    sourceOperationMaskFor context: NSDraggingContext
+  ) -> NSDragOperation {
+    [.copy, .move]
   }
 }
 

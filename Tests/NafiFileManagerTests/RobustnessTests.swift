@@ -174,6 +174,70 @@ final class RobustnessTests: XCTestCase {
     )
   }
 
+  func testFileDragStartsOnlyFromASelectedItem() {
+    let selectedURL = URL(fileURLWithPath: "/tmp/selected.txt")
+    let otherURL = URL(fileURLWithPath: "/tmp/other.txt")
+    let frames = [
+      selectedURL: CGRect(x: 0, y: 0, width: 40, height: 40),
+      otherURL: CGRect(x: 50, y: 0, width: 40, height: 40),
+    ]
+
+    XCTAssertEqual(
+      FileDragHitTesting.selectedItemURL(
+        at: CGPoint(x: 20, y: 20),
+        itemFrames: frames,
+        selectedURLs: [selectedURL]
+      ),
+      selectedURL
+    )
+    XCTAssertNil(
+      FileDragHitTesting.selectedItemURL(
+        at: CGPoint(x: 70, y: 20),
+        itemFrames: frames,
+        selectedURLs: [selectedURL]
+      )
+    )
+    XCTAssertNil(
+      FileDragHitTesting.selectedItemURL(
+        at: CGPoint(x: 120, y: 20),
+        itemFrames: frames,
+        selectedURLs: [selectedURL]
+      )
+    )
+  }
+
+  @MainActor
+  func testFileDragIncludesEverySelectedURL() {
+    let primaryURL = URL(fileURLWithPath: "/tmp/primary.txt")
+    let otherURL = URL(fileURLWithPath: "/tmp/other.txt")
+    let selection = FileSelectionController()
+
+    selection.replace(with: [primaryURL, otherURL], primary: primaryURL)
+
+    XCTAssertEqual(selection.dragURLs.first, primaryURL)
+    XCTAssertEqual(Set(selection.dragURLs), [primaryURL, otherURL])
+  }
+
+  @MainActor
+  func testNewlySplitPaneCanBeClosedDirectly() {
+    let workspace = WorkspaceModel(
+      initialURL: FileManager.default.temporaryDirectory,
+      showHidden: false,
+      viewMode: .list
+    )
+    let originalPaneID = workspace.activePaneID
+
+    workspace.splitActive(axis: .horizontal)
+    let newPaneID = workspace.activePaneID
+    XCTAssertEqual(workspace.paneCount, 2)
+
+    workspace.closePane(newPaneID)
+    XCTAssertEqual(workspace.paneCount, 1)
+    XCTAssertEqual(workspace.activePaneID, originalPaneID)
+    XCTAssertNotNil(workspace.session(for: originalPaneID))
+    XCTAssertNil(workspace.session(for: newPaneID))
+  }
+
   func testBoundedProcessRunnerEnforcesOutputLimit() async throws {
     do {
       _ = try await BoundedProcessRunner.run(

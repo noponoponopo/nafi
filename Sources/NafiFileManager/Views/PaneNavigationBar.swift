@@ -2,6 +2,8 @@ import SwiftUI
 
 struct PaneNavigationBar: View {
   @ObservedObject var model: FilePaneModel
+  let canClosePane: Bool
+  let onClosePane: () -> Void
 
   var body: some View {
     HStack(spacing: 8) {
@@ -11,6 +13,18 @@ struct PaneNavigationBar: View {
       PaneSearchControl(model: model)
 
       PaneDisplayOptionsMenu(model: model)
+
+      if canClosePane {
+        Button(action: onClosePane) {
+          Image(systemName: "xmark")
+            .font(.system(size: 9, weight: .bold))
+            .foregroundStyle(.secondary)
+            .frame(width: 20, height: 20)
+            .background(.quaternary, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .help("ペインを閉じる")
+      }
     }
     .controlSize(.small)
     .padding(.horizontal, 9)

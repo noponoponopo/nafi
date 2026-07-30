@@ -338,6 +338,12 @@ final class AppState: ObservableObject {
     openURLInNativeTab(activeModel.currentURL)
   }
 
+  func newWindow() {
+    createStandaloneBrowserWindow(
+      for: makeNativeTabRequest(for: activeModel.currentURL, parentWindowID: nil)
+    )
+  }
+
   func closeActiveNativeTab() {
     NSApplication.shared.keyWindow?.performClose(nil)
   }
@@ -449,28 +455,26 @@ final class AppState: ObservableObject {
   }
 
   private func openURLInNativeTab(_ url: URL, parentWindowID: UUID? = nil) {
-    let normalized = NafiURL.normalized(url)
     let parentID = parentWindowID ?? activeWindowState?.id
-    let request: NativeTabRequest
+    createNativeTab(for: makeNativeTabRequest(for: url, parentWindowID: parentID))
+  }
+
+  private func makeNativeTabRequest(for url: URL, parentWindowID: UUID?) -> NativeTabRequest {
+    let normalized = NafiURL.normalized(url)
 
     if normalized.isFileURL {
       var isDirectory: ObjCBool = false
       if FileManager.default.fileExists(atPath: normalized.path, isDirectory: &isDirectory),
         !isDirectory.boolValue
       {
-        request = NativeTabRequest(
+        return NativeTabRequest(
           location: normalized.deletingLastPathComponent(),
           revealURL: normalized,
-          parentWindowID: parentID
+          parentWindowID: parentWindowID
         )
-      } else {
-        request = NativeTabRequest(location: normalized, parentWindowID: parentID)
       }
-    } else {
-      request = NativeTabRequest(location: normalized, parentWindowID: parentID)
     }
-
-    createNativeTab(for: request)
+    return NativeTabRequest(location: normalized, parentWindowID: parentWindowID)
   }
 
   private func createNativeTab(for request: NativeTabRequest) {

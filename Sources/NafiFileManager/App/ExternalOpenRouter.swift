@@ -101,6 +101,8 @@ final class NafiAppDelegate: NSObject, NSApplicationDelegate {
   private let serviceProvider = NafiServiceProvider()
   private var isBackgroundLaunch: Bool { ProcessInfo.processInfo.arguments.contains("--background") }
 
+  @MainActor weak var appState: AppState?
+
   func applicationWillFinishLaunching(_ notification: Notification) {
     // The macOS window tab bar is nafi's only tab UI. nafi groups windows
     // explicitly so a Finder open never creates a second, temporary tab group.
@@ -151,6 +153,25 @@ final class NafiAppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
     false
+  }
+
+  func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+    let menu = NSMenu()
+    let item = NSMenuItem(
+      title: "新しいウインドウ",
+      action: #selector(requestNewWindow(_:)),
+      keyEquivalent: ""
+    )
+    item.target = self
+    menu.addItem(item)
+    return menu
+  }
+
+  @objc private func requestNewWindow(_ sender: Any?) {
+    Task { @MainActor in
+      NSApplication.shared.activate(ignoringOtherApps: true)
+      appState?.newWindow()
+    }
   }
 }
 

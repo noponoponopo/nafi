@@ -21,7 +21,7 @@ private struct BrowserWindowHost: View {
 
   var body: some View {
     BrowserWindowView(appState: appState, windowState: windowState)
-      .task {
+      .onAppear {
         appState.openServerEditor = { profile in
           openWindow(id: "server-editor", value: profile)
         }

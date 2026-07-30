@@ -402,9 +402,6 @@ private struct TreeListRow: View {
         model.activate(row.item)
       }
     )
-    .onDrag {
-      DragPayloadProvider.fileProvider(for: model.dragPayload(for: row.item))
-    }
     .modifier(
       FileFolderDropModifier(
         model: model,
@@ -524,9 +521,6 @@ private struct MatrixCell: View {
         model.activate(item)
       }
     )
-    .onDrag {
-      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
-    }
     .modifier(
       FileFolderDropModifier(
         model: model,
@@ -672,9 +666,6 @@ private struct GalleryThumbnail: View {
     )
     .contentShape(Rectangle())
     .highPriorityGesture(TapGesture(count: 2).onEnded { model.activate(item) })
-    .onDrag {
-      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
-    }
     .modifier(
       FileFolderDropModifier(
         model: model,
@@ -885,9 +876,6 @@ private struct ColumnItemRow: View {
     }
     .contentShape(Rectangle())
     .highPriorityGesture(TapGesture(count: 2).onEnded { model.activate(item) })
-    .onDrag {
-      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
-    }
     .modifier(
       FileFolderDropModifier(
         model: model,

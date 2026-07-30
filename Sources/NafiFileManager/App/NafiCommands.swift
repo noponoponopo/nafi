@@ -5,6 +5,8 @@ struct NafiCommands: Commands {
 
   var body: some Commands {
     CommandGroup(replacing: .newItem) {
+      Button("新規ウインドウ") { appState.newWindow() }
+        .keyboardShortcut("n", modifiers: .command)
       Button("新規ウインドウタブ") { appState.newNativeTab() }
         .keyboardShortcut("t", modifiers: .command)
       Button("新規ファイル") { appState.activeModel.requestNewFile() }

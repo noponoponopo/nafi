@@ -118,6 +118,22 @@ enum DragPayloadProvider {
     return register(payload, contentType: .nafiFileCollection, on: provider)
   }
 
+  static func pasteboardItem(for payload: FileDragPayload) -> NSPasteboardItem {
+    let item = NSPasteboardItem()
+    if let firstURL = payload.urls.first, firstURL.isFileURL {
+      item.setString(firstURL.absoluteString, forType: .fileURL)
+    }
+    if let data = try? JSONEncoder().encode(payload),
+      data.count <= DragPayloadLimits.maximumPayloadBytes
+    {
+      item.setData(
+        data,
+        forType: NSPasteboard.PasteboardType(UTType.nafiFileCollection.identifier)
+      )
+    }
+    return item
+  }
+
   static func sidebarFavoriteProvider(for favoriteID: UUID) -> NSItemProvider {
     register(
       SidebarFavoriteDragPayload(favoriteID: favoriteID),

@@ -6,7 +6,11 @@ struct PaneHostView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      PaneNavigationBar(model: session.activeModel)
+      PaneNavigationBar(
+        model: session.activeModel,
+        canClosePane: workspace.paneCount > 1,
+        onClosePane: { workspace.closePane(session.id) }
+      )
       FilePaneView(model: session.activeModel)
     }
     .background(Color(nsColor: .textBackgroundColor))

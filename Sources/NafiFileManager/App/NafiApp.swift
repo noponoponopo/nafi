@@ -10,6 +10,7 @@ struct NafiApp: App {
       RootView(request: nil)
         .environmentObject(appState)
         .frame(minWidth: 640, minHeight: 420)
+        .onAppear { appDelegate.appState = appState }
         .task { await appState.start() }
     }
     .defaultSize(width: 1080, height: 680)

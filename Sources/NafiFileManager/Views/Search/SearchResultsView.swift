@@ -175,9 +175,6 @@ private struct SearchResultRow: View {
         model.activate(item)
       }
     )
-    .onDrag {
-      DragPayloadProvider.fileProvider(for: model.dragPayload(for: item))
-    }
     .modifier(
       FileFolderDropModifier(
         model: model,
