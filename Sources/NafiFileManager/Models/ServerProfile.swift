@@ -9,11 +9,13 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     case sftp
     case ftp
     case s3
+    case rclone
 
     var id: String { rawValue }
     var label: String {
       switch self {
       case .s3: "S3 / R2"
+      case .rclone: "その他の接続先"
       default: rawValue.uppercased()
       }
     }
@@ -26,6 +28,7 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
       case .sftp: 22
       case .ftp: 21
       case .s3: 443
+      case .rclone: 1
       }
     }
     var systemImage: String {
@@ -37,6 +40,7 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
       case .sftp: "lock.shield"
       case .ftp: "arrow.up.arrow.down.square"
       case .s3: "shippingbox"
+      case .rclone: "point.3.connected.trianglepath.dotted"
       }
     }
   }
@@ -44,12 +48,43 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
   enum SFTPAuthentication: String, Codable, CaseIterable, Identifiable, Sendable {
     case password
     case privateKey
+    case sshAgent
 
     var id: String { rawValue }
     var label: String {
       switch self {
       case .password: "パスワード"
-      case .privateKey: "秘密鍵"
+      case .privateKey: "秘密鍵ファイル"
+      case .sshAgent: "ssh-agent"
+      }
+    }
+  }
+
+  enum SFTPShellType: String, Codable, CaseIterable, Identifiable, Sendable {
+    case disabled
+    case automatic
+    case unix
+    case commandPrompt
+    case powershell
+
+    var id: String { rawValue }
+    var label: String {
+      switch self {
+      case .disabled: "無効（安全優先）"
+      case .automatic: "自動検出"
+      case .unix: "Unix shell"
+      case .commandPrompt: "Windows Command Prompt"
+      case .powershell: "PowerShell"
+      }
+    }
+
+    var rcloneValue: String? {
+      switch self {
+      case .disabled: "none"
+      case .automatic: nil
+      case .unix: "unix"
+      case .commandPrompt: "cmd"
+      case .powershell: "powershell"
       }
     }
   }
@@ -104,6 +139,7 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
   var autoConnect: Bool
   var localMountPath: String
   var sftpAuthentication: SFTPAuthentication
+  var sftpShellType: SFTPShellType
   var privateKeyPath: String
   var ftpEncryption: FTPEncryption
   var verifyTLSCertificate: Bool
@@ -111,6 +147,10 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
   var s3Region: String
   var s3AddressingStyle: S3AddressingStyle
   var s3Anonymous: Bool
+  var rcloneBackend: String
+  var rcloneParametersJSON: String
+  var transferPolicy: ConnectionTransferPolicy
+  var configurationRevision: UUID
 
   init(
     id: UUID = UUID(),
@@ -124,13 +164,18 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     autoConnect: Bool,
     localMountPath: String,
     sftpAuthentication: SFTPAuthentication = .password,
+    sftpShellType: SFTPShellType = .disabled,
     privateKeyPath: String = "",
     ftpEncryption: FTPEncryption = .none,
     verifyTLSCertificate: Bool = true,
     s3Bucket: String = "",
     s3Region: String = "auto",
     s3AddressingStyle: S3AddressingStyle = .automatic,
-    s3Anonymous: Bool = false
+    s3Anonymous: Bool = false,
+    rcloneBackend: String = "",
+    rcloneParametersJSON: String = "{}",
+    transferPolicy: ConnectionTransferPolicy = .default,
+    configurationRevision: UUID = UUID()
   ) {
     self.id = id
     self.name = name
@@ -143,6 +188,7 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     self.autoConnect = autoConnect
     self.localMountPath = localMountPath
     self.sftpAuthentication = sftpAuthentication
+    self.sftpShellType = sftpShellType
     self.privateKeyPath = privateKeyPath
     self.ftpEncryption = ftpEncryption
     self.verifyTLSCertificate = verifyTLSCertificate
@@ -150,6 +196,10 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     self.s3Region = s3Region
     self.s3AddressingStyle = s3AddressingStyle
     self.s3Anonymous = s3Anonymous
+    self.rcloneBackend = rcloneBackend
+    self.rcloneParametersJSON = rcloneParametersJSON
+    self.transferPolicy = transferPolicy
+    self.configurationRevision = configurationRevision
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -164,6 +214,7 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     case autoConnect
     case localMountPath
     case sftpAuthentication
+    case sftpShellType
     case privateKeyPath
     case ftpEncryption
     case verifyTLSCertificate
@@ -171,6 +222,10 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     case s3Region
     case s3AddressingStyle
     case s3Anonymous
+    case rcloneBackend
+    case rcloneParametersJSON
+    case transferPolicy
+    case configurationRevision
   }
 
   init(from decoder: Decoder) throws {
@@ -188,6 +243,9 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     sftpAuthentication =
       try container.decodeIfPresent(SFTPAuthentication.self, forKey: .sftpAuthentication)
       ?? .password
+    sftpShellType =
+      try container.decodeIfPresent(SFTPShellType.self, forKey: .sftpShellType)
+      ?? .disabled
     privateKeyPath = try container.decodeIfPresent(String.self, forKey: .privateKeyPath) ?? ""
     ftpEncryption =
       try container.decodeIfPresent(FTPEncryption.self, forKey: .ftpEncryption) ?? .none
@@ -199,6 +257,14 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
       try container.decodeIfPresent(S3AddressingStyle.self, forKey: .s3AddressingStyle)
       ?? .automatic
     s3Anonymous = try container.decodeIfPresent(Bool.self, forKey: .s3Anonymous) ?? false
+    rcloneBackend = try container.decodeIfPresent(String.self, forKey: .rcloneBackend) ?? ""
+    rcloneParametersJSON = try container.decodeIfPresent(String.self, forKey: .rcloneParametersJSON) ?? "{}"
+    transferPolicy =
+      try container.decodeIfPresent(ConnectionTransferPolicy.self, forKey: .transferPolicy)
+      ?? .default
+    transferPolicy.clamp()
+    configurationRevision =
+      try container.decodeIfPresent(UUID.self, forKey: .configurationRevision) ?? id
   }
 
   static var blank: ServerProfile {
@@ -224,6 +290,11 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
   }
 
   var endpointDescription: String {
+    if kind == .rclone {
+      let backend = rcloneBackend.trimmingCharacters(in: .whitespacesAndNewlines)
+      let root = path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+      return root.isEmpty ? "rclone:\(backend)" : "rclone:\(backend):\(root)"
+    }
     if kind == .s3 {
       let scheme = useTLS ? "https" : "http"
       let endpoint = host.contains("://") ? host : "\(scheme)://\(host)"
@@ -255,6 +326,8 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
     case .s3:
       if host.contains("://") { return URL(string: host) }
       components.scheme = useTLS ? "https" : "http"
+    case .rclone:
+      return nil
     default:
       components.scheme = kind.rawValue
     }

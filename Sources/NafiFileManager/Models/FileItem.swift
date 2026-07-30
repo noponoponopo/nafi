@@ -124,7 +124,7 @@ enum ThumbnailMediaKind: Hashable, Sendable {
   case video
 }
 
-enum FileSort: String, CaseIterable, Identifiable, Sendable {
+enum FileSort: String, CaseIterable, Identifiable, Codable, Sendable {
   case name
   case modified
   case size

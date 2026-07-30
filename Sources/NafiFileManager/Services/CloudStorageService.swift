@@ -75,7 +75,10 @@ final class CloudStorageService: ObservableObject {
         includingResourceValuesForKeys: [.isDirectoryKey],
         relativeTo: nil
       )
-      try data.write(to: bookmarkURL, options: .atomic)
+      try data.write(
+        to: bookmarkURL,
+        options: [.atomic, .completeFileProtectionUnlessOpen]
+      )
       refresh()
     } catch {
       errorMessage = "iCloud Driveの場所を保存できませんでした: \(error.localizedDescription)"
@@ -83,8 +86,14 @@ final class CloudStorageService: ObservableObject {
   }
 
   func forgetSelectedLocation() {
-    try? FileManager.default.removeItem(at: bookmarkURL)
-    refresh()
+    do {
+      if FileManager.default.fileExists(atPath: bookmarkURL.path) {
+        try FileManager.default.removeItem(at: bookmarkURL)
+      }
+      refresh()
+    } catch {
+      errorMessage = "保存したiCloud Driveの場所を削除できませんでした: \(error.localizedDescription)"
+    }
   }
 
   static func automaticICloudDriveURL() -> URL? {
@@ -103,9 +112,13 @@ final class CloudStorageService: ObservableObject {
   }
 
   private func resolveStoredBookmark() -> URL? {
-    guard let data = try? Data(contentsOf: bookmarkURL) else { return nil }
+    guard FileManager.default.fileExists(atPath: bookmarkURL.path) else { return nil }
 
     do {
+      let data = try AppStoragePaths.readRegularFile(
+        at: bookmarkURL,
+        maximumBytes: 1 * 1_024 * 1_024
+      )
       var isStale = false
       let resolvedURL = try URL(
         resolvingBookmarkData: data,
@@ -119,12 +132,15 @@ final class CloudStorageService: ObservableObject {
           includingResourceValuesForKeys: [.isDirectoryKey],
           relativeTo: nil
         )
-        try refreshed.write(to: bookmarkURL, options: .atomic)
+        try refreshed.write(
+          to: bookmarkURL,
+          options: [.atomic, .completeFileProtectionUnlessOpen]
+        )
       }
       return resolvedURL
     } catch {
-      try? FileManager.default.removeItem(at: bookmarkURL)
-      errorMessage = "保存していたiCloud Driveのアクセス情報を読み込めませんでした。"
+      AppStoragePaths.quarantineCorruptFile(at: bookmarkURL, label: "invalid-bookmark")
+      errorMessage = "保存していたiCloud Driveのアクセス情報を読み込めなかったため隔離しました。"
       return nil
     }
   }

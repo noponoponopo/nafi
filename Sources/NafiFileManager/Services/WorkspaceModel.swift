@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 indirect enum PaneLayoutNode: Identifiable {
@@ -12,7 +13,7 @@ indirect enum PaneLayoutNode: Identifiable {
   }
 }
 
-enum PaneSplitAxis: String, CaseIterable, Identifiable {
+enum PaneSplitAxis: String, Codable, CaseIterable, Identifiable, Sendable {
   case horizontal
   case vertical
 
@@ -45,11 +46,35 @@ final class WorkspaceModel: ObservableObject {
   @Published private(set) var sessions: [UUID: PaneSession]
   @Published var activePaneID: UUID
 
+  private var sessionObservers: [UUID: AnyCancellable] = [:]
+
   init(initialURL: URL, showHidden: Bool, viewMode: FileViewMode) {
     let session = PaneSession(initialURL: initialURL, showHidden: showHidden, viewMode: viewMode)
     sessions = [session.id: session]
     root = .pane(session.id)
     activePaneID = session.id
+    bindSession(session)
+  }
+
+  init(snapshot: WorkspaceSnapshot) {
+    var restored: [UUID: PaneSession] = [:]
+    for pane in snapshot.panes.prefix(64) {
+      let model = FilePaneModel.restore(from: pane)
+      restored[pane.id] = PaneSession(id: pane.id, model: model)
+    }
+    if restored.isEmpty {
+      let model = FilePaneModel(
+        initialURL: FileManager.default.homeDirectoryForCurrentUser,
+        showHidden: false,
+        viewMode: .list
+      )
+      restored[model.id] = PaneSession(id: model.id, model: model)
+    }
+    sessions = restored
+    let candidate = Self.restoreLayout(snapshot.root, validPaneIDs: Set(restored.keys))
+    root = candidate ?? .pane(restored.keys.first!)
+    activePaneID = restored[snapshot.activePaneID] == nil ? restored.keys.first! : snapshot.activePaneID
+    bindAllSessions()
   }
 
   var activeSession: PaneSession {
@@ -93,6 +118,7 @@ final class WorkspaceModel: ObservableObject {
     let newSession = PaneSession(model: model)
     newSession.activeModel.load()
     sessions[newSession.id] = newSession
+    bindSession(newSession)
 
     let oldNode = PaneLayoutNode.pane(paneID)
     let newNode = PaneLayoutNode.pane(newSession.id)
@@ -110,6 +136,7 @@ final class WorkspaceModel: ObservableObject {
     guard sessions.count > 1 else { return }
     guard let updated = removingPane(from: root, paneID: paneID) else { return }
     sessions[paneID] = nil
+    sessionObservers[paneID] = nil
     root = updated
     if activePaneID == paneID {
       activePaneID = firstPaneID(in: updated) ?? sessions.keys.first!
@@ -118,6 +145,60 @@ final class WorkspaceModel: ObservableObject {
 
   func openInNewPane(_ url: URL) {
     split(paneID: activePaneID, edge: .trailing, opening: url)
+  }
+
+  func makeSnapshot(name: String) -> WorkspaceSnapshot {
+    WorkspaceSnapshot(
+      name: name,
+      root: Self.snapshot(root),
+      activePaneID: activePaneID,
+      panes: sessions.values.map { $0.activeModel.makeStateSnapshot() }
+    )
+  }
+
+  func replace(with snapshot: WorkspaceSnapshot) {
+    let restored = WorkspaceModel(snapshot: snapshot)
+    sessionObservers.removeAll()
+    sessions = restored.sessions
+    bindAllSessions()
+    root = restored.root
+    activePaneID = restored.activePaneID
+    loadAll()
+  }
+
+  private func bindAllSessions() {
+    sessionObservers.removeAll(keepingCapacity: true)
+    for session in sessions.values { bindSession(session) }
+  }
+
+  private func bindSession(_ session: PaneSession) {
+    sessionObservers[session.id] = session.activeModel.objectWillChange.sink { [weak self] _ in
+      self?.objectWillChange.send()
+    }
+  }
+
+  private static func snapshot(_ node: PaneLayoutNode) -> PaneLayoutSnapshot {
+    switch node {
+    case .pane(let id): return .pane(id)
+    case .split(let id, let axis, let first, let second):
+      return .split(id: id, axis: axis, first: snapshot(first), second: snapshot(second))
+    }
+  }
+
+  private static func restoreLayout(
+    _ value: PaneLayoutSnapshot, validPaneIDs: Set<UUID>
+  ) -> PaneLayoutNode? {
+    switch value {
+    case .pane(let id): return validPaneIDs.contains(id) ? .pane(id) : nil
+    case .split(let id, let axis, let first, let second):
+      let a = restoreLayout(first, validPaneIDs: validPaneIDs)
+      let b = restoreLayout(second, validPaneIDs: validPaneIDs)
+      switch (a, b) {
+      case (nil, nil): return nil
+      case (let value?, nil), (nil, let value?): return value
+      case (let first?, let second?): return .split(id: id, axis: axis, first: first, second: second)
+      }
+    }
   }
 
   private func replacingPane(

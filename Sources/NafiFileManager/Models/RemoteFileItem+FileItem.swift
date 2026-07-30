@@ -3,7 +3,11 @@ import UniformTypeIdentifiers
 
 extension FileItem {
   init(remote item: RemoteFileItem, profileID: UUID) {
-    let url = NafiURL.remoteURL(profileID: profileID, path: item.path)
+    let url = NafiURL.remoteURL(
+      profileID: profileID,
+      path: item.path,
+      identityToken: item.ambiguityToken
+    )
     let type = item.isDirectory ? UTType.folder : UTType(filenameExtension: url.pathExtension)
     self.init(
       url: url,

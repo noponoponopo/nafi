@@ -274,7 +274,10 @@ struct ServerSidebarRow: View {
       Button("切断") { Task { await manager.disconnect(profile) } }
       Divider()
       Button("編集", action: edit)
-      Button("削除", role: .destructive) { manager.remove(profile) }
+      Button("削除", role: .destructive) {
+        do { try manager.remove(profile) }
+        catch { appState.presentationErrorMessage = error.localizedDescription }
+      }
     }
     .help(helpText)
     .onDisappear { focusTask?.cancel() }

@@ -1,7 +1,7 @@
 import Foundation
 import UniformTypeIdentifiers
 
-enum FileSearchFilterMode: String, CaseIterable, Identifiable, Sendable {
+enum FileSearchFilterMode: String, CaseIterable, Identifiable, Codable, Sendable {
   case all
   case folders
   case kinds
@@ -28,7 +28,7 @@ enum FileSearchFilterMode: String, CaseIterable, Identifiable, Sendable {
   }
 }
 
-enum FileSearchKind: String, CaseIterable, Identifiable, Hashable, Sendable {
+enum FileSearchKind: String, CaseIterable, Identifiable, Codable, Hashable, Sendable {
   case images
   case video
   case audio

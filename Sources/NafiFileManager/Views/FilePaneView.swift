@@ -686,30 +686,47 @@ private struct GalleryThumbnail: View {
   }
 }
 
+private final class EmbeddedQuickLookContainer: NSView {
+  let previewView: QLPreviewView?
+
+  override init(frame frameRect: NSRect) {
+    let preview = QLPreviewView(frame: frameRect, style: .normal)
+    previewView = preview
+    super.init(frame: frameRect)
+
+    guard let preview else { return }
+    preview.autostarts = true
+    preview.wantsLayer = true
+    preview.layer?.masksToBounds = true
+    preview.autoresizingMask = [.width, .height]
+    preview.frame = bounds
+    preview.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    preview.setContentHuggingPriority(.defaultLow, for: .vertical)
+    preview.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    preview.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+    addSubview(preview)
+  }
+
+  required init?(coder: NSCoder) { nil }
+}
+
 private struct EmbeddedQuickLookView: NSViewRepresentable {
   let url: URL
 
-  func makeNSView(context: Context) -> QLPreviewView {
-    let view = QLPreviewView(frame: .zero, style: .normal)!
-    view.autostarts = true
-    view.wantsLayer = true
-    view.layer?.masksToBounds = true
-    view.setContentHuggingPriority(.defaultLow, for: .horizontal)
-    view.setContentHuggingPriority(.defaultLow, for: .vertical)
-    view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-    view.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-    return view
+  func makeNSView(context: Context) -> EmbeddedQuickLookContainer {
+    EmbeddedQuickLookContainer(frame: .zero)
   }
 
-  func updateNSView(_ nsView: QLPreviewView, context: Context) {
-    let current = (nsView.previewItem as? NSURL).map { $0 as URL }
+  func updateNSView(_ nsView: EmbeddedQuickLookContainer, context: Context) {
+    guard let preview = nsView.previewView else { return }
+    let current = (preview.previewItem as? NSURL).map { $0 as URL }
     guard current != url else { return }
-    nsView.previewItem = nil
-    nsView.previewItem = url as NSURL
+    preview.previewItem = nil
+    preview.previewItem = url as NSURL
   }
 
-  static func dismantleNSView(_ nsView: QLPreviewView, coordinator: Void) {
-    nsView.previewItem = nil
+  static func dismantleNSView(_ nsView: EmbeddedQuickLookContainer, coordinator: Void) {
+    nsView.previewView?.previewItem = nil
   }
 }
 
@@ -991,6 +1008,12 @@ struct FileItemContextMenu: View {
       model.ensureSelected(item)
       model.previewSelected()
     }
+    if NafiURL.isRemote(item.url) {
+      Button("ダウンロード…") {
+        model.ensureSelected(item)
+        model.downloadSelection()
+      }
+    }
     if QuickEditSupport.isEditable(item) {
       Button("クイックエディット") {
         model.ensureSelected(item)
@@ -1010,6 +1033,12 @@ struct FileItemContextMenu: View {
       model.ensureSelected(item)
       model.requestRename(item.url)
     }
+    if model.selectedItems.count > 1 {
+      Button("一括名称変更") {
+        model.ensureSelected(item)
+        model.requestBatchRenameSelected()
+      }
+    }
     Button("複製") {
       model.ensureSelected(item)
       model.duplicateSelection()
@@ -1021,6 +1050,14 @@ struct FileItemContextMenu: View {
     Button("圧縮") {
       model.ensureSelected(item)
       model.compressSelection()
+    }
+    if !item.isDirectory,
+      item.url.pathExtension.localizedCaseInsensitiveCompare("zip") == .orderedSame
+    {
+      Button("ZIPを展開") {
+        model.ensureSelected(item)
+        model.extractSelection()
+      }
     }
     Button("タグを編集") {
       model.ensureSelected(item)

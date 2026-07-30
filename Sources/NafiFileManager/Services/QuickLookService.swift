@@ -26,6 +26,7 @@ final class QuickLookService: NSObject, @preconcurrency QLPreviewPanelDataSource
   }
 
   func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-    previewItems[index]
+    guard previewItems.indices.contains(index) else { return nil }
+    return previewItems[index]
   }
 }

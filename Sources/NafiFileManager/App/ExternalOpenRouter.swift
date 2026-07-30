@@ -2,29 +2,73 @@ import AppKit
 import Foundation
 
 @MainActor
+enum NafiExternalCommand: Equatable {
+  case quickOpen
+  case sync(profile: String?)
+  case syncCenter
+  case dropStack
+  case workspaces
+
+  init?(url: URL) {
+    guard url.scheme?.lowercased() == "nafi" else { return nil }
+    let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    let command = (url.host ?? url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))).lowercased()
+    switch command {
+    case "quick-open": self = .quickOpen
+    case "sync":
+      let profile = components?.queryItems?.first(where: { $0.name == "profile" })?.value
+      self = .sync(profile: profile?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty)
+    case "sync-center": self = .syncCenter
+    case "drop-stack": self = .dropStack
+    case "workspaces": self = .workspaces
+    default: return nil
+    }
+  }
+}
+
+private extension String {
+  var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+@MainActor
 final class ExternalOpenRouter {
   static let shared = ExternalOpenRouter()
 
   private var pendingURLs: [URL] = []
-  private var handler: (([URL]) -> Void)?
+  private var pendingCommands: [NafiExternalCommand] = []
+  private var fileHandler: (([URL]) -> Void)?
+  private var commandHandler: ((NafiExternalCommand) -> Void)?
 
   private init() {}
 
   func connect(_ handler: @escaping ([URL]) -> Void) {
-    self.handler = handler
+    fileHandler = handler
     guard !pendingURLs.isEmpty else { return }
     let queued = pendingURLs
     pendingURLs.removeAll(keepingCapacity: true)
     handler(queued)
   }
 
+  func connectCommands(_ handler: @escaping (NafiExternalCommand) -> Void) {
+    commandHandler = handler
+    guard !pendingCommands.isEmpty else { return }
+    let queued = pendingCommands
+    pendingCommands.removeAll(keepingCapacity: true)
+    queued.forEach(handler)
+  }
+
   func submit(_ urls: [URL]) {
+    let commands = urls.compactMap(NafiExternalCommand.init(url:))
     let fileURLs = urls.filter(\.isFileURL)
-    guard !fileURLs.isEmpty else { return }
-    if let handler {
-      handler(fileURLs)
-    } else {
-      pendingURLs.append(contentsOf: fileURLs)
+
+    if !fileURLs.isEmpty {
+      if let fileHandler { fileHandler(fileURLs) }
+      else { pendingURLs.append(contentsOf: fileURLs) }
+    }
+
+    for command in commands {
+      if let commandHandler { commandHandler(command) }
+      else { pendingCommands.append(command) }
     }
   }
 }
@@ -55,16 +99,23 @@ final class NafiServiceProvider: NSObject {
 
 final class NafiAppDelegate: NSObject, NSApplicationDelegate {
   private let serviceProvider = NafiServiceProvider()
+  private var isBackgroundLaunch: Bool { ProcessInfo.processInfo.arguments.contains("--background") }
 
   func applicationWillFinishLaunching(_ notification: Notification) {
     // The macOS window tab bar is nafi's only tab UI. nafi groups windows
     // explicitly so a Finder open never creates a second, temporary tab group.
     NSWindow.allowsAutomaticWindowTabbing = false
+    if isBackgroundLaunch { NSApplication.shared.setActivationPolicy(.accessory) }
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApplication.shared.servicesProvider = serviceProvider
     NSUpdateDynamicServices()
+    if isBackgroundLaunch {
+      DispatchQueue.main.async {
+        NSApplication.shared.windows.forEach { $0.orderOut(nil) }
+      }
+    }
 
     // Finder can launch the app with an external file event before SwiftUI
     // creates the browser scene. Use the same native-window path as new tabs

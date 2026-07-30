@@ -43,12 +43,21 @@ struct KeychainStore {
   }
 
   func deleteSecrets(for profile: ServerProfile) throws {
+    var firstError: Error?
+    var accounts = [String]()
     for kind in [SecretKind.password, .keyPassphrase, .sessionToken] {
-      let account = account(for: profile, kind: kind)
-      try? delete(service: service, account: account)
-      try? delete(service: legacyService, account: account)
+      accounts.append(account(for: profile, kind: kind))
     }
-    try? delete(service: legacyService, account: profile.id.uuidString)
+    // Very old versions used only the UUID as the account in both service namespaces.
+    accounts.append(profile.id.uuidString)
+
+    for account in accounts {
+      for namespace in [service, legacyService] {
+        do { try delete(service: namespace, account: account) }
+        catch { if firstError == nil { firstError = error } }
+      }
+    }
+    if let firstError { throw firstError }
   }
 
   private func save(secret: String, kind: SecretKind, for profile: ServerProfile) throws {

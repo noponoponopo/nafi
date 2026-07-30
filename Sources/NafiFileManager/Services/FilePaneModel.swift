@@ -9,14 +9,17 @@ final class FilePaneModel: ObservableObject, Identifiable {
     case newFile
     case newFolder
     case rename(URL)
+    case batchRename([URL])
     case tags([URL])
 
     var id: String {
       switch self {
       case .newFile: "newFile"
       case .newFolder: "newFolder"
-      case .rename(let url): "rename-\(url.path)"
-      case .tags(let urls): "tags-\(urls.map(\.path).joined(separator: "|"))"
+      case .rename(let url): "rename-\(url.absoluteString)"
+      case .batchRename(let urls):
+        "batchRename-\(urls.map(\.absoluteString).joined(separator: "|"))"
+      case .tags(let urls): "tags-\(urls.map(\.absoluteString).joined(separator: "|"))"
       }
     }
 
@@ -25,12 +28,14 @@ final class FilePaneModel: ObservableObject, Identifiable {
       case .newFile: "新規ファイル"
       case .newFolder: "新規フォルダ"
       case .rename: "名前を変更"
+      case .batchRename: "一括名称変更"
       case .tags: "タグを編集"
       }
     }
 
     var placeholder: String {
       switch self {
+      case .batchRename: "例: 写真 ###（# は連番、[name] は元の名前）"
       case .tags: "タグをカンマ区切りで入力"
       default: "名前"
       }
@@ -214,6 +219,9 @@ final class FilePaneModel: ObservableObject, Identifiable {
   var canGoBack: Bool { !backStack.isEmpty }
   var canGoForward: Bool { !forwardStack.isEmpty }
   var selectionCount: Int { selectionController.count }
+  var canDownloadSelection: Bool {
+    !selectedItems.isEmpty && selectedItems.allSatisfy { NafiURL.isRemote($0.url) }
+  }
   var isPerformingFileOperation: Bool { operationLabel != nil }
   var isSearchActive: Bool { !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
   var isRecursiveSearchActive: Bool { isSearchActive && searchScope.searchesRecursively }
@@ -255,6 +263,62 @@ final class FilePaneModel: ObservableObject, Identifiable {
   func item(for url: URL?) -> FileItem? {
     guard let url else { return nil }
     return itemLookup[url] ?? supplementalItems[url]
+  }
+
+  struct StateSnapshot: Codable, Hashable, Sendable {
+    var id: UUID
+    var currentURL: URL
+    var showHidden: Bool
+    var viewMode: FileViewMode
+    var sort: FileSort
+    var sortDescending: Bool
+    var iconSize: Double
+    var searchText: String
+    var searchScope: FileSearchScope
+    var searchFilterMode: FileSearchFilterMode
+    var selectedSearchKinds: Set<FileSearchKind>
+    var searchExtensionsText: String
+    var backStack: [URL]
+    var forwardStack: [URL]
+  }
+
+  func makeStateSnapshot() -> StateSnapshot {
+    StateSnapshot(
+      id: id,
+      currentURL: currentURL,
+      showHidden: showHidden,
+      viewMode: viewMode,
+      sort: sort,
+      sortDescending: sortDescending,
+      iconSize: iconSize,
+      searchText: searchText,
+      searchScope: searchScope,
+      searchFilterMode: searchFilterMode,
+      selectedSearchKinds: selectedSearchKinds,
+      searchExtensionsText: searchExtensionsText,
+      backStack: Array(backStack.suffix(200)),
+      forwardStack: Array(forwardStack.suffix(200))
+    )
+  }
+
+  static func restore(from snapshot: StateSnapshot) -> FilePaneModel {
+    let model = FilePaneModel(
+      id: snapshot.id,
+      initialURL: snapshot.currentURL,
+      showHidden: snapshot.showHidden,
+      viewMode: snapshot.viewMode
+    )
+    model.sort = snapshot.sort
+    model.sortDescending = snapshot.sortDescending
+    model.iconSize = min(max(snapshot.iconSize.isFinite ? snapshot.iconSize : 64, 24), 256)
+    model.searchText = String(snapshot.searchText.prefix(1_024))
+    model.searchScope = snapshot.searchScope
+    model.searchFilterMode = snapshot.searchFilterMode
+    model.selectedSearchKinds = snapshot.selectedSearchKinds
+    model.searchExtensionsText = String(snapshot.searchExtensionsText.prefix(4_096))
+    model.backStack = Array(snapshot.backStack.suffix(200))
+    model.forwardStack = Array(snapshot.forwardStack.suffix(200))
+    return model
   }
 
   func clone() -> FilePaneModel {
@@ -719,6 +783,23 @@ final class FilePaneModel: ObservableObject, Identifiable {
     return true
   }
 
+
+  @discardableResult
+  func requestBatchRenameSelected() -> Bool {
+    let urls = selectedItems.map(\.url)
+    guard urls.count >= 2 else { return false }
+    promptText = "[name] #"
+    prompt = .batchRename(urls)
+    return true
+  }
+
+  var canExtractSelection: Bool {
+    guard selectedItems.count == 1, let item = selectedItems.first, !item.isDirectory else {
+      return false
+    }
+    return item.url.pathExtension.localizedCaseInsensitiveCompare("zip") == .orderedSame
+  }
+
   func selectAfterNextLoad(_ url: URL) {
     let standardized = NafiURL.normalized(url)
     if let item = itemLookup[standardized] ?? supplementalItems[standardized] {
@@ -738,7 +819,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       ? NafiURL.parent(of: standardized)
       : standardized.deletingLastPathComponent().standardizedFileURL
     pendingSelectionURL = standardized
-    if NafiURL.normalized(currentURL) == parent {
+    if NafiURL.sameLocation(currentURL, parent) {
       load()
     } else {
       navigate(to: parent)
@@ -774,6 +855,10 @@ final class FilePaneModel: ObservableObject, Identifiable {
     case .rename(let url):
       runAsyncOperation(label: "名前を変更中") {
         [try await UnifiedFileSystemService.rename(url, to: text)]
+      }
+    case .batchRename(let urls):
+      runAsyncOperation(label: "一括名称変更中") {
+        try await UnifiedFileSystemService.batchRename(urls, pattern: text)
       }
     case .tags(let urls):
       guard urls.allSatisfy(\.isFileURL) else {
@@ -820,6 +905,15 @@ final class FilePaneModel: ObservableObject, Identifiable {
     }
   }
 
+
+  func extractSelection() {
+    guard canExtractSelection, let archive = selectedItems.first?.url else { return }
+    let directory = currentURL
+    runAsyncOperation(label: "展開中") {
+      [try await UnifiedFileSystemService.extractArchive(archive, to: directory)]
+    }
+  }
+
   func trashSelection() {
     let items = selectedItems
     guard !items.isEmpty else { return }
@@ -861,8 +955,15 @@ final class FilePaneModel: ObservableObject, Identifiable {
     }
 
     Task { [weak self] in
-      let conflicts = await UnifiedFileSystemService.conflictingItems(
-        safeURLs, in: destinationURL)
+      let conflicts: [URL]
+      do {
+        conflicts = try await UnifiedFileSystemService.conflictingItems(
+          safeURLs, in: destinationURL)
+      } catch {
+        guard let self else { return }
+        self.errorMessage = error.localizedDescription
+        return
+      }
       guard let self else { return }
       if !conflicts.isEmpty {
         self.transferConflict = TransferConflictPrompt(
@@ -914,8 +1015,12 @@ final class FilePaneModel: ObservableObject, Identifiable {
       label: move ? "移動中" : "コピー中",
       clearPasteboardOnSuccess: clearPasteboardOnSuccess
     ) {
-      try await UnifiedFileSystemService.transfer(
-        urls, to: destination, move: move, policy: existingItemPolicy)
+      try await TransferQueue.shared.enqueueAndWait(
+        sources: urls,
+        destination: destination,
+        move: move,
+        policy: existingItemPolicy
+      )
     }
   }
 
@@ -945,7 +1050,9 @@ final class FilePaneModel: ObservableObject, Identifiable {
     pasteboard.clearContents()
     let localURLs = urls.filter(\.isFileURL)
     if !localURLs.isEmpty { pasteboard.writeObjects(localURLs.map { $0 as NSURL }) }
-    if let data = try? JSONEncoder().encode(FileDragPayload(urls: urls)) {
+    if let data = try? JSONEncoder().encode(FileDragPayload(urls: urls)),
+      data.count <= DragPayloadLimits.maximumPayloadBytes
+    {
       pasteboard.setData(
         data,
         forType: NSPasteboard.PasteboardType(UTType.nafiFileCollection.identifier)
@@ -955,11 +1062,28 @@ final class FilePaneModel: ObservableObject, Identifiable {
       cut ? "cut" : "copy", forType: NSPasteboard.PasteboardType("app.nafi.transfer-mode"))
   }
 
+  func downloadSelection() {
+    let urls = selectedItems.map(\.url)
+    guard !urls.isEmpty, urls.allSatisfy(NafiURL.isRemote) else { return }
+
+    let panel = NSOpenPanel()
+    panel.title = "ダウンロード先を選択"
+    panel.prompt = "ダウンロード"
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.canCreateDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+    guard panel.runModal() == .OK, let destination = panel.url else { return }
+    transferItems(urls, to: destination, move: false)
+  }
+
   func paste() {
     let pasteboard = NSPasteboard.general
     let urls: [URL]
     if let data = pasteboard.data(
       forType: NSPasteboard.PasteboardType(UTType.nafiFileCollection.identifier)),
+      data.count <= DragPayloadLimits.maximumPayloadBytes,
       let payload = try? JSONDecoder().decode(FileDragPayload.self, from: data)
     {
       urls = payload.urls

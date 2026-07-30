@@ -1,8 +1,12 @@
 import AppKit
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 extension Notification.Name {
   static let nafiFileSystemDidChange = Notification.Name("app.nafi.file-system-did-change")
+  static let nafiMaintenanceWarning = Notification.Name("app.nafi.maintenance-warning")
 }
 
 private final class DirectorySnapshotBox: NSObject, @unchecked Sendable {
@@ -225,22 +229,28 @@ struct FileSystemService {
     let requestedDestination = directory.appendingPathComponent(source.lastPathComponent)
     let sourceURL = source.standardizedFileURL
     let requestedURL = requestedDestination.standardizedFileURL
+    let copiesOntoSource = NafiURL.sameLocation(sourceURL, requestedURL)
 
     // Replacing an item with itself would destroy the source. A same-folder copy is always kept
     // as a second item instead.
     let destination =
-      existingItemPolicy == .keepBoth || sourceURL == requestedURL
+      existingItemPolicy == .keepBoth || copiesOntoSource
       ? uniqueURL(for: source.lastPathComponent, in: directory)
       : requestedDestination
 
-    if existingItemPolicy == .replace, sourceURL != requestedURL,
+    if existingItemPolicy == .replace, !copiesOntoSource,
       FileManager.default.fileExists(atPath: destination.path)
     {
       try replaceExistingItem(at: destination) {
         try FileManager.default.copyItem(at: source, to: destination)
       }
     } else {
-      try FileManager.default.copyItem(at: source, to: destination)
+      do {
+        try FileManager.default.copyItem(at: source, to: destination)
+      } catch {
+        try? FileManager.default.removeItem(at: destination)
+        throw error
+      }
     }
 
     notifyChanges(in: [directory])
@@ -252,7 +262,7 @@ struct FileSystemService {
     to directory: URL,
     existingItemPolicy: ExistingItemPolicy = .keepBoth
   ) throws -> URL {
-    if source.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL {
+    if NafiURL.sameLocation(source.deletingLastPathComponent(), directory) {
       return source
     }
 
@@ -267,8 +277,15 @@ struct FileSystemService {
       do {
         try FileManager.default.moveItem(at: source, to: destination)
       } catch {
-        // FileManager.moveItem may fail across volumes. Fall back to copy + remove.
-        try FileManager.default.copyItem(at: source, to: destination)
+        // Only a genuine cross-device rename is retried as copy + remove. Permission,
+        // collision and malformed-path failures must retain their original meaning.
+        guard isCrossDeviceMoveError(error) else { throw error }
+        do {
+          try FileManager.default.copyItem(at: source, to: destination)
+        } catch {
+          try? FileManager.default.removeItem(at: destination)
+          throw error
+        }
         do {
           try FileManager.default.removeItem(at: source)
         } catch {
@@ -288,33 +305,86 @@ struct FileSystemService {
     return destination
   }
 
-  static func compress(_ urls: [URL], in directory: URL) throws -> URL {
+  static func compress(_ urls: [URL], in directory: URL) async throws -> URL {
     guard !urls.isEmpty else { throw FileOperationError.noSelection }
+    let normalizedDirectory = directory.standardizedFileURL
+    guard normalizedDirectory.isFileURL,
+      urls.allSatisfy({
+        $0.isFileURL
+          && NafiURL.sameLocation($0.deletingLastPathComponent(), normalizedDirectory)
+      })
+    else {
+      throw FileOperationError.processFailed("圧縮対象は同じローカルフォルダ内にある必要があります。")
+    }
+    try await Task.detached(priority: .utility) {
+      try validateCompressionInputs(urls)
+    }.value
+
     let baseName =
       urls.count == 1
       ? urls[0].deletingPathExtension().lastPathComponent
       : "アーカイブ"
     let destination = uniqueURL(for: "\(baseName).zip", in: directory)
 
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-    process.currentDirectoryURL = directory
-    process.arguments = ["-r", "-q", destination.path, "--"] + urls.map(\.lastPathComponent)
-    let errorPipe = Pipe()
-    process.standardError = errorPipe
-
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-      let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
-      let message = String(data: data, encoding: .utf8) ?? "圧縮に失敗しました。"
+    do {
+      let result = try await BoundedProcessRunner.run(
+        executableURL: URL(fileURLWithPath: "/usr/bin/zip"),
+        arguments: ["-r", "-q", destination.path, "--"] + urls.map(\.lastPathComponent),
+        currentDirectoryURL: directory,
+        timeout: 6 * 60 * 60,
+        maximumStandardOutputBytes: 1 * 1_024 * 1_024,
+        maximumStandardErrorBytes: 1 * 1_024 * 1_024
+      )
+      guard result.terminationStatus == 0 else {
+        let message = String(data: result.stderr, encoding: .utf8)?
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        throw FileOperationError.processFailed(
+          message.flatMap { $0.isEmpty ? nil : $0 } ?? "圧縮に失敗しました。"
+        )
+      }
+    } catch BoundedProcessRunner.Failure.cancelled {
       try? FileManager.default.removeItem(at: destination)
-      throw FileOperationError.processFailed(
-        message.trimmingCharacters(in: .whitespacesAndNewlines))
+      throw CancellationError()
+    } catch is CancellationError {
+      try? FileManager.default.removeItem(at: destination)
+      throw CancellationError()
+    } catch {
+      try? FileManager.default.removeItem(at: destination)
+      throw error
     }
 
     notifyChanges(in: [directory])
     return destination
+  }
+
+  private static func validateCompressionInputs(_ roots: [URL]) throws {
+    let keys: Set<URLResourceKey> = [.isSymbolicLinkKey, .isDirectoryKey, .isRegularFileKey]
+    var pending = roots.map { $0.standardizedFileURL }
+    var visited = 0
+    while let item = pending.popLast() {
+      if Task.isCancelled { throw CancellationError() }
+      visited += 1
+      guard visited <= 1_000_000 else {
+        throw FileOperationError.processFailed("圧縮対象が100万項目を超えています。対象を分割してください。")
+      }
+      let values = try item.resourceValues(forKeys: keys)
+      if values.isSymbolicLink == true {
+        throw FileOperationError.processFailed(
+          "シンボリックリンクを含む項目は安全のため圧縮できません: \(item.path)"
+        )
+      }
+      if values.isDirectory == true {
+        pending.append(contentsOf: try FileManager.default.contentsOfDirectory(
+          at: item,
+          includingPropertiesForKeys: Array(keys),
+          options: []
+        ))
+      } else if values.isRegularFile != true {
+        throw FileOperationError.processFailed(
+          "通常ファイルでもフォルダでもない項目は圧縮できません: \(item.path)"
+        )
+      }
+    }
   }
 
   static func setTags(_ tags: [String], for urls: [URL]) throws {
@@ -338,9 +408,25 @@ struct FileSystemService {
     notifyChanges(in: [url.deletingLastPathComponent()])
   }
 
+
+  private static func isCrossDeviceMoveError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    if nsError.domain == NSPOSIXErrorDomain, nsError.code == EXDEV { return true }
+    if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error {
+      return isCrossDeviceMoveError(underlying)
+    }
+    if let detailed = nsError.userInfo[NSDetailedErrorsKey] as? [Error] {
+      return detailed.contains(where: isCrossDeviceMoveError)
+    }
+    return false
+  }
+
   private static func validatedName(_ name: String) throws -> String {
     let value = name.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !value.isEmpty, value != ".", value != "..", !value.contains("/") else {
+    guard !value.isEmpty, value != ".", value != "..", !value.contains("/"),
+      value.utf8.count <= 255,
+      !value.unicodeScalars.contains(where: { $0.value == 0 || $0 == "\r" || $0 == "\n" })
+    else {
       throw FileOperationError.invalidName
     }
     return value
@@ -360,7 +446,6 @@ struct FileSystemService {
     try fileManager.moveItem(at: destination, to: backup)
     do {
       try operation()
-      try fileManager.removeItem(at: backup)
     } catch {
       try? fileManager.removeItem(at: destination)
       do {
@@ -371,6 +456,19 @@ struct FileSystemService {
         )
       }
       throw error
+    }
+
+    do {
+      try fileManager.removeItem(at: backup)
+    } catch {
+      NotificationCenter.default.post(
+        name: .nafiMaintenanceWarning,
+        object: nil,
+        userInfo: [
+          "message":
+            "置き換えは完了しましたが、古いバックアップを削除できませんでした。必要に応じて削除してください: \(backup.path)\n\(error.localizedDescription)"
+        ]
+      )
     }
   }
 
@@ -388,10 +486,6 @@ struct FileSystemService {
       if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
       index += 1
     }
-  }
-
-  private static func shellQuoted(_ value: String) -> String {
-    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
   }
 
   private static func snapshotKey(for directory: URL, showHidden: Bool) -> NSString {

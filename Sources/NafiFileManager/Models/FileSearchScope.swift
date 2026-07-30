@@ -1,6 +1,6 @@
 import Foundation
 
-enum FileSearchScope: String, CaseIterable, Identifiable, Sendable {
+enum FileSearchScope: String, CaseIterable, Identifiable, Codable, Sendable {
   case currentFolder
   case descendants
   case storage

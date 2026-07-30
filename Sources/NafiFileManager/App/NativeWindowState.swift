@@ -8,17 +8,20 @@ struct NativeTabRequest: Codable, Hashable, Identifiable {
   let location: URL
   let revealURL: URL?
   let parentWindowID: UUID?
+  let workspaceSnapshot: WorkspaceSnapshot?
 
   init(
     id: UUID = UUID(),
     location: URL,
     revealURL: URL? = nil,
-    parentWindowID: UUID? = nil
+    parentWindowID: UUID? = nil,
+    workspaceSnapshot: WorkspaceSnapshot? = nil
   ) {
     self.id = id
     self.location = location
     self.revealURL = revealURL
     self.parentWindowID = parentWindowID
+    self.workspaceSnapshot = workspaceSnapshot
   }
 }
 
@@ -42,19 +45,26 @@ final class BrowserWindowState: ObservableObject, Identifiable {
     id = request?.id ?? UUID()
     parentWindowID = request?.parentWindowID
     revealURL = request?.revealURL
-    workspace = WorkspaceModel(
-      initialURL: request?.location ?? FileManager.default.homeDirectoryForCurrentUser,
-      showHidden: showHidden,
-      viewMode: viewMode
-    )
+    let restored = request?.workspaceSnapshot ?? (request == nil ? WorkspaceLibrary.shared.consumeInitialRestoration() : nil)
+    if let restored {
+      workspace = WorkspaceModel(snapshot: restored)
+    } else {
+      workspace = WorkspaceModel(
+        initialURL: request?.location ?? FileManager.default.homeDirectoryForCurrentUser,
+        showHidden: showHidden,
+        viewMode: viewMode
+      )
+    }
   }
 
   var activeModel: FilePaneModel { workspace.activeModel }
 
   var isPristineHomeWindow: Bool {
     workspace.paneCount == 1
-      && workspace.activeModel.currentURL.standardizedFileURL
-        == FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL
+      && NafiURL.sameLocation(
+        workspace.activeModel.currentURL,
+        FileManager.default.homeDirectoryForCurrentUser
+      )
   }
 
   func start() {

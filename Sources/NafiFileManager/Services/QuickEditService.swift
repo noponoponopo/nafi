@@ -144,7 +144,13 @@ struct QuickEditService {
           throw QuickEditError.tooLarge(size)
         }
 
-        let data = try Data(contentsOf: coordinatedURL, options: [.mappedIfSafe])
+        let handle = try FileHandle(forReadingFrom: coordinatedURL)
+        defer { try? handle.close() }
+        let maximumBytes = Int(QuickEditSupport.maximumFileSize)
+        let data = try handle.read(upToCount: maximumBytes + 1) ?? Data()
+        guard data.count <= maximumBytes else {
+          throw QuickEditError.tooLarge(Int64(data.count))
+        }
         let decoded = try decode(data)
         result = .success(
           QuickEditSnapshot(

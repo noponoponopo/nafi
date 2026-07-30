@@ -24,7 +24,7 @@ enum TerminalApplicationService {
 
   private static func sshCommand(profile: ServerProfile, path: String) -> String {
     var arguments = ["/usr/bin/ssh", "-t", "-p", String(profile.port)]
-    if profile.sftpAuthentication == .privateKey,
+    if profile.sftpAuthentication != .password,
       !profile.privateKeyPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     {
       let keyPath = NSString(string: profile.privateKeyPath).expandingTildeInPath

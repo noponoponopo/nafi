@@ -7,25 +7,14 @@ let package = Package(
     .macOS(.v14)
   ],
   products: [
-    .executable(name: "nafi", targets: ["NafiFileManager"])
+    .executable(name: "nafi", targets: ["NafiFileManager"]),
+    .executable(name: "nafi-background-agent", targets: ["NafiBackgroundAgent"])
   ],
-  dependencies: [
-    .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.12.1"),
-    .package(url: "https://github.com/apple/swift-nio.git", from: "2.81.0"),
-    .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.34.1"),
-    .package(url: "https://github.com/apple/swift-crypto.git", from: "3.12.3"),
-  ],
+  dependencies: [],
   targets: [
     .executableTarget(
       name: "NafiFileManager",
-      dependencies: [
-        .product(name: "Citadel", package: "Citadel"),
-        .product(name: "Crypto", package: "swift-crypto"),
-        .product(name: "NIOCore", package: "swift-nio"),
-        .product(name: "NIOPosix", package: "swift-nio"),
-        .product(name: "NIOTLS", package: "swift-nio"),
-        .product(name: "NIOSSL", package: "swift-nio-ssl"),
-      ],
+      dependencies: [],
       path: "Sources/NafiFileManager",
       linkerSettings: [
         .linkedFramework("AppKit"),
@@ -36,7 +25,20 @@ let package = Package(
         .linkedFramework("QuickLookThumbnailing"),
         .linkedFramework("QuickLookUI"),
         .linkedFramework("Security"),
+        .linkedFramework("ServiceManagement"),
+        .linkedFramework("FileProvider"),
+        .linkedFramework("Carbon"),
       ]
+    ),
+    .executableTarget(
+      name: "NafiBackgroundAgent",
+      path: "Sources/NafiBackgroundAgent",
+      linkerSettings: [.linkedFramework("AppKit")]
+    ),
+    .testTarget(
+      name: "NafiFileManagerTests",
+      dependencies: ["NafiFileManager"],
+      path: "Tests/NafiFileManagerTests"
     )
   ],
   swiftLanguageModes: [.v5]

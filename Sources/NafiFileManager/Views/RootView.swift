@@ -80,6 +80,22 @@ private struct RootViewContent: View {
         appState.quickEditDidSave(savedURL)
       }
     }
+    .sheet(isPresented: $appState.isQuickOpenPresented) {
+      QuickOpenView(model: appState.quickOpenModel) { appState.openQuickOpenResult($0) }
+    }
+    .sheet(isPresented: $appState.isDropStackPresented) {
+      DropStackView(model: appState.dropStack, destination: workspace.activeModel.currentURL)
+    }
+    .sheet(isPresented: $appState.isSyncCenterPresented) {
+      SyncCenterView(manager: appState.syncManager, currentURL: workspace.activeModel.currentURL)
+    }
+    .sheet(isPresented: $appState.isWorkspaceLibraryPresented) {
+      WorkspaceLibraryView(
+        library: appState.workspaceLibrary,
+        workspace: workspace,
+        restore: appState.restoreWorkspace
+      )
+    }
     .alert(
       "nafi",
       isPresented: Binding(
@@ -101,31 +117,36 @@ private struct RootViewContent: View {
 
     ToolbarItemGroup {
       Menu {
-        Button("左右に追加") { workspace.splitActive(axis: .horizontal) }
-        Button("上下に追加") { workspace.splitActive(axis: .vertical) }
+        Button("Quick Open") { appState.presentQuickOpen() }
+          .keyboardShortcut(.space, modifiers: [.command, .option])
         Divider()
-        Button("現在のペインを閉じる") {
-          workspace.closePane(workspace.activePaneID)
+        Button("同期") { appState.isSyncCenterPresented = true }
+        Button("選択をDrop Stackへ追加") { appState.addSelectionToDropStack() }
+          .disabled(workspace.activeModel.selectedItems.isEmpty)
+        Button("Drop Stackを開く") { appState.isDropStackPresented = true }
+        Button("ワークスペース") { appState.isWorkspaceLibraryPresented = true }
+        Divider()
+        Button("ここでターミナルを開く") { workspace.activeModel.openTerminalHere() }
+          .disabled(!workspace.activeModel.canOpenTerminalHere)
+        Button("サーバーへ接続") { appState.presentServerEditor() }
+        Divider()
+        Menu("ペイン") {
+          Button("左右に追加") { workspace.splitActive(axis: .horizontal) }
+          Button("上下に追加") { workspace.splitActive(axis: .vertical) }
+          Button("現在のペインを閉じる") { workspace.closePane(workspace.activePaneID) }
+            .disabled(workspace.paneCount == 1)
         }
-        .disabled(workspace.paneCount == 1)
       } label: {
-        Image(systemName: "rectangle.split.2x1")
+        Label("クイック操作", systemImage: "ellipsis.circle")
       }
-      .help("ペイン")
+      .help("クイック操作")
     }
 
     ToolbarItem {
       ActiveViewModePicker(session: workspace.activeSession)
     }
 
-    ToolbarItemGroup {
-      Button {
-        appState.presentServerEditor()
-      } label: {
-        Image(systemName: "network.badge.shield.half.filled")
-      }
-      .help("サーバーへ接続")
-
+    ToolbarItem {
       ActiveInspectorButton(session: workspace.activeSession) { item in
         appState.presentInspector(for: item.url)
       }

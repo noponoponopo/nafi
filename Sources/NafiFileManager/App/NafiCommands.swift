@@ -27,80 +27,80 @@ struct NafiCommands: Commands {
         .keyboardShortcut("a", modifiers: .command)
     }
 
-    CommandMenu("ファイル") {
-      Button("開く") { appState.activeModel.openSelected() }
-        .keyboardShortcut("o", modifiers: .command)
-      Button("名前を変更") { appState.activeModel.requestRenameSelected() }
-        .keyboardShortcut(.return, modifiers: [])
-      Button("複製") { appState.activeModel.duplicateSelection() }
-        .keyboardShortcut("d", modifiers: .command)
-      Button("エイリアスを作成") { appState.activeModel.createAliasSelection() }
-      Button("圧縮") { appState.activeModel.compressSelection() }
-      Button("Quick Look") { appState.activeModel.previewSelected() }
-        .keyboardShortcut(.space, modifiers: [])
-      Button("クイックエディット") { appState.quickEditSelected() }
-        .keyboardShortcut("e", modifiers: [.command, .option])
-        .disabled(!appState.canQuickEditSelection)
-      Divider()
-      Button(appState.activeModel.isRemote ? "削除" : "ゴミ箱に入れる") {
-        appState.activeModel.trashSelection()
-      }
-      .keyboardShortcut(.delete, modifiers: .command)
-    }
+    CommandMenu("操作") {
+      Button("Quick Open") { appState.presentQuickOpen() }
+        .keyboardShortcut(.space, modifiers: [.command, .option])
 
-    CommandMenu("移動") {
-      Button("戻る") { appState.activeModel.goBack() }
-        .keyboardShortcut("[", modifiers: .command)
-        .disabled(!appState.activeModel.canGoBack)
-      Button("進む") { appState.activeModel.goForward() }
-        .keyboardShortcut("]", modifiers: .command)
-        .disabled(!appState.activeModel.canGoForward)
-      Button("親フォルダ") { appState.activeModel.goUp() }
-        .keyboardShortcut(.upArrow, modifiers: .command)
-      Divider()
-      Button("新しいタブで開く") {
-        if let item = appState.activeModel.selectedItem, item.isDirectory {
-          appState.openInNewTab(item.url)
+      Menu("選択項目") {
+        Button("開く") { appState.activeModel.openSelected() }
+          .keyboardShortcut("o", modifiers: .command)
+        Button("名前を変更") { appState.activeModel.requestRenameSelected() }
+          .keyboardShortcut(.return, modifiers: [])
+        Button("一括名称変更") { appState.activeModel.requestBatchRenameSelected() }
+          .disabled(appState.activeModel.selectedItems.count < 2)
+        Button("複製") { appState.activeModel.duplicateSelection() }
+          .keyboardShortcut("d", modifiers: .command)
+        Button("エイリアスを作成") { appState.activeModel.createAliasSelection() }
+        Button("圧縮") { appState.activeModel.compressSelection() }
+        Button("ZIPを展開") { appState.activeModel.extractSelection() }
+          .disabled(!appState.activeModel.canExtractSelection)
+        Divider()
+        Button("Quick Look") { appState.activeModel.previewSelected() }
+          .keyboardShortcut(.space, modifiers: [])
+        Button("ダウンロード…") { appState.activeModel.downloadSelection() }
+          .disabled(!appState.activeModel.canDownloadSelection)
+        Button("クイックエディット") { appState.quickEditSelected() }
+          .keyboardShortcut("e", modifiers: [.command, .option])
+          .disabled(!appState.canQuickEditSelection)
+        Button("Drop Stackへ追加") { appState.addSelectionToDropStack() }
+          .disabled(appState.activeModel.selectedItems.isEmpty)
+        Divider()
+        Button(appState.activeModel.isRemote ? "削除" : "ゴミ箱に入れる") {
+          appState.activeModel.trashSelection()
         }
+        .keyboardShortcut(.delete, modifiers: .command)
       }
-      Button("新しいペインで開く") {
-        if let item = appState.activeModel.selectedItem, item.isDirectory {
-          appState.openInNewPane(item.url)
-        }
-      }
-    }
 
-    CommandMenu("表示") {
-      Button("リスト") { appState.activeModel.viewMode = .list }
-        .keyboardShortcut("1", modifiers: .command)
-      Button("マトリクス") { appState.activeModel.viewMode = .matrix }
-        .keyboardShortcut("2", modifiers: .command)
-      Button("カラム") { appState.activeModel.viewMode = .columns }
-        .keyboardShortcut("3", modifiers: .command)
-      Button("ギャラリー") { appState.activeModel.viewMode = .gallery }
-        .keyboardShortcut("4", modifiers: .command)
-      Divider()
-      Button("左右にペインを追加") { appState.workspace.splitActive(axis: .horizontal) }
-        .keyboardShortcut("\\", modifiers: [.command, .option])
-      Button("上下にペインを追加") { appState.workspace.splitActive(axis: .vertical) }
-      Button("現在のペインを閉じる") { appState.workspace.closePane(appState.workspace.activePaneID) }
+      Menu("移動と表示") {
+        Button("戻る") { appState.activeModel.goBack() }
+          .keyboardShortcut("[", modifiers: .command)
+          .disabled(!appState.activeModel.canGoBack)
+        Button("進む") { appState.activeModel.goForward() }
+          .keyboardShortcut("]", modifiers: .command)
+          .disabled(!appState.activeModel.canGoForward)
+        Button("親フォルダ") { appState.activeModel.goUp() }
+          .keyboardShortcut(.upArrow, modifiers: .command)
+        Divider()
+        ForEach(FileViewMode.allCases) { mode in
+          Button(mode.label) { appState.activeModel.viewMode = mode }
+        }
+        Divider()
+        Button(appState.activeModel.showHidden ? "隠しファイルを隠す" : "隠しファイルを表示") {
+          appState.activeModel.showHidden.toggle()
+          appState.activeModel.load()
+        }
+        .keyboardShortcut(".", modifiers: [.command, .shift])
+      }
+
+      Menu("ペイン") {
+        Button("左右に追加") { appState.workspace.splitActive(axis: .horizontal) }
+          .keyboardShortcut("\\", modifiers: [.command, .option])
+        Button("上下に追加") { appState.workspace.splitActive(axis: .vertical) }
+        Button("現在のペインを閉じる") {
+          appState.workspace.closePane(appState.workspace.activePaneID)
+        }
         .disabled(appState.workspace.paneCount == 1)
-      Divider()
-      Button(appState.activeModel.showHidden ? "隠しファイルを隠す" : "隠しファイルを表示") {
-        appState.activeModel.showHidden.toggle()
-        appState.activeModel.load()
       }
-      .keyboardShortcut(".", modifiers: [.command, .shift])
-    }
 
-    CommandMenu("サーバー") {
+      Divider()
+      Button("同期") { appState.isSyncCenterPresented = true }
+      Button("Drop Stack") { appState.isDropStackPresented = true }
+      Button("ワークスペース") { appState.isWorkspaceLibraryPresented = true }
+      Divider()
       Button("ここでターミナルを開く") { appState.activeModel.openTerminalHere() }
         .disabled(!appState.activeModel.canOpenTerminalHere)
-      Divider()
       Button("接続先を追加") { appState.presentServerEditor() }
         .keyboardShortcut("k", modifiers: [.command, .shift])
-      Button("自動接続を実行") { Task { await appState.serverManager.connectAutoProfiles() } }
-      Button("マウントを再検出") { appState.serverManager.refreshMountedVolumes() }
     }
   }
 }

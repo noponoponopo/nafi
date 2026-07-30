@@ -22,6 +22,19 @@ struct SettingsView: View {
       }
       .tabItem { Label("iCloud", systemImage: "icloud") }
 
+      TransferQueueSettingsView(
+        model: appState.transferQueueModel,
+        serverManager: appState.serverManager
+      )
+      .tabItem { Label("転送", systemImage: "arrow.left.arrow.right") }
+
+      IntegrationSettingsView(
+        service: appState.systemIntegration,
+        serverManager: appState.serverManager,
+        quickOpenChanged: appState.configureGlobalQuickOpen
+      )
+      .tabItem { Label("統合", systemImage: "puzzlepiece.extension") }
+
       privacySettings
         .tabItem { Label("プライバシー", systemImage: "hand.raised") }
     }
@@ -239,16 +252,6 @@ private struct ICloudSettingsView: View {
           }
         }
       }
-
-      Section("対応内容") {
-        Text(
-          "iCloud Drive内のフォルダを通常のフォルダと同じように閲覧、作成、名前変更、移動、コピーできます。未ダウンロードのテキストファイルをクイックエディットするときは、macOSへダウンロードを要求してから読み書きします。"
-        )
-        Text(
-          "Appleは他社アプリへiCloud Drive全体を返す専用APIを提供していないため、nafiはmacOS上のiCloud Drive保存場所を自動検出し、必要な場合だけユーザーが選んだ場所へのアクセス権を保存します。"
-        )
-        .foregroundStyle(.secondary)
-      }
     }
     .formStyle(.grouped)
     .task { service.refresh() }
@@ -263,5 +266,252 @@ private struct ICloudSettingsView: View {
     } message: {
       Text(service.errorMessage ?? "")
     }
+  }
+}
+
+
+private struct TransferQueueSettingsView: View {
+  @ObservedObject var model: TransferQueueModel
+  @ObservedObject var serverManager: ServerManager
+
+  private var hasFinishedJobs: Bool {
+    model.jobs.contains { [.completed, .failed, .cancelled].contains($0.state) }
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("転送キュー")
+            .font(.headline)
+          Text("転送は順番に実行され、未完了の処理はアプリ再起動後も復元されます。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        Spacer()
+        Button {
+          Task { await model.refresh() }
+        } label: {
+          Label("更新", systemImage: "arrow.clockwise")
+        }
+        .disabled(model.isRefreshing)
+
+        Button("完了・失敗履歴を削除") {
+          model.removeFinished()
+        }
+        .disabled(!hasFinishedJobs)
+      }
+      .padding(16)
+
+      Divider()
+
+      if model.jobs.isEmpty {
+        ContentUnavailableView(
+          "転送はありません",
+          systemImage: "arrow.left.arrow.right",
+          description: Text("コピーまたは移動を開始すると、ここで進行状況を確認できます。")
+        )
+      } else {
+        List(model.jobs) { job in
+          TransferQueueJobRow(
+            job: job,
+            destination: displayPath(for: job.destination),
+            pause: { model.pause(job) },
+            resume: { model.resume(job) },
+            cancel: { model.cancel(job) },
+            remove: { model.remove(job) }
+          )
+          .padding(.vertical, 4)
+        }
+        .listStyle(.inset)
+      }
+    }
+    .task { await model.refresh() }
+    .alert(
+      "転送キュー",
+      isPresented: Binding(
+        get: { model.errorMessage != nil },
+        set: { if !$0 { model.errorMessage = nil } }
+      )
+    ) {
+      Button("OK", role: .cancel) { model.errorMessage = nil }
+    } message: {
+      Text(model.errorMessage ?? "")
+    }
+  }
+
+  private func displayPath(for url: URL) -> String {
+    guard let id = NafiURL.profileID(in: url),
+      let profile = serverManager.profiles.first(where: { $0.id == id })
+    else {
+      return NafiURL.displayPath(url)
+    }
+    return NafiURL.displayPath(url, profile: profile)
+  }
+}
+
+private struct TransferQueueJobRow: View {
+  let job: TransferQueue.Job
+  let destination: String
+  let pause: () -> Void
+  let resume: () -> Void
+  let cancel: () -> Void
+  let remove: () -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(alignment: .firstTextBaseline, spacing: 8) {
+        Label(job.move ? "移動" : "コピー", systemImage: job.move ? "arrow.right" : "doc.on.doc")
+          .font(.headline)
+        Text(stateLabel)
+          .font(.caption.weight(.semibold))
+          .foregroundStyle(stateColor)
+        Spacer()
+        Text(job.updatedAt, style: .relative)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+
+      Text("\(job.sources.count)項目 → \(destination)")
+        .font(.subheadline)
+        .lineLimit(2)
+        .truncationMode(.middle)
+        .help(destination)
+
+      ProgressView(value: job.fractionCompleted) {
+        Text("\(job.completedSourceCount) / \(job.totalSourceCount) 項目")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+
+      if let error = job.errorMessage, !error.isEmpty {
+        Label(error, systemImage: "exclamationmark.triangle.fill")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .textSelection(.enabled)
+      }
+
+      HStack {
+        Text("試行回数: \(job.attemptCount)")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Spacer()
+        controls
+      }
+    }
+    .accessibilityElement(children: .combine)
+  }
+
+  @ViewBuilder
+  private var controls: some View {
+    switch job.state {
+    case .queued, .running:
+      Button("一時停止", action: pause)
+      Button("キャンセル", role: .destructive, action: cancel)
+    case .paused:
+      Button("再開", action: resume)
+      Button("キャンセル", role: .destructive, action: cancel)
+    case .failed:
+      Button("再試行", action: resume)
+      Button("削除", role: .destructive, action: remove)
+    case .completed, .cancelled:
+      Button("削除", role: .destructive, action: remove)
+    }
+  }
+
+  private var stateLabel: String {
+    switch job.state {
+    case .queued: "待機中"
+    case .running: "転送中"
+    case .paused: "一時停止"
+    case .completed: "完了"
+    case .failed: "失敗"
+    case .cancelled: "キャンセル済み"
+    }
+  }
+
+  private var stateColor: Color {
+    switch job.state {
+    case .running: .accentColor
+    case .failed: .red
+    case .completed: .green
+    case .paused, .queued, .cancelled: .secondary
+    }
+  }
+}
+
+private struct IntegrationSettingsView: View {
+  @ObservedObject var service: SystemIntegrationService
+  @ObservedObject var serverManager: ServerManager
+  let quickOpenChanged: () -> Void
+  @AppStorage("Nafi.globalQuickOpen") private var globalQuickOpen = true
+
+  var body: some View {
+    Form {
+      Section("常駐とショートカット") {
+        Toggle(
+          "ログイン時にバックグラウンドで起動",
+          isOn: Binding(
+            get: { service.launchesAtLogin },
+            set: { service.setLaunchAtLogin($0) }
+          )
+        )
+        Toggle("⌘⌥SpaceでQuick Open", isOn: $globalQuickOpen)
+          .onChange(of: globalQuickOpen) { _, _ in quickOpenChanged() }
+        LabeledContent("rclone") {
+          Text(service.rcloneVersion ?? "未検出").foregroundStyle(.secondary)
+        }
+      }
+
+      Section("シェル") {
+        Text("`nafi .`で開くほか、`--quick-open`、`--sync 名前`、`--sync-center`、`--drop-stack`、`--workspaces`を利用できます。~/.local/binには識別マーカー付きの標準openラッパーだけを設置し、既存の同名ファイルは上書きしません。")
+          .font(.caption).foregroundStyle(.secondary)
+        HStack {
+          if service.shellCommandInstalled {
+            Button("nafiコマンドを削除", role: .destructive) { service.uninstallShellCommand() }
+          } else {
+            Button("nafiコマンドを追加") { service.installShellCommand() }
+          }
+          Spacer()
+          Text(service.shellCommandInstalled ? "~/.local/bin/nafi" : "未導入")
+            .font(.caption).foregroundStyle(.secondary)
+        }
+      }
+
+      Section("File Provider") {
+        Text("有効にした接続をFinder、開く／保存パネル、他のmacOSアプリへ公開します。nafiのリモート通信は常駐rcloneを経由します。")
+          .font(.caption).foregroundStyle(.secondary)
+        if serverManager.profiles.isEmpty {
+          Text("先にリモート接続を追加してください。").foregroundStyle(.secondary)
+        } else {
+          ForEach(serverManager.profiles.filter { ![.nfs, .afp].contains($0.kind) }) { profile in
+            Toggle(
+              isOn: Binding(
+                get: { service.fileProviderProfileIDs.contains(profile.id) },
+                set: { service.setFileProviderEnabled($0, profile: profile) }
+              )
+            ) {
+              Label(profile.name, systemImage: profile.kind.systemImage)
+            }
+          }
+        }
+        LabeledContent("状態", value: service.fileProviderStatus)
+      }
+
+      Section("FSKit") {
+        LabeledContent("状態", value: service.fskitStatus)
+        Text("通常のクラウド／ネットワーク接続はFile Providerを標準経路にします。FSKitはmacOS 15.4以降向けの追加ボリューム公開として設計資料と能力ゲートを同梱していますが、現在の配布ターゲットでは有効化していません。未対応環境ではFile Providerだけを使用します。")
+          .font(.caption).foregroundStyle(.secondary)
+      }
+    }
+    .formStyle(.grouped)
+    .task { service.refresh() }
+    .alert(
+      "システム統合",
+      isPresented: Binding(
+        get: { service.errorMessage != nil },
+        set: { if !$0 { service.errorMessage = nil } }
+      )
+    ) { Button("OK", role: .cancel) {} } message: { Text(service.errorMessage ?? "") }
   }
 }
