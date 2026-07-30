@@ -2,9 +2,7 @@
 
 [日本語版](README.ja.md)
 
-nafi is a native multi-pane file manager for macOS 14 or later. It uses SwiftUI and AppKit, keeps browser tabs as real macOS window tabs, and presents local folders and supported remote locations through the same pane and file-operation model.
-
-This working tree is a `v0.9.0` development checkpoint. It includes a persistent rclone runtime, Sync Center, incremental sync, a File Provider extension, Drop Stack, Quick Open, named workspaces, login-item support, and shell integration. A complete macOS device build and an FSKit extension are not complete. See [`CHECKPOINT_AUDIT.md`](CHECKPOINT_AUDIT.md) for the exact validation boundary and remaining work.
+nafi is a native multi-pane file manager for macOS 14 or later. It uses SwiftUI and AppKit, keeps browser tabs as real macOS window tabs, and presents local folders and supported remote locations through the same pane and file-operation model. It includes a persistent rclone runtime, Sync Center, incremental sync, a File Provider extension, Drop Stack, Quick Open, named workspaces, login-item support, and shell integration.
 
 ## Requirements
 

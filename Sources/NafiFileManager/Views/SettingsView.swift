@@ -497,12 +497,6 @@ private struct IntegrationSettingsView: View {
         }
         LabeledContent("状態", value: service.fileProviderStatus)
       }
-
-      Section("FSKit") {
-        LabeledContent("状態", value: service.fskitStatus)
-        Text("通常のクラウド／ネットワーク接続はFile Providerを標準経路にします。FSKitはmacOS 15.4以降向けの追加ボリューム公開として設計資料と能力ゲートを同梱していますが、現在の配布ターゲットでは有効化していません。未対応環境ではFile Providerだけを使用します。")
-          .font(.caption).foregroundStyle(.secondary)
-      }
     }
     .formStyle(.grouped)
     .task { service.refresh() }

@@ -201,13 +201,6 @@ final class SystemIntegrationService: ObservableObject {
     }
   }
 
-  var fskitStatus: String {
-    guard #available(macOS 15.4, *) else { return "macOS 15.4以降が必要" }
-    return NSClassFromString("FSKit.FSFileSystemBase") == nil
-      ? "このSDKではネットワークボリューム公開を有効化できません"
-      : "対応SDKを検出（File Providerを標準経路として使用）"
-  }
-
   private func migrateLegacyFileProviderStoreIfNeeded() {
     guard !FileManager.default.fileExists(atPath: fileProviderStoreURL.path) else { return }
     let source = [legacyAppGroupStoreURL, legacyFileProviderStoreURL].first {
