@@ -7,7 +7,6 @@ actor RcloneRemoteSession: RemoteServerSession {
   private let sftpHostKeyAlgorithms: [String]
   private(set) var capabilities: RcloneRemoteCapabilities
   private var isClosed = false
-  private var didRefreshHostKeys = false
   private struct CachedDirectory {
     let loadedAt: Date
     let items: [RemoteFileItem]
@@ -35,7 +34,7 @@ actor RcloneRemoteSession: RemoteServerSession {
     secrets: RcloneProfileSecrets,
     runtime: RcloneRuntime = .shared
   ) async throws -> RcloneRemoteSession {
-    var sftpHostKeyAlgorithms: [String]
+    let sftpHostKeyAlgorithms: [String]
     if profile.kind == .sftp {
       sftpHostKeyAlgorithms = try await SSHHostKeyService.shared.prepareKnownHosts(
         host: profile.host,
@@ -43,7 +42,7 @@ actor RcloneRemoteSession: RemoteServerSession {
       )
       guard !sftpHostKeyAlgorithms.isEmpty else {
         throw RemoteServerError.invalidResponse(
-          "SSHホストキーを自動登録できませんでした。接続先のホスト名とポートを確認してください。"
+          "SSHホストキーが登録されていません。設定画面で指紋を確認して信頼してください。"
         )
       }
     } else {
@@ -52,37 +51,15 @@ actor RcloneRemoteSession: RemoteServerSession {
     var currentSecrets = secrets
     if let token = try await runtime.configure(
       profile: profile,
-      secrets: secrets,
+      secrets: currentSecrets,
       sftpHostKeyAlgorithms: sftpHostKeyAlgorithms
     ) {
-      currentSecrets = try secrets.replacingOAuthToken(token)
+      currentSecrets = try currentSecrets.replacingOAuthToken(token)
     }
-    let response: [String: JSONValue]
-    do {
-      response = try await runtime.call(
-        "operations/fsinfo",
-        parameters: ["fs": .string(RcloneConfiguration.fs(for: profile))]
-      )
-    } catch {
-      guard profile.kind == .sftp, Self.isUnknownHostKeyError(error) else { throw error }
-      let algorithms = try await SSHHostKeyService.shared.refreshKnownHosts(
-        host: profile.host,
-        port: profile.port
-      )
-      sftpHostKeyAlgorithms = algorithms
-      await runtime.invalidateConfiguration(profileID: profile.id)
-      if let token = try await runtime.configure(
-        profile: profile,
-        secrets: currentSecrets,
-        sftpHostKeyAlgorithms: algorithms
-      ) {
-        currentSecrets = try currentSecrets.replacingOAuthToken(token)
-      }
-      response = try await runtime.call(
-        "operations/fsinfo",
-        parameters: ["fs": .string(RcloneConfiguration.fs(for: profile))]
-      )
-    }
+    let response = try await runtime.call(
+      "operations/fsinfo",
+      parameters: ["fs": .string(RcloneConfiguration.fs(for: profile))]
+    )
     let session = RcloneRemoteSession(
       profile: profile,
       runtime: runtime,
@@ -94,12 +71,7 @@ actor RcloneRemoteSession: RemoteServerSession {
   }
 
   func listDirectory(at path: String) async throws -> [RemoteFileItem] {
-    do {
-      try await ensureReady()
-    } catch {
-      guard try await recoverFromUnknownHostKey(error) else { throw error }
-      try await ensureReady()
-    }
+    try await ensureReady()
     let cleanPath = try remoteArgument(path)
     let cacheKey = RemotePath.normalized(path)
     if let cached = directoryCache[cacheKey],
@@ -107,13 +79,7 @@ actor RcloneRemoteSession: RemoteServerSession {
     {
       return cached.items
     }
-    let response: [String: JSONValue]
-    do {
-      response = try await listDirectoryResponse(at: cleanPath)
-    } catch {
-      guard try await recoverFromUnknownHostKey(error) else { throw error }
-      response = try await listDirectoryResponse(at: cleanPath)
-    }
+    let response = try await listDirectoryResponse(at: cleanPath)
     guard let raw = response["list"] else { return [] }
     let data = try JSONEncoder().encode(raw)
     let entries = try JSONDecoder().decode([RcloneListEntry].self, from: data)
@@ -179,28 +145,17 @@ actor RcloneRemoteSession: RemoteServerSession {
     )
   }
 
-  private func recoverFromUnknownHostKey(_ error: Error) async throws -> Bool {
-    guard profile.kind == .sftp, !didRefreshHostKeys, Self.isUnknownHostKeyError(error) else {
-      return false
-    }
-    didRefreshHostKeys = true
-    let algorithms = try await SSHHostKeyService.shared.refreshKnownHosts(
-      host: profile.host,
-      port: profile.port
-    )
-    await runtime.invalidateConfiguration(profileID: profile.id)
-    _ = try await runtime.configure(
-      profile: profile,
-      secrets: secrets,
-      sftpHostKeyAlgorithms: algorithms
-    )
-    return true
+  func prepareForTransfer() async throws {
+    try await ensureReady()
   }
 
-  static func isUnknownHostKeyError(_ error: Error) -> Bool {
-    let message = error.localizedDescription.lowercased()
-    return message.contains("knownhosts")
-      && (message.contains("key is unknown") || message.contains("key mismatch"))
+  static func isHostKeyRelatedErrorMessage(_ rawMessage: String) -> Bool {
+    let message = rawMessage.lowercased()
+    return message.contains("knownhosts: key is unknown")
+      || message.contains("knownhosts: key mismatch")
+      || message.contains("knownhosts: key is revoked")
+      || message.contains("couldn't parse known_hosts_file")
+      || message.contains("sshホストキーが登録されていません")
   }
 
   func statItem(at path: String) async throws -> RemoteFileItem? {

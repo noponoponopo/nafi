@@ -390,6 +390,44 @@ struct RcloneTransferEngine: TransferEngine {
   ) async throws -> TransferEngineResult {
     let sourceEndpoint = try await TransferEndpoint.resolve(source)
     let destinationEndpoint = try await TransferEndpoint.resolve(destination)
+    try await prepareRemoteSessions(
+      sourceEndpoint: sourceEndpoint,
+      destinationEndpoint: destinationEndpoint
+    )
+    return try await executeOnce(
+      method: method,
+      source: source,
+      destination: destination,
+      isDirectory: isDirectory,
+      sourceEndpoint: sourceEndpoint,
+      destinationEndpoint: destinationEndpoint,
+      progress: progress
+    )
+  }
+
+  private func prepareRemoteSessions(
+    sourceEndpoint: TransferEndpoint,
+    destinationEndpoint: TransferEndpoint
+  ) async throws {
+    var profileIDs = Set<UUID>()
+    for endpoint in [sourceEndpoint, destinationEndpoint] {
+      guard let profileID = endpoint.profileID, profileIDs.insert(profileID).inserted else { continue }
+      let session = try await RemoteFileSystemRegistry.shared.session(for: profileID)
+      if let session = session as? RcloneRemoteSession {
+        try await session.prepareForTransfer()
+      }
+    }
+  }
+
+  private func executeOnce(
+    method: String,
+    source: URL,
+    destination: URL,
+    isDirectory: Bool,
+    sourceEndpoint: TransferEndpoint,
+    destinationEndpoint: TransferEndpoint,
+    progress: @escaping @Sendable (TransferEngineProgress) -> Void
+  ) async throws -> TransferEngineResult {
     let group = "nafi-transfer-\(UUID().uuidString)"
     var parameters: [String: JSONValue]
     if isDirectory {

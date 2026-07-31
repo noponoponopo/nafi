@@ -17,19 +17,30 @@ final class RobustnessTests: XCTestCase {
     XCTAssertEqual(try SSHHostKeyService.validatedUsername("nafi-user"), "nafi-user")
   }
 
-  func testUnknownSFTPHostKeyErrorIsEligibleForAutomaticRecovery() {
+  func testOnlyExplicitKnownHostsErrorsAreClassified() {
     XCTAssertTrue(
-      RcloneRemoteSession.isUnknownHostKeyError(
-        RcloneRuntimeError.invalidResponse(
-          "NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key is unknown"
-        )
+      RcloneRemoteSession.isHostKeyRelatedErrorMessage(
+        "NewFs: couldn't connect SSH: ssh: handshake failed: knownhosts: key is unknown"
       )
+    )
+    XCTAssertTrue(
+      RcloneRemoteSession.isHostKeyRelatedErrorMessage("knownhosts: key mismatch")
     )
     XCTAssertFalse(
-      RcloneRemoteSession.isUnknownHostKeyError(
-        RcloneRuntimeError.invalidResponse("rclone connection failed")
-      )
+      RcloneRemoteSession.isHostKeyRelatedErrorMessage("host key verification failed")
     )
+    XCTAssertFalse(
+      RcloneRemoteSession.isHostKeyRelatedErrorMessage("rclone connection failed")
+    )
+  }
+
+  func testHostKeyRelatedMessagesRequireExactKnownHostsErrors() {
+    XCTAssertTrue(RcloneRemoteSession.isHostKeyRelatedErrorMessage("knownhosts: key mismatch"))
+    XCTAssertTrue(RcloneRemoteSession.isHostKeyRelatedErrorMessage("couldn't parse known_hosts_file"))
+    XCTAssertTrue(RcloneRemoteSession.isHostKeyRelatedErrorMessage("SSHホストキーが登録されていません。"))
+    XCTAssertFalse(RcloneRemoteSession.isHostKeyRelatedErrorMessage("SSHホストキーを取得できませんでした。"))
+    XCTAssertFalse(RcloneRemoteSession.isHostKeyRelatedErrorMessage("host key verification failed"))
+    XCTAssertFalse(RcloneRemoteSession.isHostKeyRelatedErrorMessage("temporary network failure"))
   }
 
   func testOpenSSHKnownHostIdentityParsingIgnoresCommentsAndMalformedKeys() {
@@ -49,6 +60,28 @@ final class RobustnessTests: XCTestCase {
 
     XCTAssertEqual(identities.count, 1)
     XCTAssertTrue(identities.first?.hasPrefix("ssh-ed25519 SHA256:") == true)
+  }
+
+  func testHostKeyApprovalDistinguishesNewAndChangedKeys() {
+    let old = Set(["ssh-ed25519 SHA256:old"])
+    XCTAssertTrue(
+      SSHHostKeyApprovalRequest.isKeyChange(
+        existingIdentities: old,
+        scannedIdentities: ["ssh-ed25519 SHA256:new"]
+      )
+    )
+    XCTAssertFalse(
+      SSHHostKeyApprovalRequest.isKeyChange(
+        existingIdentities: old,
+        scannedIdentities: ["ssh-ed25519 SHA256:old"]
+      )
+    )
+    XCTAssertFalse(
+      SSHHostKeyApprovalRequest.isKeyChange(
+        existingIdentities: [],
+        scannedIdentities: ["ssh-ed25519 SHA256:new"]
+      )
+    )
   }
 
   func testArchiveEntryValidationRejectsTraversalAndAbsolutePaths() {

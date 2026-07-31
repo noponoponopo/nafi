@@ -97,16 +97,71 @@ private struct RootViewContent: View {
       )
     }
     .alert(
-      "nafi",
+      activeAlertTitle,
       isPresented: Binding(
-        get: { appState.presentationErrorMessage != nil },
-        set: { if !$0 { appState.presentationErrorMessage = nil } }
+        get: { hasActiveAlert },
+        set: { if !$0 { dismissActiveAlert() } }
       )
     ) {
-      Button("OK", role: .cancel) { appState.presentationErrorMessage = nil }
+      if serverManager.hostKeyApprovalRequest != nil {
+        Button("信頼して接続") {
+          guard let request = serverManager.hostKeyApprovalRequest else { return }
+          Task { await serverManager.approveHostKey(request) }
+        }
+        Button("キャンセル", role: .cancel) {
+          serverManager.dismissHostKeyApproval()
+        }
+      } else {
+        Button("OK", role: .cancel) { dismissActiveAlert() }
+      }
     } message: {
-      Text(appState.presentationErrorMessage ?? "")
+      if serverManager.hostKeyApprovalRequest != nil {
+        Text(hostKeyApprovalMessage)
+      } else if let message = serverManager.errorMessage {
+        Text(message)
+      } else {
+        Text(appState.presentationErrorMessage ?? "")
+      }
     }
+  }
+
+  private var hasActiveAlert: Bool {
+    appState.presentationErrorMessage != nil
+      || serverManager.hostKeyApprovalRequest != nil
+      || serverManager.errorMessage != nil
+  }
+
+  private var activeAlertTitle: String {
+    if serverManager.hostKeyApprovalRequest != nil { return "SSHホストキーを確認" }
+    if serverManager.errorMessage != nil { return "操作を完了できません" }
+    return "nafi"
+  }
+
+  private func dismissActiveAlert() {
+    if serverManager.hostKeyApprovalRequest != nil {
+      serverManager.dismissHostKeyApproval()
+    } else if serverManager.errorMessage != nil {
+      serverManager.errorMessage = nil
+    } else {
+      appState.presentationErrorMessage = nil
+    }
+  }
+
+  private var hostKeyApprovalMessage: String {
+    guard let request = serverManager.hostKeyApprovalRequest else { return "" }
+    let endpoint = request.scan.port == 22
+      ? request.scan.host
+      : "[\(request.scan.host)]:\(request.scan.port)"
+    let heading = request.isKeyChange
+      ? "登録済みのホストキーと異なります。接続先が正しい場合だけ更新してください。"
+      : "このサーバーはまだ登録されていません。指紋を確認してから接続してください。"
+    let newKeys = request.scan.keys
+      .map { "\($0.algorithm): \($0.fingerprint)" }
+      .joined(separator: "\n")
+    let oldKeys = request.existingIdentities.isEmpty
+      ? ""
+      : "\n\n登録済みの指紋:\n" + request.existingIdentities.joined(separator: "\n")
+    return "\(request.profileName)\n\(endpoint)\n\n\(heading)\n\n取得した指紋:\n\(newKeys)\(oldKeys)"
   }
 
   @ToolbarContentBuilder

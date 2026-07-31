@@ -287,9 +287,13 @@ struct ServerSidebarRow: View {
     Task {
       if let url = await manager.activate(profile) {
         appState.activeModel.navigate(to: url)
-      } else if case .failed(let message) = manager.state(for: profile) {
+      } else if manager.hostKeyApprovalRequest == nil,
+        case .failed(let message) = manager.state(for: profile)
+      {
         appState.presentationErrorMessage = message
-      } else if case .helperRequired(let message) = manager.state(for: profile) {
+      } else if manager.hostKeyApprovalRequest == nil,
+        case .helperRequired(let message) = manager.state(for: profile)
+      {
         appState.presentationErrorMessage = message
       }
     }

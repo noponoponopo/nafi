@@ -15,6 +15,7 @@ final class ServerManager: ObservableObject {
   @Published private(set) var states: [UUID: ServerConnectionState] = [:]
   @Published private(set) var mountedVolumes: [MountedVolume] = []
   @Published var errorMessage: String?
+  @Published private(set) var hostKeyApprovalRequest: SSHHostKeyApprovalRequest?
 
   private let keychain = KeychainStore()
   private let persistenceURL: URL
@@ -54,6 +55,27 @@ final class ServerManager: ObservableObject {
 
   func state(for profile: ServerProfile) -> ServerConnectionState {
     states[profile.id] ?? .idle
+  }
+
+  func dismissHostKeyApproval() {
+    hostKeyApprovalRequest = nil
+  }
+
+  func approveHostKey(_ request: SSHHostKeyApprovalRequest) async {
+    guard hostKeyApprovalRequest == nil || hostKeyApprovalRequest?.id == request.id else { return }
+    hostKeyApprovalRequest = nil
+    do {
+      try await SSHHostKeyService.shared.trust(request.scan)
+    } catch {
+      states[request.profileID] = .failed(error.localizedDescription)
+      errorMessage = error.localizedDescription
+      return
+    }
+    guard let profile = profiles.first(where: { $0.id == request.profileID }) else {
+      errorMessage = "接続プロファイルが削除されています。"
+      return
+    }
+    await connect(profile)
   }
 
   func destinationURL(for profile: ServerProfile) -> URL? {
@@ -409,6 +431,10 @@ final class ServerManager: ObservableObject {
         switch state(for: profile) {
         case .connected, .helperRequired:
           break
+        case .failed(let message) where RcloneRemoteSession.isHostKeyRelatedErrorMessage(message):
+          // Host-key failures require explicit fingerprint confirmation in the
+          // editor. Retrying cannot make an untrusted key trusted.
+          break
         case .idle, .connecting, .failed:
           if attempt < 2 {
             let delay = UInt64(1 << attempt) * 1_000_000_000
@@ -613,7 +639,36 @@ final class ServerManager: ObservableObject {
         "rcloneが見つかりません。nafiに同梱するか、Homebrewでインストールしてください。"
       )
     } catch {
+      if profile.kind == .sftp,
+        RcloneRemoteSession.isHostKeyRelatedErrorMessage(error.localizedDescription)
+      {
+        do {
+          try await presentHostKeyApproval(for: profile)
+        } catch {
+          states[profile.id] = .failed(error.localizedDescription)
+          return
+        }
+      }
       states[profile.id] = .failed(error.localizedDescription)
+    }
+  }
+
+  private func presentHostKeyApproval(for profile: ServerProfile) async throws {
+    let existing = try await SSHHostKeyService.shared.trustedHostKeyIdentities(
+      host: profile.host,
+      port: profile.port
+    )
+    let scan = try await SSHHostKeyService.shared.scan(host: profile.host, port: profile.port)
+    guard profiles.contains(where: { $0.id == profile.id }) else {
+      throw RemoteServerError.invalidResponse("接続プロファイルが削除されています。")
+    }
+    if hostKeyApprovalRequest == nil || hostKeyApprovalRequest?.profileID == profile.id {
+      hostKeyApprovalRequest = SSHHostKeyApprovalRequest(
+        profileID: profile.id,
+        profileName: profile.name,
+        scan: scan,
+        existingIdentities: existing
+      )
     }
   }
 

@@ -60,13 +60,14 @@ RootView
 
 `PaneTreeView` renders the recursive `PaneLayoutNode`. A leaf uses `PaneHostView`; a split uses the native horizontal or vertical split view. `FileFolderDropModifier`, `FileSelectionSurface`, and sidebar reorder modifiers are interaction boundaries shared by the relevant leaf views.
 
-`RootViewContent` also owns the shared toolbar, sidebar customization sheet, Quick Edit sheet, inspector presentation callback, and application-level presentation errors. The toolbar sends commands to the active `WorkspaceModel` or active `FilePaneModel`; it does not perform storage operations itself.
+`RootViewContent` also owns the shared toolbar, sidebar customization sheet, Quick Edit sheet, inspector presentation callback, application-level presentation errors, and the SFTP host-key approval alert. The toolbar sends commands to the active `WorkspaceModel` or active `FilePaneModel`; it does not perform storage operations itself.
 
 ## State ownership
 
 ```text
 AppState
 ├─ ServerManager
+│  └─ pending SFTP host-key approval → RootViewContent alert
 ├─ SidebarModel
 ├─ DefaultFileManagerService
 ├─ CloudStorageService
