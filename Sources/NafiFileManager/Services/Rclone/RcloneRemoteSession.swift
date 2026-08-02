@@ -456,6 +456,7 @@ actor RcloneRemoteSession: RemoteServerSession {
       parameters: payload,
       timeout: 90
     )
+    var pollDelay: UInt64 = 200_000_000
     do {
       while true {
         try Task.checkCancellation()
@@ -474,7 +475,10 @@ actor RcloneRemoteSession: RemoteServerSession {
           }
           return
         }
-        try await Task.sleep(nanoseconds: 250_000_000)
+        // Poll aggressively for short metadata operations, then back off to
+        // avoid burning CPU on long-running remote jobs.
+        try await Task.sleep(nanoseconds: pollDelay)
+        pollDelay = min(5_000_000_000, pollDelay * 2)
       }
     } catch {
       await Task.detached(priority: .utility) {

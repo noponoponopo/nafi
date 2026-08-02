@@ -24,6 +24,7 @@ final class ServerManager: ObservableObject {
   private var keyPassphraseCache: [UUID: String] = [:]
   private var sessionTokenCache: [UUID: String] = [:]
   private var connectionTasks: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
+  private var fileProviderConfigurationTasks: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
 
   init() {
     persistenceURL = AppStoragePaths.file(named: "servers.json")
@@ -447,31 +448,51 @@ final class ServerManager: ObservableObject {
     }
   }
 
-  func configureFileProviderProfiles(_ enabledIDs: Set<UUID>) async {
-    for profile in profiles where enabledIDs.contains(profile.id) {
-      guard states[profile.id] != .connected(nil) else { continue }
-      do {
-        let secrets = RcloneProfileSecrets(
-          password: password(for: profile),
-          keyPassphrase: keyPassphrase(for: profile),
-          sessionToken: sessionToken(for: profile)
-        )
-        let sftpHostKeyAlgorithms: [String]
-        if profile.kind == .sftp {
-          sftpHostKeyAlgorithms = (try? await SSHHostKeyService.shared.prepareKnownHosts(
-            host: profile.host, port: profile.port
-          )) ?? []
-        } else {
-          sftpHostKeyAlgorithms = []
-        }
-        _ = try await RcloneRuntime.shared.configure(
-          profile: profile,
-          secrets: secrets,
-          sftpHostKeyAlgorithms: sftpHostKeyAlgorithms
-        )
-      } catch {
-        states[profile.id] = .failed(error.localizedDescription)
+  func configureFileProviderProfile(_ profileID: UUID) async {
+    if let existing = fileProviderConfigurationTasks[profileID] {
+      await existing.task.value
+      return
+    }
+    let token = UUID()
+    let task = Task<Void, Never> { @MainActor [weak self] in
+      if let self {
+        await self.performFileProviderConfiguration(profileID)
       }
+    }
+    fileProviderConfigurationTasks[profileID] = (token, task)
+    await task.value
+    if fileProviderConfigurationTasks[profileID]?.token == token {
+      fileProviderConfigurationTasks[profileID] = nil
+    }
+  }
+
+  private func performFileProviderConfiguration(_ profileID: UUID) async {
+    guard let profile = profiles.first(where: { $0.id == profileID }) else { return }
+    do {
+      let secrets = RcloneProfileSecrets(
+        password: password(for: profile),
+        keyPassphrase: keyPassphrase(for: profile),
+        sessionToken: sessionToken(for: profile)
+      )
+      let sftpHostKeyAlgorithms: [String]
+      if profile.kind == .sftp {
+        sftpHostKeyAlgorithms = (try? await SSHHostKeyService.shared.prepareKnownHosts(
+          host: profile.host, port: profile.port
+        )) ?? []
+      } else {
+        sftpHostKeyAlgorithms = []
+      }
+      _ = try await RcloneRuntime.shared.configure(
+        profile: profile,
+        secrets: secrets,
+        sftpHostKeyAlgorithms: sftpHostKeyAlgorithms
+      )
+      await RcloneRuntime.shared.markFileProviderReady(
+        profileID: profile.id,
+        configurationRevision: profile.configurationRevision
+      )
+    } catch {
+      states[profile.id] = .failed(error.localizedDescription)
     }
   }
 

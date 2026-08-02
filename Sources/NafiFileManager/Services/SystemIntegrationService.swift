@@ -14,7 +14,6 @@ final class SystemIntegrationService: ObservableObject {
   @Published private(set) var rcloneVersion: String?
   @Published private(set) var fileProviderProfileIDs = Set<UUID>()
   private var fileProviderRecords: [UUID: FileProviderDomainRecord] = [:]
-  private var fileProviderPollingTask: Task<Void, Never>?
   @Published private(set) var fileProviderStatus = "未構成"
   @Published var errorMessage: String?
 
@@ -30,10 +29,7 @@ final class SystemIntegrationService: ObservableObject {
     refresh()
     migrateLegacyFileProviderStoreIfNeeded()
     loadFileProviderProfiles()
-    startFileProviderPolling()
   }
-
-  deinit { fileProviderPollingTask?.cancel() }
 
   func refresh() {
     #if canImport(ServiceManagement)
@@ -42,12 +38,31 @@ final class SystemIntegrationService: ObservableObject {
     }
     #endif
     shellCommandInstalled = shellCommandIsManaged
-    Task {
+  }
+
+  func refreshRcloneVersion() {
+    Task(priority: .utility) { [weak self] in
+      guard let binary = await RcloneRuntime.shared.binaryURL() else {
+        await MainActor.run { self?.rcloneVersion = nil }
+        return
+      }
       do {
-        let version = try await RcloneRuntime.shared.version()
-        await MainActor.run { self.rcloneVersion = version }
+        let result = try await BoundedProcessRunner.run(
+          executableURL: binary,
+          arguments: ["version"],
+          timeout: 8,
+          maximumStandardOutputBytes: 64 * 1_024,
+          maximumStandardErrorBytes: 64 * 1_024
+        )
+        guard result.terminationStatus == 0 else {
+          await MainActor.run { self?.rcloneVersion = nil }
+          return
+        }
+        let text = String(data: result.stdout, encoding: .utf8) ?? ""
+        let version = text.split(whereSeparator: \.isNewline).first.map(String.init)
+        await MainActor.run { self?.rcloneVersion = version }
       } catch {
-        await MainActor.run { self.rcloneVersion = nil }
+        await MainActor.run { self?.rcloneVersion = nil }
       }
     }
   }
@@ -171,6 +186,25 @@ final class SystemIntegrationService: ObservableObject {
     let prefix = (try? handle.read(upToCount: 512)) ?? nil
     guard let prefix, let text = String(data: prefix, encoding: .utf8) else { return false }
     return text.contains(shellMarker)
+  }
+
+  func refreshFileProvider(profileID: UUID) {
+    guard fileProviderProfileIDs.contains(profileID) else { return }
+    fileProviderStatus = "更新を要求中…"
+    Task {
+      do {
+        try await FileProviderChangeNotifier.refreshNow(profileID: profileID)
+        await MainActor.run {
+          self.fileProviderStatus = "\(self.fileProviderProfileIDs.count)接続を公開・更新要求済み"
+        }
+      } catch {
+        await MainActor.run {
+          self.fileProviderStatus = self.fileProviderProfileIDs.isEmpty
+            ? "未構成" : "\(self.fileProviderProfileIDs.count)接続を公開"
+          self.errorMessage = "File Providerへ最新状態の確認を要求できませんでした。\n\(error.localizedDescription)"
+        }
+      }
+    }
   }
 
   func setFileProviderEnabled(_ enabled: Bool, profile: ServerProfile) {
@@ -323,21 +357,9 @@ final class SystemIntegrationService: ObservableObject {
     )
   }
 
-  private func startFileProviderPolling() {
-    guard fileProviderPollingTask == nil else { return }
-    fileProviderPollingTask = Task { [weak self] in
-      try? await Task.sleep(nanoseconds: 10 * 1_000_000_000)
-      while !Task.isCancelled {
-        guard let self else { return }
-        let ids = await MainActor.run { Array(self.fileProviderProfileIDs) }
-        for id in ids {
-          guard !Task.isCancelled else { return }
-          await FileProviderChangeNotifier.signal(profileID: id)
-        }
-        try? await Task.sleep(nanoseconds: 5 * 60 * 1_000_000_000)
-      }
-    }
-  }
+  // No clock-driven File Provider polling. Nafi-originated mutations signal the
+  // affected domain immediately, while remote-only changes are picked up the next
+  // time macOS enumerates that directory. This removes a permanent wake source.
 
   private func domainIdentifier(_ profile: ServerProfile) -> String {
     "app.nafi.filemanager.remote.\(profile.id.uuidString.lowercased())"

@@ -9,6 +9,15 @@ struct FPRuntimeDescriptor: Codable {
   let generation: UUID
   let processIdentifier: Int32
   let expiresAt: Date
+  let fileProviderReadyProfiles: [String: String]?
+
+  func isReady(for record: FPDomainRecord) -> Bool {
+    guard let ready = fileProviderReadyProfiles else { return false }
+    let key = record.id.uuidString.lowercased()
+    guard let revision = ready[key] else { return false }
+    let expected = record.configurationRevision?.uuidString.lowercased() ?? ""
+    return revision == expected
+  }
 }
 
 struct FPDomainRecord: Codable {

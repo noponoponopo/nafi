@@ -8,6 +8,7 @@ final class NafiFileProviderItem: NSObject, NSFileProviderItem {
   let filename: String
   let contentType: UTType
   let capabilities: NSFileProviderItemCapabilities
+  let contentPolicy: NSFileProviderContentPolicy = .downloadLazily
   let documentSize: NSNumber?
   let contentModificationDate: Date?
   let creationDate: Date?

@@ -68,6 +68,14 @@ actor TransferQueue {
   private static let retainedTerminalJobCount = 300
 
   private let persistenceURL = AppStoragePaths.file(named: "transfers.json")
+  private let persistenceEncoder: JSONEncoder = {
+    let encoder = JSONEncoder()
+    // Compact JSON materially reduces encode time, bytes copied and atomic-write
+    // I/O for queues that can contain thousands of jobs. Human-readable output
+    // is not needed for an application-owned recovery journal.
+    encoder.dateEncodingStrategy = .iso8601
+    return encoder
+  }()
   private var jobs: [Job] = []
   private var loaded = false
   private var workerTask: Task<Void, Never>?
@@ -75,6 +83,7 @@ actor TransferQueue {
   private var activeJobID: UUID?
   private var waiters: [UUID: [CheckedContinuation<[URL], Error>]] = [:]
   private var persistenceErrorMessage: String?
+  private var changeNotificationTask: Task<Void, Never>?
 
   func start() {
     loadIfNeeded()
@@ -334,12 +343,12 @@ actor TransferQueue {
           finishJob(at: currentIndex)
         } else {
           jobs[currentIndex].state = .queued
-          do {
-            try persistRecordingFailure()
-          } catch {
-            failForPersistence(jobID: jobID, underlying: error, afterCompletedTransfer: true)
-            continue
-          }
+          // Do not write an intermediate queued snapshot here. The next loop
+          // iteration persists the updated completedSourceCount together with
+          // the running state *before* starting the next source. If the process
+          // dies in this tiny gap, the previously persisted running state is
+          // intentionally recovered as paused, so duplicate/move safety is
+          // preserved while eliminating one full atomic queue write per source.
           postChange()
         }
       } catch is CancellationError {
@@ -501,10 +510,7 @@ actor TransferQueue {
     guard jobs.count <= Self.maximumJobCount else {
       throw TransferQueueError.persistence("転送キューの件数が安全上の上限を超えています。")
     }
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-    encoder.dateEncodingStrategy = .iso8601
-    let data = try encoder.encode(PersistedQueue(version: 1, jobs: jobs))
+    let data = try persistenceEncoder.encode(PersistedQueue(version: 1, jobs: jobs))
     guard data.count <= Self.maximumPersistenceBytes else {
       throw TransferQueueError.persistence("転送キューの保存サイズが安全上の上限を超えています。")
     }
@@ -600,12 +606,20 @@ actor TransferQueue {
   }
 
   private func postChange() {
-    if Thread.isMainThread {
+    // A directory containing many tiny files can complete jobs faster than the
+    // UI can meaningfully redraw. Coalesce bursts to one main-thread update.
+    guard changeNotificationTask == nil else { return }
+    changeNotificationTask = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: 80_000_000)
+      guard !Task.isCancelled else { return }
+      await self?.flushChangeNotification()
+    }
+  }
+
+  private func flushChangeNotification() {
+    changeNotificationTask = nil
+    DispatchQueue.main.async {
       NotificationCenter.default.post(name: .nafiTransferQueueDidChange, object: nil)
-    } else {
-      DispatchQueue.main.async {
-        NotificationCenter.default.post(name: .nafiTransferQueueDidChange, object: nil)
-      }
     }
   }
 }

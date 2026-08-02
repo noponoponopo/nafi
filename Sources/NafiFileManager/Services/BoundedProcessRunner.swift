@@ -252,7 +252,7 @@ enum BoundedProcessRunner {
         failure = .outputLimitExceeded
         break
       }
-      Thread.sleep(forTimeInterval: 0.05)
+      Thread.sleep(forTimeInterval: 0.20)
     }
 
     if failure != nil { terminate(process) }
@@ -277,7 +277,7 @@ enum BoundedProcessRunner {
     process.terminate()
     let graceDeadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
     while process.isRunning, DispatchTime.now().uptimeNanoseconds < graceDeadline {
-      Thread.sleep(forTimeInterval: 0.02)
+      Thread.sleep(forTimeInterval: 0.10)
     }
     if process.isRunning {
       kill(process.processIdentifier, SIGKILL)

@@ -14,6 +14,27 @@ struct QuickOpenResult: Identifiable, Hashable, Sendable {
   let action: Action
   let kind: Kind
   let systemImage: String
+  let normalizedSearchText: String
+
+  init(
+    id: String,
+    title: String,
+    subtitle: String,
+    action: Action,
+    kind: Kind,
+    systemImage: String
+  ) {
+    self.id = id
+    self.title = title
+    self.subtitle = subtitle
+    self.action = action
+    self.kind = kind
+    self.systemImage = systemImage
+    normalizedSearchText = (title + " " + subtitle).folding(
+      options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+      locale: .current
+    )
+  }
 
   var url: URL? {
     guard case .open(let value) = action else { return nil }
@@ -99,9 +120,7 @@ final class QuickOpenModel: ObservableObject {
     }
     let folded = query.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
     let matchingBase = baseResults.filter {
-      ($0.title + " " + $0.subtitle)
-        .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
-        .contains(folded)
+      $0.normalizedSearchText.contains(folded)
     }
     isSearching = true
     let spotlight = await SpotlightSearchService.search(nameContaining: query, limit: 250)

@@ -150,9 +150,9 @@ OAuth providers may rotate refresh tokens while rclone serves either the app or 
 Other macOS app / Finder
 └─ NafiFileProvider
    ├─ extension container → domain records / current rclone RC descriptor
-   ├─ working set / folder enumeration → parent operations/list + exact item selection
-   └─ fetchContents → parent-rooted sync/copy + exact rooted filename filter
+   ├─ folder enumeration → operations/list; point lookup/version check → operations/stat
+   └─ fetchContents → operations/copyfile; read-only Box fallback → exact-filtered sync/copy
       └─ private local transfer directory → macOS File Provider materialization
 ```
 
-The containing app is not sandboxed and publishes records and the expiring RC descriptor directly into the File Provider extension container. The extension needs only its own sandbox container and loopback network access, so local builds do not depend on a provisioned App Group. Existing App Group records are migrated once. A new domain's macOS working-set request is rooted at the remote root before normal folder enumeration begins. File fetches use the same parent-listing strategy for every rclone backend; this avoids Box upload-preflight metadata calls and prevents recursive traversal outside the selected item's parent.
+The containing app is not sandboxed and publishes records and the expiring RC descriptor directly into the File Provider extension container. The extension needs only its own sandbox container and loopback network access, so local builds do not depend on a provisioned App Group. Existing App Group records are migrated once. A new domain's macOS working-set request is rooted at the remote root before normal folder enumeration begins. Point lookups and version checks use operations/stat so a save/delete does not enumerate a large parent directory. File fetches use operations/copyfile for a single object and retain the parent-rooted exact-filter fallback only for the known read-only Box metadata failure. Manual refresh signals the root and working set without enabling periodic polling.

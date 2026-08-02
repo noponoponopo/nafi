@@ -460,6 +460,7 @@ struct RcloneTransferEngine: TransferEngine {
 
     do {
       var lastStats = RcloneTransferStats()
+      var pollDelayNanoseconds: UInt64 = 750_000_000
       while true {
         try Task.checkCancellation()
         if let stats = try? await readStats(group: group) { lastStats = stats }
@@ -513,7 +514,11 @@ struct RcloneTransferEngine: TransferEngine {
             errorCount: final.errors
           )
         }
-        try await Task.sleep(nanoseconds: 350_000_000)
+        // Front-load feedback for short operations, then back off. Long transfers
+        // do not need two loopback HTTP requests every second just to repaint a
+        // progress label. This converges to one sample every four seconds.
+        try await Task.sleep(nanoseconds: pollDelayNanoseconds)
+        pollDelayNanoseconds = min(4_000_000_000, pollDelayNanoseconds * 2)
       }
     } catch {
       await Self.stopJobNoncancellable(job)

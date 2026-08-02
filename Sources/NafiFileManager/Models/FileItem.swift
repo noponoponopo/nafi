@@ -2,7 +2,33 @@ import AppKit
 import Foundation
 import UniformTypeIdentifiers
 
+private final class FileItemKindCache: @unchecked Sendable {
+  private let cache: NSCache<NSString, NSString> = {
+    let cache = NSCache<NSString, NSString>()
+    cache.countLimit = 256
+    return cache
+  }()
+
+  func label(for identifier: String) -> String {
+    let key = identifier as NSString
+    if let cached = cache.object(forKey: key) { return cached as String }
+    let label: String
+    if let type = UTType(identifier) {
+      label = type.localizedDescription ?? type.identifier
+    } else {
+      label = "ファイル"
+    }
+    cache.setObject(label as NSString, forKey: key)
+    return label
+  }
+}
+
 struct FileItem: Identifiable, Hashable, Sendable {
+  private static let japaneseLocale = Locale(identifier: "ja_JP")
+  private static let modifiedDateStyle = Date.FormatStyle(date: .abbreviated, time: .shortened)
+    .locale(japaneseLocale)
+  private static let kindCache = FileItemKindCache()
+
   let url: URL
   let name: String
   let isDirectory: Bool
@@ -49,10 +75,8 @@ struct FileItem: Identifiable, Hashable, Sendable {
     let kind: String
     if isDirectory {
       kind = isPackage ? "パッケージ" : "フォルダ"
-    } else if let identifier = contentTypeIdentifier,
-      let type = UTType(identifier)
-    {
-      kind = type.localizedDescription ?? type.identifier
+    } else if let identifier = contentTypeIdentifier {
+      kind = Self.kindCache.label(for: identifier)
     } else {
       kind = "ファイル"
     }
@@ -65,21 +89,18 @@ struct FileItem: Identifiable, Hashable, Sendable {
     }
 
     if let modificationDate {
-      modifiedLabel = modificationDate.formatted(
-        Date.FormatStyle(date: .abbreviated, time: .shortened)
-          .locale(Locale(identifier: "ja_JP"))
-      )
+      modifiedLabel = modificationDate.formatted(Self.modifiedDateStyle)
     } else {
       modifiedLabel = "—"
     }
 
     normalizedName = name.folding(
       options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
-      locale: Locale(identifier: "ja_JP")
+      locale: Self.japaneseLocale
     )
     normalizedKind = kind.folding(
       options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
-      locale: Locale(identifier: "ja_JP")
+      locale: Self.japaneseLocale
     )
   }
 

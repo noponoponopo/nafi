@@ -38,7 +38,9 @@ private final class RcloneLogBuffer: @unchecked Sendable {
     guard !incoming.isEmpty else { return }
     lock.lock()
     data.append(incoming)
-    if data.count > maximumBytes { data.removeFirst(data.count - maximumBytes) }
+    // Amortize the memmove performed by Data.removeFirst. rclone can emit many
+    // small log chunks; trimming on every chunk needlessly burns CPU.
+    if data.count > maximumBytes * 2 { data.removeFirst(data.count - maximumBytes) }
     lock.unlock()
   }
 
@@ -105,7 +107,10 @@ actor RcloneRuntime {
   private var startTask: Task<State, Error>?
   private var descriptorHeartbeat: Task<Void, Never>?
   private var oauthTokenMonitorTask: Task<Void, Never>?
+  private var idleShutdownTask: Task<Void, Never>?
+  private var activityGeneration: UInt64 = 0
   private var configuredProfiles: [UUID: Int] = [:]
+  private var fileProviderReadyProfiles: [UUID: String] = [:]
   private var oauthProfileIDs = Set<UUID>()
   private var persistedOAuthTokens: [UUID: String] = [:]
   private var oauthTokenUpdateHandler: OAuthTokenUpdateHandler?
@@ -204,7 +209,10 @@ actor RcloneRuntime {
     descriptorHeartbeat = nil
     oauthTokenMonitorTask?.cancel()
     oauthTokenMonitorTask = nil
+    idleShutdownTask?.cancel()
+    idleShutdownTask = nil
     configuredProfiles.removeAll()
+    fileProviderReadyProfiles.removeAll()
     oauthProfileIDs.removeAll()
     persistedOAuthTokens.removeAll()
     guard let current = state else { return }
@@ -242,7 +250,6 @@ actor RcloneRuntime {
       else {
         throw RcloneRuntimeError.remoteConfiguration("NFS/AFPのマウント先が見つかりません: \(path)")
       }
-      _ = try await call("operations/fsinfo", parameters: ["fs": .string(path)], timeout: 45)
       configuredProfiles[profile.id] = signature
       return nil
     }
@@ -277,6 +284,7 @@ actor RcloneRuntime {
     } else {
       oauthProfileIDs.remove(profile.id)
       persistedOAuthTokens[profile.id] = nil
+      stopOAuthTokenMonitorIfIdle()
     }
     let remoteName = RcloneConfiguration.remoteName(for: profile.id)
     let payload: [String: JSONValue] = [
@@ -300,18 +308,32 @@ actor RcloneRuntime {
       throw RcloneRuntimeError.remoteConfiguration(error.localizedDescription)
     }
 
-    _ = try await call(
-      "operations/fsinfo",
-      parameters: ["fs": .string(RcloneConfiguration.fs(for: profile))],
-      timeout: 45
-    )
+    // Do not probe the backend here. Every caller immediately performs the
+    // real operation it needs (or an fsinfo for capabilities), so probing here
+    // duplicates network I/O on every cold rclone start.
     configuredProfiles[profile.id] = signature
-    try await persistUpdatedOAuthTokens()
     return persistedOAuthTokens[profile.id]
   }
 
   func invalidateConfiguration(profileID: UUID) {
     configuredProfiles[profileID] = nil
+    fileProviderReadyProfiles[profileID] = nil
+    refreshDescriptor()
+  }
+
+  func markFileProviderReady(profileID: UUID, configurationRevision: UUID?) {
+    guard let state, state.process.isRunning else { return }
+    fileProviderReadyProfiles[profileID] = configurationRevision?.uuidString.lowercased() ?? ""
+    refreshDescriptor()
+  }
+
+  /// Extends the idle lease for RC work issued by the File Provider extension.
+  /// The extension talks to rclone directly, so without this signal the host
+  /// actor cannot see those requests and could stop the daemon mid-transfer.
+  func noteFileProviderActivity() {
+    guard state?.process.isRunning == true else { return }
+    noteActivity()
+    scheduleIdleShutdownIfEligible()
   }
 
   private func preparePrivateKey(
@@ -391,8 +413,11 @@ actor RcloneRuntime {
 
   func removeConfiguration(profileID: UUID) async {
     configuredProfiles[profileID] = nil
+    fileProviderReadyProfiles[profileID] = nil
+    refreshDescriptor()
     oauthProfileIDs.remove(profileID)
     persistedOAuthTokens[profileID] = nil
+    stopOAuthTokenMonitorIfIdle()
     _ = try? await call(
       "config/delete",
       parameters: ["name": .string(RcloneConfiguration.remoteName(for: profileID))]
@@ -401,14 +426,23 @@ actor RcloneRuntime {
   }
 
   private func startOAuthTokenMonitor() {
-    guard oauthTokenMonitorTask == nil, oauthTokenUpdateHandler != nil else { return }
+    guard oauthTokenMonitorTask == nil, oauthTokenUpdateHandler != nil, !oauthProfileIDs.isEmpty
+    else { return }
     oauthTokenMonitorTask = Task { [weak self] in
       while !Task.isCancelled {
-        try? await Task.sleep(nanoseconds: 15 * 1_000_000_000)
+        // OAuth refreshes are infrequent. Persisting every ten minutes keeps a
+        // crash-recovery copy while cutting this background wake source by 10x.
+        try? await Task.sleep(nanoseconds: 10 * 60 * 1_000_000_000)
         guard !Task.isCancelled, let self else { return }
         try? await self.persistUpdatedOAuthTokens()
       }
     }
+  }
+
+  private func stopOAuthTokenMonitorIfIdle() {
+    guard oauthProfileIDs.isEmpty else { return }
+    oauthTokenMonitorTask?.cancel()
+    oauthTokenMonitorTask = nil
   }
 
   private func persistUpdatedOAuthTokens() async throws {
@@ -437,6 +471,8 @@ actor RcloneRuntime {
     parameters: [String: JSONValue] = [:],
     timeout: TimeInterval = 45
   ) async throws -> [String: JSONValue] {
+    noteActivity()
+    defer { scheduleIdleShutdownIfEligible() }
     let current = try await requireState()
     return try await callRaw(method, parameters: parameters, state: current, timeout: timeout)
   }
@@ -452,6 +488,31 @@ actor RcloneRuntime {
     return try decoder.decode(T.self, from: data)
   }
 
+  private func noteActivity() {
+    activityGeneration &+= 1
+    idleShutdownTask?.cancel()
+    idleShutdownTask = nil
+  }
+
+  private func scheduleIdleShutdownIfEligible() {
+    guard state != nil else { return }
+    let generation = activityGeneration
+    idleShutdownTask?.cancel()
+    idleShutdownTask = Task { [weak self] in
+      // rclone is expensive only when kept resident. A short lease amortizes
+      // Finder bursts while still making the idle steady state daemon-free.
+      try? await Task.sleep(nanoseconds: 45 * 1_000_000_000)
+      guard !Task.isCancelled else { return }
+      await self?.shutdownIfStillIdle(generation: generation)
+    }
+  }
+
+  private func shutdownIfStillIdle(generation: UInt64) async {
+    guard generation == activityGeneration else { return }
+    idleShutdownTask = nil
+    await stop()
+  }
+
   private func requireState() async throws -> State {
     if let state, state.process.isRunning { return state }
     if let task = startTask { return try await task.value }
@@ -463,12 +524,13 @@ actor RcloneRuntime {
       state = newState
       startTask = nil
       configuredProfiles.removeAll()
+      fileProviderReadyProfiles.removeAll()
       startOAuthTokenMonitor()
-      try Self.publishDescriptor(for: newState)
+      try Self.publishDescriptor(for: newState, readyProfiles: fileProviderReadyProfiles)
       descriptorHeartbeat?.cancel()
       descriptorHeartbeat = Task { [weak self] in
         while !Task.isCancelled {
-          try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
+          try? await Task.sleep(nanoseconds: 90 * 60 * 1_000_000_000)
           guard !Task.isCancelled else { return }
           await self?.refreshDescriptor()
         }
@@ -655,7 +717,7 @@ actor RcloneRuntime {
       "--rc-user", username,
       "--rc-pass", password,
       "--rc-job-expire-duration", "24h",
-      "--rc-job-expire-interval", "1m",
+      "--rc-job-expire-interval", "15m",
       "--config", configURL.path,
       "--cache-dir", cacheURL.path,
       "--log-level", "NOTICE",
@@ -690,6 +752,14 @@ actor RcloneRuntime {
       removeDescriptorIfOwned(by: terminated.processIdentifier)
     }
 
+    let probeConfiguration = URLSessionConfiguration.ephemeral
+    probeConfiguration.urlCache = nil
+    probeConfiguration.timeoutIntervalForRequest = 2
+    let probeSession = URLSession(
+      configuration: probeConfiguration,
+      delegate: RcloneURLSessionDelegate(),
+      delegateQueue: nil
+    )
     let deadline = DispatchTime.now().uptimeNanoseconds + 12_000_000_000
     var discoveredBaseURL: URL?
     while DispatchTime.now().uptimeNanoseconds < deadline {
@@ -720,14 +790,6 @@ actor RcloneRuntime {
         let credentials = Data("\(username):\(password)".utf8).base64EncodedString()
         request.setValue("Basic \(credentials)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 1
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.urlCache = nil
-        configuration.timeoutIntervalForRequest = 2
-        let probeSession = URLSession(
-          configuration: configuration,
-          delegate: RcloneURLSessionDelegate(),
-          delegateQueue: nil
-        )
         if let (_, response) = try? await probeSession.data(for: request),
           let http = response as? HTTPURLResponse,
           sameOrigin(http.url, baseURL),
@@ -783,14 +845,21 @@ actor RcloneRuntime {
     #endif
   }
 
-  private nonisolated static func publishDescriptor(for state: State) throws {
+  private nonisolated static func publishDescriptor(
+    for state: State,
+    readyProfiles: [UUID: String]
+  ) throws {
+    let ready = Dictionary(uniqueKeysWithValues: readyProfiles.map { id, revision in
+      (id.uuidString.lowercased(), revision)
+    })
     let descriptor = RcloneRuntimeDescriptor(
       baseURL: state.baseURL,
       username: state.username,
       password: state.password,
       generation: state.generation,
       processIdentifier: state.process.processIdentifier,
-      expiresAt: Date().addingTimeInterval(2 * 60 * 60)
+      expiresAt: Date().addingTimeInterval(2 * 60 * 60),
+      fileProviderReadyProfiles: ready
     )
     let data = try JSONEncoder().encode(descriptor)
     let destination = AppStoragePaths.sharedFile(named: "rclone-runtime.json")
@@ -821,7 +890,7 @@ actor RcloneRuntime {
       try? FileManager.default.removeItem(at: AppStoragePaths.sharedFile(named: "rclone-runtime.json"))
       return
     }
-    try? Self.publishDescriptor(for: state)
+    try? Self.publishDescriptor(for: state, readyProfiles: fileProviderReadyProfiles)
   }
 
   private nonisolated static func randomSecret(byteCount: Int) throws -> String {

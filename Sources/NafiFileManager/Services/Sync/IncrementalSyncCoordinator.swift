@@ -76,7 +76,9 @@ final class FSEventsChangeMonitor: @unchecked Sendable {
       &context,
       [root.path] as CFArray,
       FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-      0.35,
+      // Incremental sync already waits for file stability, so allowing FSEvents
+      // a little more batching lowers wakeups without affecting correctness.
+      2.0,
       FSEventStreamCreateFlags(
         kFSEventStreamCreateFlagFileEvents
           | kFSEventStreamCreateFlagUseCFTypes
@@ -139,7 +141,16 @@ actor IncrementalSyncCoordinator {
     var fullTask: Task<Void, Never>?
   }
 
+  private enum TransferWaitKind: Sendable { case slot, drain }
+
+  private struct TransferWaiter {
+    let id: UUID
+    let continuation: CheckedContinuation<Bool, Never>
+  }
+
   private var runtimes: [UUID: ProfileRuntime] = [:]
+  private var transferSlotWaiters: [UUID: [TransferWaiter]] = [:]
+  private var transferDrainWaiters: [UUID: [TransferWaiter]] = [:]
   private let reconcile: FullReconciliation
   private let status: StatusUpdate
 
@@ -175,7 +186,6 @@ actor IncrementalSyncCoordinator {
     profile.clamp()
     let profileID = profile.id
     var state = ProfileRuntime(profile: profile)
-    state.fullTask = makeReconciliationTask(profile)
 
     if profile.source.isFileURL, profile.mode != .bidirectional {
       let root = profile.source.standardizedFileURL
@@ -189,6 +199,7 @@ actor IncrementalSyncCoordinator {
         await status(profile.id, .failed, "変更監視を開始できないため定期照合へ切り替えました。\n\(error.localizedDescription)")
       }
     }
+    state.fullTask = makeReconciliationTask(profile, hasReliableLocalMonitor: state.monitor != nil)
     runtimes[profile.id] = state
     scheduleReconciliation(profileID: profile.id, delay: 2)
     await status(profile.id, .waitingForStability, "停止中の変更を確認しています。")
@@ -200,12 +211,23 @@ actor IncrementalSyncCoordinator {
     state.fullTask?.cancel()
     for task in state.pending.values { task.cancel() }
     state.pending.removeAll()
+    resumeAll(&transferSlotWaiters, profileID: profileID)
+    resumeAll(&transferDrainWaiters, profileID: profileID)
   }
 
-  private func makeReconciliationTask(_ profile: SavedSyncProfile) -> Task<Void, Never> {
+  private func makeReconciliationTask(
+    _ profile: SavedSyncProfile,
+    hasReliableLocalMonitor: Bool
+  ) -> Task<Void, Never> {
     Task { [weak self] in
       while !Task.isCancelled {
-        let interval = max(15 * 60, profile.fullReconciliationInterval)
+        // FSEvents is the primary source of truth for local continuous sync. A
+        // full tree walk is a costly safety net, so do it at most daily while
+        // the monitor is healthy. If monitoring is unavailable, preserve the
+        // user's configured reconciliation cadence.
+        let interval = hasReliableLocalMonitor
+          ? max(24 * 60 * 60, profile.fullReconciliationInterval)
+          : max(15 * 60, profile.fullReconciliationInterval)
         try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         guard !Task.isCancelled else { return }
         await self?.scheduleReconciliation(profileID: profile.id, delay: 1)
@@ -313,12 +335,10 @@ actor IncrementalSyncCoordinator {
         return
       }
 
+      // consume() already debounces this exact path for stableForSeconds and
+      // cancels/restarts that task on every subsequent FSEvent. Re-polling size
+      // and mtime here doubled both latency and wakeups.
       await status(profile.id, .waitingForStability, relativePath)
-      guard try await waitUntilStable(source, seconds: profile.stableForSeconds) else {
-        scheduleReconciliation(profileID: profile.id, delay: profile.stableForSeconds)
-        return
-      }
-
       let values = try source.resourceValues(forKeys: [.fileSizeKey])
       let size = Int64(values.fileSize ?? 0)
 
@@ -377,7 +397,9 @@ actor IncrementalSyncCoordinator {
         runtimes[profileID] = state
         return
       }
-      try await Task.sleep(nanoseconds: 200_000_000)
+      guard await waitForTransferSignal(profileID: profileID, kind: .slot) else {
+        throw CancellationError()
+      }
     }
   }
 
@@ -385,32 +407,85 @@ actor IncrementalSyncCoordinator {
     guard var state = runtimes[profileID] else { return }
     state.activeTransfers = max(0, state.activeTransfers - 1)
     runtimes[profileID] = state
+    if state.activeTransfers == 0 {
+      resumeAll(&transferDrainWaiters, profileID: profileID)
+    }
+    if !state.isReconciling {
+      resumeOne(&transferSlotWaiters, profileID: profileID)
+    }
   }
 
-  private func waitUntilStable(_ url: URL, seconds: TimeInterval) async throws -> Bool {
-    let stableSeconds = seconds.isFinite ? min(max(seconds, 1), 3_600) : 8
-    let interval = min(max(stableSeconds / 2, 0.75), 5)
-    let stableNanoseconds = UInt64(stableSeconds * 1_000_000_000)
-    let timeoutNanoseconds = UInt64(max(30, stableSeconds * 12) * 1_000_000_000)
-    let startedAt = DispatchTime.now().uptimeNanoseconds
-    let deadline = startedAt + timeoutNanoseconds
-    var previous: (Int64, Date)?
-    var unchangedSince = startedAt
-
-    while DispatchTime.now().uptimeNanoseconds < deadline {
+  private func waitForTransfersToDrain(profileID: UUID) async throws {
+    while true {
       try Task.checkCancellation()
-      let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-      let current = (Int64(values.fileSize ?? 0), values.contentModificationDate ?? .distantPast)
-      let observedAt = DispatchTime.now().uptimeNanoseconds
-      if let previous, previous.0 == current.0, previous.1 == current.1 {
-        if observedAt - unchangedSince >= stableNanoseconds { return true }
-      } else {
-        previous = current
-        unchangedSince = observedAt
+      guard let state = runtimes[profileID] else { throw CancellationError() }
+      if state.activeTransfers == 0 { return }
+      guard await waitForTransferSignal(profileID: profileID, kind: .drain) else {
+        throw CancellationError()
       }
-      try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
     }
-    return false
+  }
+
+  private func waitForTransferSignal(profileID: UUID, kind: TransferWaitKind) async -> Bool {
+    if Task.isCancelled { return false }
+    let id = UUID()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        if Task.isCancelled {
+          continuation.resume(returning: false)
+          return
+        }
+        let waiter = TransferWaiter(id: id, continuation: continuation)
+        switch kind {
+        case .slot:
+          transferSlotWaiters[profileID, default: []].append(waiter)
+        case .drain:
+          transferDrainWaiters[profileID, default: []].append(waiter)
+        }
+      }
+    } onCancel: {
+      Task { await self.cancelTransferWaiter(profileID: profileID, id: id, kind: kind) }
+    }
+  }
+
+  private func cancelTransferWaiter(profileID: UUID, id: UUID, kind: TransferWaitKind) {
+    switch kind {
+    case .slot:
+      cancelWaiter(&transferSlotWaiters, profileID: profileID, id: id)
+    case .drain:
+      cancelWaiter(&transferDrainWaiters, profileID: profileID, id: id)
+    }
+  }
+
+  private func cancelWaiter(
+    _ storage: inout [UUID: [TransferWaiter]],
+    profileID: UUID,
+    id: UUID
+  ) {
+    guard var waiters = storage[profileID],
+      let index = waiters.firstIndex(where: { $0.id == id })
+    else { return }
+    let waiter = waiters.remove(at: index)
+    storage[profileID] = waiters.isEmpty ? nil : waiters
+    waiter.continuation.resume(returning: false)
+  }
+
+  private func resumeOne(
+    _ storage: inout [UUID: [TransferWaiter]],
+    profileID: UUID
+  ) {
+    guard var waiters = storage[profileID], !waiters.isEmpty else { return }
+    let waiter = waiters.removeFirst()
+    storage[profileID] = waiters.isEmpty ? nil : waiters
+    waiter.continuation.resume(returning: true)
+  }
+
+  private func resumeAll(
+    _ storage: inout [UUID: [TransferWaiter]],
+    profileID: UUID
+  ) {
+    let waiters = storage.removeValue(forKey: profileID) ?? []
+    for waiter in waiters { waiter.continuation.resume(returning: true) }
   }
 
   private func makeSnapshot(
@@ -478,13 +553,15 @@ actor IncrementalSyncCoordinator {
         updated.needsAnotherReconciliation = false
         updated.pending["__full__"] = nil
         runtimes[profileID] = updated
+        resumeAll(&transferSlotWaiters, profileID: profileID)
         if rerun { scheduleReconciliation(profileID: profileID, delay: updated.profile.stableForSeconds) }
       }
     }
 
-    while let current = runtimes[profileID], current.activeTransfers > 0 {
-      guard !Task.isCancelled else { return }
-      try? await Task.sleep(nanoseconds: 200_000_000)
+    do {
+      try await waitForTransfersToDrain(profileID: profileID)
+    } catch {
+      return
     }
     guard !Task.isCancelled, runtimes[profileID] != nil else { return }
     await reconcile(profileID)

@@ -33,7 +33,7 @@ private final class FileSystemRuntime: @unchecked Sendable {
 
   func cachedItems(for key: NSString) -> [FileItem]? {
     guard let snapshot = snapshotCache.object(forKey: key),
-      Date().timeIntervalSince(snapshot.createdAt) < 0.8
+      Date().timeIntervalSince(snapshot.createdAt) < 2.0
     else { return nil }
     return snapshot.items
   }

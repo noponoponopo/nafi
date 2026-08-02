@@ -8,6 +8,7 @@ struct FileSearchResult: Sendable {
 
 enum FileSearchService {
   static let resultLimit = 5_000
+  private static let searchLocale = Locale(identifier: "ja_JP")
 
   static func search(
     query: String,
@@ -95,24 +96,30 @@ enum FileSearchService {
 
     for case let url as URL in enumerator {
       if Task.isCancelled { throw CancellationError() }
-      guard let values = try? url.resourceValues(forKeys: FileSystemService.resourceKeys) else {
-        continue
-      }
-      let name = values.name ?? url.lastPathComponent
-      if !showHidden && (values.isHidden == true || name.hasPrefix(".")) { continue }
-
+      // Name matching is intentionally performed before requesting resource
+      // values. Recursive searches can walk hundreds of thousands of entries;
+      // fetching content type, tags and dates for every non-match is expensive
+      // on both local disks and network-backed volumes. The enumerator already
+      // applies .skipsHiddenFiles when hidden files are disabled.
+      let name = url.lastPathComponent
       let normalizedName = name.folding(
         options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
-        locale: Locale(identifier: "ja_JP")
+        locale: searchLocale
       )
       guard normalizedName.contains(query) else { continue }
 
+      guard let values = try? url.resourceValues(forKeys: FileSystemService.resourceKeys) else {
+        continue
+      }
+      let resolvedName = values.name ?? name
+      if !showHidden && (values.isHidden == true || resolvedName.hasPrefix(".")) { continue }
+
       let item = FileItem(
         url: url,
-        name: name,
+        name: resolvedName,
         isDirectory: values.isDirectory == true,
         isPackage: values.isPackage == true,
-        isHidden: values.isHidden == true || name.hasPrefix("."),
+        isHidden: values.isHidden == true || resolvedName.hasPrefix("."),
         fileSize: values.fileSize.map(Int64.init),
         creationDate: values.creationDate,
         modificationDate: values.contentModificationDate,

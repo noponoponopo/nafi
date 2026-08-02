@@ -48,7 +48,8 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
     try ensureActive()
     // Finder may launch the extension before the containing app. Resolve both
     // records for each request so an earlier startup failure is never cached.
-    return (try FPSharedStore.domainRecord(for: domain), try FPRcloneBridge())
+    let record = try FPSharedStore.domainRecord(for: domain)
+    return (record, FPRcloneBridge(record: record))
   }
 
   func item(
@@ -252,6 +253,7 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
           let current = try await statIfExists(oldRelative, record: record, bridge: bridge, strongVersion: true)
         else { throw FPBridgeError.noSuchItem }
         guard sameVersion(version, current.itemVersion) else { throw FPBridgeError.versionMismatch }
+        try await ensureMutationPathIsUnambiguous(oldRelative, record: record, bridge: bridge)
 
         var appliedFields: NSFileProviderItemFields = []
         if changedFields.contains(.filename) { appliedFields.insert(.filename) }
@@ -295,6 +297,7 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
             bridge: bridge
           )
           if oldRelative != newRelative {
+            try await ensureMutationPathIsUnambiguous(oldRelative, record: record, bridge: bridge)
             guard let sourceBeforeDelete = try await statIfExists(
               oldRelative,
               record: record,
@@ -366,6 +369,7 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
           let current = try await statIfExists(relative, record: record, bridge: bridge, strongVersion: true)
         else { throw FPBridgeError.noSuchItem }
         guard sameVersion(version, current.itemVersion) else { throw FPBridgeError.versionMismatch }
+        try await ensureMutationPathIsUnambiguous(relative, record: record, bridge: bridge)
 
         _ = try await bridge.runJob(current.isDirectory ? "operations/purge" : "operations/deletefile", [
           "fs": record.fs,
@@ -771,6 +775,10 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
         "srcFs": staging.path,
         "dstFs": combinedFS(record.fs, path: remoteParent),
         "oneWay": true,
+        "download": false,
+        // The staging directory contains one transaction file. Keep rclone from
+        // traversing/checking unrelated siblings in a very large destination.
+        "_filter": ["IncludeRule": [exactFilterRule(temporaryName)]],
       ])
       guard checked["success"] as? Bool == true else {
         throw FPBridgeError.remote((checked["status"] as? String) ?? "アップロード検証に失敗しました。")
@@ -793,6 +801,9 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
       if let expectedExistingFingerprint {
         guard existing?.contentFingerprint == expectedExistingFingerprint else {
           throw FPBridgeError.versionMismatch
+        }
+        if existing != nil {
+          try await ensureMutationPathIsUnambiguous(relative, record: record, bridge: bridge)
         }
       } else if existing != nil {
         throw FPBridgeError.collision
@@ -987,6 +998,41 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
     }
   }
 
+  private func ensureMutationPathIsUnambiguous(
+    _ relative: String,
+    record: FPDomainRecord,
+    bridge: FPRcloneBridge
+  ) async throws {
+    guard try await bridge.allowsDuplicateFiles(
+      fs: record.fs, configurationRevision: record.configurationRevision
+    ) else { return }
+    let path = try fullPath(relative, record: record)
+    let parent = FPIdentifierCodec.parentPath(of: path)
+    let name = (path as NSString).lastPathComponent
+    let response = try await bridge.call("operations/list", [
+      "fs": record.fs,
+      "remote": parent,
+      "opt": [
+        "recurse": false,
+        "showOrigIDs": true,
+        "showHash": false,
+        "noMimeType": true,
+        "metadata": false,
+      ],
+      // rclone may still need a backend directory listing, but only duplicate-name
+      // capable remotes pay this cost and the response is constrained to one name.
+      "_filter": ["IncludeRule": [exactFilterRule(name)]],
+    ], timeout: 120)
+    guard let values = response["list"] as? [[String: Any]], values.count <= 16 else {
+      throw FPBridgeError.malformedResponse
+    }
+    let matches = values.filter { $0["Name"] as? String == name }
+    guard matches.count == 1 else {
+      if matches.isEmpty { throw FPBridgeError.noSuchItem }
+      throw FPBridgeError.collision
+    }
+  }
+
   private func statIfExists(
     _ relative: String,
     record: FPDomainRecord,
@@ -1010,26 +1056,25 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
   ) async throws -> [String: Any]? {
     let path = try FPIdentifierCodec.validatedPath(remote)
     guard !path.isEmpty else { throw FPBridgeError.malformedResponse }
-    let parent = FPIdentifierCodec.parentPath(of: path)
-    let name = (path as NSString).lastPathComponent
     do {
-      let response = try await bridge.call("operations/list", [
+      // A point lookup must stay a point lookup. Listing the parent directory here
+      // made every save/delete/version check proportional to the number of siblings.
+      // operations/stat asks the backend for exactly this path; showHash still requests
+      // backend-provided hashes only and never enables download-based hashing.
+      let response = try await bridge.call("operations/stat", [
         "fs": fs,
-        "remote": parent,
+        "remote": path,
         "opt": [
-          "recurse": false,
           "showOrigIDs": true,
           "showHash": strongVersion,
           "noMimeType": true,
           "metadata": false,
         ],
       ], timeout: strongVersion ? 300 : 120)
-      guard let values = response["list"] as? [[String: Any]], values.count <= 250_000 else {
-        throw FPBridgeError.malformedResponse
-      }
-      let matches = values.filter { $0["Name"] as? String == name }
-      guard matches.count <= 1 else { throw FPBridgeError.collision }
-      return matches.first
+      guard let item = response["item"] else { throw FPBridgeError.malformedResponse }
+      if item is NSNull { return nil }
+      guard let object = item as? [String: Any] else { throw FPBridgeError.malformedResponse }
+      return object
     } catch let error as FPBridgeError where error.isNotFound {
       return nil
     }
@@ -1042,6 +1087,24 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
     record: FPDomainRecord,
     bridge: FPRcloneBridge
   ) async throws {
+    let sourceRemote = try fullPath(relative, record: record)
+    let destination = localDirectory.appendingPathComponent(name, isDirectory: false)
+    do {
+      // Single-file materialization should not enumerate the parent directory.
+      // copyfile addresses exactly one object and is the cheapest path on normal
+      // backends. A known Box read-only metadata failure retains the previous
+      // exact-name filtered fallback below.
+      _ = try await bridge.runJob("operations/copyfile", [
+        "srcFs": record.fs,
+        "srcRemote": sourceRemote,
+        "dstFs": "/",
+        "dstRemote": localRemote(destination),
+      ])
+      return
+    } catch {
+      guard isReadOnlyBoxMetadataFailure(error) else { throw error }
+    }
+
     let parent = FPIdentifierCodec.parentPath(of: relative)
     let source = combinedFS(record.fs, path: try fullPath(parent, record: record))
     _ = try await bridge.runJob("sync/copy", [
@@ -1050,6 +1113,12 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
       "createEmptySrcDirs": false,
       "_filter": ["IncludeRule": [exactFilterRule(name)]],
     ])
+  }
+
+  private func isReadOnlyBoxMetadataFailure(_ error: Error) -> Bool {
+    let message = error.localizedDescription.lowercased()
+    return message.contains("pre-upload check")
+      && message.contains("access_denied_insufficient_permissions")
   }
 
   private func exactFilterRule(_ name: String) -> String {

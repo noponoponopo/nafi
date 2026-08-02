@@ -4,6 +4,9 @@ import Foundation
 import os
 
 private let fpEnumeratorLogger = Logger(subsystem: "app.nafi.filemanager.fileprovider", category: "enumerator")
+private let fpRefreshRequestNotification = Notification.Name(
+  "app.nafi.filemanager.fileprovider.refresh-request"
+)
 
 final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
   private struct PageToken: Codable {
@@ -45,6 +48,7 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
   private var tasks: [UUID: Task<Void, Never>] = [:]
   private var completedTaskTokens = Set<UUID>()
   private var enumerationCache: EnumerationCache?
+  private var refreshObserver: NSObjectProtocol?
   private let pageSize = 500
   private let maximumPageTokenBytes = 1_024
   private static let workingSetAnchor = Data("nafi-working-set".utf8)
@@ -57,6 +61,20 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     self.containerIdentifier = containerIdentifier
     self.domain = domain
     super.init()
+    refreshObserver = DistributedNotificationCenter.default().addObserver(
+      forName: fpRefreshRequestNotification,
+      object: domain.identifier.rawValue,
+      queue: nil
+    ) { [weak self] _ in
+      guard let self else { return }
+      self.signalCurrentContainer()
+    }
+  }
+
+  deinit {
+    if let refreshObserver {
+      DistributedNotificationCenter.default().removeObserver(refreshObserver)
+    }
   }
 
   func invalidate() {
@@ -68,6 +86,22 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     enumerationCache = nil
     lock.unlock()
     active.forEach { $0.cancel() }
+    if let refreshObserver {
+      DistributedNotificationCenter.default().removeObserver(refreshObserver)
+      self.refreshObserver = nil
+    }
+  }
+
+  private func signalCurrentContainer() {
+    lock.lock()
+    let stopped = invalidated
+    lock.unlock()
+    guard !stopped,
+      containerIdentifier != .rootContainer,
+      containerIdentifier != .workingSet,
+      let manager = NSFileProviderManager(for: domain)
+    else { return }
+    manager.signalEnumerator(for: containerIdentifier) { _ in }
   }
 
   func enumerateItems(
@@ -217,7 +251,7 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
   private func listItems() async throws -> [NafiFileProviderItem] {
     try ensureActive()
     let record = try FPSharedStore.domainRecord(for: domain)
-    let bridge = try FPRcloneBridge()
+    let bridge = FPRcloneBridge(record: record)
     let relative = relativePath
     let response = try await bridge.call("operations/list", [
       "fs": record.fs,

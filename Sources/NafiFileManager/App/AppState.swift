@@ -3,6 +3,13 @@ import Combine
 import Foundation
 import SwiftUI
 
+private let fileProviderRuntimeRequestNotification = Notification.Name(
+  "app.nafi.filemanager.fileprovider.runtime-request"
+)
+private let fileProviderRuntimeActivityNotification = Notification.Name(
+  "app.nafi.filemanager.fileprovider.runtime-activity"
+)
+
 @MainActor
 final class AppState: ObservableObject {
   @Published var isSidebarEditorPresented = false
@@ -39,6 +46,7 @@ final class AppState: ObservableObject {
   private var terminationObserver: NSObjectProtocol?
   private var workspaceObservers: [UUID: AnyCancellable] = [:]
   private var serverProfilesObserver: AnyCancellable?
+  private var fileProviderRuntimeObservers: [NSObjectProtocol] = []
   private var sessionPersistenceTask: Task<Void, Never>?
   private var didRestoreSessionTabs = false
   private var reusePristineWindowForNextExternalOpen = false
@@ -75,11 +83,14 @@ final class AppState: ObservableObject {
       Task { @MainActor in self?.systemIntegration.reconcileFileProviderProfiles(profiles) }
     }
     configureGlobalQuickOpen()
+    installFileProviderRuntimeBridge()
   }
 
   deinit {
     if let maintenanceObserver { NotificationCenter.default.removeObserver(maintenanceObserver) }
     if let terminationObserver { NotificationCenter.default.removeObserver(terminationObserver) }
+    let distributed = DistributedNotificationCenter.default()
+    for observer in fileProviderRuntimeObservers { distributed.removeObserver(observer) }
     sessionPersistenceTask?.cancel()
   }
 
@@ -190,11 +201,13 @@ final class AppState: ObservableObject {
         guard let serverManager else { return }
         try await serverManager.persistOAuthToken(token, for: profileID)
       }
-      do { try await RcloneRuntime.shared.start() } catch {
-        self.presentationErrorMessage = error.localizedDescription
-      }
+      // rclone is intentionally lazy. Local-only sessions should not pay for a
+      // resident helper process, open loopback sockets, descriptor heartbeats,
+      // or RC housekeeping. The first remote/transfer operation starts it on demand.
       await serverManager.connectAutoProfiles()
-      await serverManager.configureFileProviderProfiles(systemIntegration.fileProviderProfileIDs)
+      // File Provider remotes are configured only when Finder actually asks for
+      // them. Keeping them out of startup is what allows rclone to be fully off
+      // while the published domains are idle.
       let recoveryWarnings = await UnifiedFileSystemService.recoverPendingRemoteOperations()
       if !recoveryWarnings.isEmpty {
         self.presentationErrorMessage = recoveryWarnings.joined(separator: "\n\n")
@@ -206,6 +219,41 @@ final class AppState: ObservableObject {
     }
     startupTask = task
     await task.value
+  }
+
+  private func installFileProviderRuntimeBridge() {
+    let center = DistributedNotificationCenter.default()
+    fileProviderRuntimeObservers.append(center.addObserver(
+      forName: fileProviderRuntimeRequestNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] notification in
+      guard let raw = notification.object as? String,
+        let profileID = UUID(uuidString: raw)
+      else { return }
+      Task { @MainActor [weak self] in
+        guard let self,
+          self.systemIntegration.fileProviderProfileIDs.contains(profileID)
+        else { return }
+        await self.serverManager.configureFileProviderProfile(profileID)
+      }
+    })
+
+    fileProviderRuntimeObservers.append(center.addObserver(
+      forName: fileProviderRuntimeActivityNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] notification in
+      guard let raw = notification.object as? String,
+        let profileID = UUID(uuidString: raw)
+      else { return }
+      Task { @MainActor [weak self] in
+        guard let self,
+          self.systemIntegration.fileProviderProfileIDs.contains(profileID)
+        else { return }
+        await RcloneRuntime.shared.noteFileProviderActivity()
+      }
+    })
   }
 
   func configureGlobalQuickOpen() {

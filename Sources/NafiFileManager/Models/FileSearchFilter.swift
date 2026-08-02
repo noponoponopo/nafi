@@ -100,29 +100,47 @@ enum FileSearchKind: String, CaseIterable, Identifiable, Codable, Hashable, Send
     return fileExtension.isEmpty ? nil : UTType(filenameExtension: fileExtension)
   }
 
+  // These sets are shared across every match instead of being reconstructed for
+  // every item visited by a recursive search.
+  private static let imageExtensions: Set<String> = [
+    "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "tif", "tiff", "svg", "raw",
+  ]
+  private static let videoExtensions: Set<String> = [
+    "mov", "mp4", "m4v", "avi", "mkv", "webm", "mpeg", "mpg",
+  ]
+  private static let audioExtensions: Set<String> = [
+    "mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg",
+  ]
+  private static let pdfExtensions: Set<String> = ["pdf"]
+  private static let documentExtensions: Set<String> = [
+    "txt", "md", "rtf", "pages", "doc", "docx", "xls", "xlsx", "numbers", "ppt", "pptx", "key",
+    "csv", "tsv",
+  ]
+  private static let sourceCodeExtensions: Set<String> = [
+    "swift", "m", "mm", "h", "c", "cc", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "rb",
+    "rs", "go", "java", "kt", "kts", "sh", "zsh", "fish", "html", "css", "scss", "json", "yaml",
+    "yml", "toml", "xml",
+  ]
+  private static let archiveExtensions: Set<String> = [
+    "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar",
+  ]
+
   private var fallbackExtensions: Set<String> {
     switch self {
     case .images:
-      ["jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "tif", "tiff", "svg", "raw"]
+      Self.imageExtensions
     case .video:
-      ["mov", "mp4", "m4v", "avi", "mkv", "webm", "mpeg", "mpg"]
+      Self.videoExtensions
     case .audio:
-      ["mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg"]
+      Self.audioExtensions
     case .pdf:
-      ["pdf"]
+      Self.pdfExtensions
     case .documents:
-      [
-        "txt", "md", "rtf", "pages", "doc", "docx", "xls", "xlsx", "numbers", "ppt", "pptx", "key",
-        "csv", "tsv",
-      ]
+      Self.documentExtensions
     case .sourceCode:
-      [
-        "swift", "m", "mm", "h", "c", "cc", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "rb",
-        "rs", "go", "java", "kt", "kts", "sh", "zsh", "fish", "html", "css", "scss", "json", "yaml",
-        "yml", "toml", "xml",
-      ]
+      Self.sourceCodeExtensions
     case .archives:
-      ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"]
+      Self.archiveExtensions
     }
   }
 }

@@ -2,14 +2,66 @@ import AppKit
 import Foundation
 import QuickLookThumbnailing
 
+private actor ThumbnailGenerationLimiter {
+  private struct Waiter {
+    let id: UUID
+    let continuation: CheckedContinuation<Bool, Never>
+  }
+
+  private let limit: Int
+  private var active = 0
+  private var waiters: [Waiter] = []
+
+  init(limit: Int) {
+    self.limit = max(1, limit)
+  }
+
+  func acquire() async -> Bool {
+    if Task.isCancelled { return false }
+    if active < limit {
+      active += 1
+      return true
+    }
+
+    let id = UUID()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        if Task.isCancelled {
+          continuation.resume(returning: false)
+        } else {
+          waiters.append(Waiter(id: id, continuation: continuation))
+        }
+      }
+    } onCancel: {
+      Task { await self.cancel(id) }
+    }
+  }
+
+  func release() {
+    if let waiter = waiters.popLast() {
+      waiter.continuation.resume(returning: true)
+    } else {
+      active = max(0, active - 1)
+    }
+  }
+
+  private func cancel(_ id: UUID) {
+    guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+    let waiter = waiters.remove(at: index)
+    waiter.continuation.resume(returning: false)
+  }
+}
+
+private let thumbnailGenerationLimiter = ThumbnailGenerationLimiter(limit: 2)
+
 @MainActor
 final class FileThumbnailService {
   static let shared = FileThumbnailService()
 
   private let cache: NSCache<NSString, NSImage> = {
     let cache = NSCache<NSString, NSImage>()
-    cache.countLimit = 512
-    cache.totalCostLimit = 160 * 1_024 * 1_024
+    cache.countLimit = 256
+    cache.totalCostLimit = 64 * 1_024 * 1_024
     return cache
   }()
 
@@ -29,10 +81,21 @@ final class FileThumbnailService {
       return await task.value
     }
 
-    let task = Task<NSImage?, Never> {
+    let task = Task<NSImage?, Never>(priority: .utility) {
       do {
         return try await UnifiedFileSystemService.withTemporaryLocalCopy(of: item.url) { localURL in
-          await Self.generateThumbnail(for: localURL, pointSize: requestSize, scale: scale)
+          guard await thumbnailGenerationLimiter.acquire() else { return nil }
+          if Task.isCancelled {
+            await thumbnailGenerationLimiter.release()
+            return nil
+          }
+          let image = await Self.generateThumbnail(
+            for: localURL,
+            pointSize: requestSize,
+            scale: scale
+          )
+          await thumbnailGenerationLimiter.release()
+          return image
         }
       } catch {
         return nil

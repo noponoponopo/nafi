@@ -479,19 +479,26 @@ private struct IntegrationSettingsView: View {
       }
 
       Section("File Provider") {
-        Text("有効にした接続をFinder、開く／保存パネル、他のmacOSアプリへ公開します。nafiのリモート通信は常駐rcloneを経由します。")
+        Text("有効にした接続をFinder、開く／保存パネル、他のmacOSアプリへ公開します。rcloneは必要な時だけ起動し、File Providerがアイドルになると終了します。定期ポーリングは行いません。")
           .font(.caption).foregroundStyle(.secondary)
         if serverManager.profiles.isEmpty {
           Text("先にリモート接続を追加してください。").foregroundStyle(.secondary)
         } else {
           ForEach(serverManager.profiles.filter { ![.nfs, .afp].contains($0.kind) }) { profile in
-            Toggle(
-              isOn: Binding(
-                get: { service.fileProviderProfileIDs.contains(profile.id) },
-                set: { service.setFileProviderEnabled($0, profile: profile) }
-              )
-            ) {
-              Label(profile.name, systemImage: profile.kind.systemImage)
+            HStack {
+              Toggle(
+                isOn: Binding(
+                  get: { service.fileProviderProfileIDs.contains(profile.id) },
+                  set: { service.setFileProviderEnabled($0, profile: profile) }
+                )
+              ) {
+                Label(profile.name, systemImage: profile.kind.systemImage)
+              }
+              if service.fileProviderProfileIDs.contains(profile.id) {
+                Button("今すぐ確認") { service.refreshFileProvider(profileID: profile.id) }
+                  .buttonStyle(.borderless)
+                  .help("定期ポーリングを有効にせず、Finderへリモートの最新状態を確認するよう要求します")
+              }
             }
           }
         }
@@ -499,7 +506,10 @@ private struct IntegrationSettingsView: View {
       }
     }
     .formStyle(.grouped)
-    .task { service.refresh() }
+    .task {
+      service.refresh()
+      service.refreshRcloneVersion()
+    }
     .alert(
       "システム統合",
       isPresented: Binding(

@@ -356,6 +356,11 @@ struct RcloneRuntimeDescriptor: Codable, Hashable, Sendable {
   let generation: UUID
   let processIdentifier: Int32
   let expiresAt: Date
+  /// File Provider profiles configured inside this exact rclone generation.
+  /// The value is the profile configuration revision; an empty string means
+  /// the legacy/unknown revision. Keeping this in the runtime descriptor lets
+  /// the extension distinguish "daemon is up" from "this remote is ready".
+  let fileProviderReadyProfiles: [String: String]?
 
   var isUsable: Bool { expiresAt > Date() }
 }

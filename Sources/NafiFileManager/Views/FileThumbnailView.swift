@@ -36,6 +36,10 @@ struct FileThumbnailView: View {
     .task(id: requestIdentity) {
       thumbnail = nil
       guard thumbnailsEnabled else { return }
+      // Avoid decoding thumbnails for rows/cards that only flash by during a fast
+      // scroll. SwiftUI cancels this task when the cell disappears.
+      try? await Task.sleep(nanoseconds: 140_000_000)
+      guard !Task.isCancelled else { return }
       let scale = NSScreen.main?.backingScaleFactor ?? 2
       let image = await FileThumbnailService.shared.thumbnail(
         for: item,

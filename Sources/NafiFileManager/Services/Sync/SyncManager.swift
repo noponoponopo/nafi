@@ -11,6 +11,7 @@ final class SyncManager: ObservableObject {
   private let runtime: RcloneRuntime
   private var runningTasks: [UUID: Task<Void, Never>] = [:]
   private var scheduledTask: Task<Void, Never>?
+  private var schedulingEnabled = false
   private var incremental: IncrementalSyncCoordinator!
 
   init(runtime: RcloneRuntime = .shared) {
@@ -34,15 +35,10 @@ final class SyncManager: ObservableObject {
   }
 
   func startScheduling() {
-    guard scheduledTask == nil else { return }
+    guard !schedulingEnabled else { return }
+    schedulingEnabled = true
     Task { await incremental.updateProfiles(profiles) }
-    scheduledTask = Task { [weak self] in
-      while !Task.isCancelled {
-        guard let self else { return }
-        await self.runDueProfiles()
-        try? await Task.sleep(nanoseconds: 60_000_000_000)
-      }
-    }
+    restartSchedulingLoop()
   }
 
   @discardableResult
@@ -81,6 +77,7 @@ final class SyncManager: ObservableObject {
     guard persist(updatedProfiles) else { return false }
     profiles = updatedProfiles
     Task { await incremental.updateProfiles(profiles) }
+    restartSchedulingLoop()
     return true
   }
 
@@ -92,6 +89,7 @@ final class SyncManager: ObservableObject {
     statuses[profile.id] = nil
     if selectedPreview?.profileID == profile.id { selectedPreview = nil }
     Task { await incremental.updateProfiles(profiles) }
+    restartSchedulingLoop()
   }
 
   func preview(_ profile: SavedSyncProfile) async -> SyncPreview? {
@@ -216,7 +214,10 @@ final class SyncManager: ObservableObject {
     requiringPreview: Bool,
     allowingInitialBisync: Bool
   ) async {
-    defer { runningTasks[original.id] = nil }
+    defer {
+      runningTasks[original.id] = nil
+      restartSchedulingLoop()
+    }
     var profile = original
     profile.clamp()
     var status = statuses[profile.id] ?? SyncRunStatus(profileID: profile.id)
@@ -293,6 +294,7 @@ final class SyncManager: ObservableObject {
       status.rcloneExecuteID = job.executeID
       statuses[profile.id] = status
 
+      var progressPollDelayNanoseconds: UInt64 = 750_000_000
       while true {
         try Task.checkCancellation()
         let stats = (try? await stats(group: group)) ?? RcloneTransferStats()
@@ -327,7 +329,8 @@ final class SyncManager: ObservableObject {
           }
           break
         }
-        try await Task.sleep(nanoseconds: 450_000_000)
+        try await Task.sleep(nanoseconds: progressPollDelayNanoseconds)
+        progressPollDelayNanoseconds = min(4_000_000_000, progressPollDelayNanoseconds * 2)
       }
 
       status.phase = .verifying
@@ -738,6 +741,52 @@ final class SyncManager: ObservableObject {
       }
       if due { run(profile) }
     }
+  }
+
+  private func restartSchedulingLoop() {
+    guard schedulingEnabled else { return }
+    scheduledTask?.cancel()
+    scheduledTask = nil
+    let hasScheduledProfiles = profiles.contains { profile in
+      guard profile.enabled else { return false }
+      switch profile.trigger {
+      case .hourly, .daily: return true
+      case .manual, .continuous: return false
+      }
+    }
+    // Manual/continuous-only configurations need no clock-driven scheduler at all.
+    guard hasScheduledProfiles else { return }
+    scheduledTask = Task { [weak self] in
+      while !Task.isCancelled {
+        guard let self else { return }
+        await self.runDueProfiles()
+        guard !Task.isCancelled else { return }
+        let delay = self.nextScheduledDelay()
+        let bounded = min(max(delay, 1), 24 * 60 * 60)
+        try? await Task.sleep(nanoseconds: UInt64(bounded * 1_000_000_000))
+      }
+    }
+  }
+
+  private func nextScheduledDelay() -> TimeInterval {
+    let now = Date()
+    var nextDelay: TimeInterval?
+    for profile in profiles where profile.enabled && runningTasks[profile.id] == nil {
+      if profile.mode == .bidirectional && !isBisyncInitialized(profile) { continue }
+      let interval: TimeInterval
+      switch profile.trigger {
+      case .manual, .continuous:
+        continue
+      case .hourly:
+        interval = 60 * 60
+      case .daily:
+        interval = 24 * 60 * 60
+      }
+      let elapsed = now.timeIntervalSince(profile.lastRunAt ?? .distantPast)
+      let remaining = max(1, interval - elapsed)
+      nextDelay = min(nextDelay ?? remaining, remaining)
+    }
+    return nextDelay ?? 24 * 60 * 60
   }
 
   private func load() {

@@ -4,6 +4,30 @@ import Foundation
 import os
 
 private let fpBridgeLogger = Logger(subsystem: "app.nafi.filemanager.fileprovider", category: "rclone")
+private let fpRuntimeRequestNotification = Notification.Name(
+  "app.nafi.filemanager.fileprovider.runtime-request"
+)
+private let fpRuntimeActivityNotification = Notification.Name(
+  "app.nafi.filemanager.fileprovider.runtime-activity"
+)
+
+private actor FPCapabilityCache {
+  static let shared = FPCapabilityCache()
+  private var duplicateFiles: [String: Bool] = [:]
+
+  private func key(generation: UUID, configurationRevision: UUID?, fs: String) -> String {
+    "\(generation.uuidString.lowercased())|\(configurationRevision?.uuidString.lowercased() ?? "")|\(fs)"
+  }
+
+  func value(generation: UUID, configurationRevision: UUID?, fs: String) -> Bool? {
+    duplicateFiles[key(generation: generation, configurationRevision: configurationRevision, fs: fs)]
+  }
+
+  func store(_ value: Bool, generation: UUID, configurationRevision: UUID?, fs: String) {
+    if duplicateFiles.count >= 512 { duplicateFiles.removeAll(keepingCapacity: true) }
+    duplicateFiles[key(generation: generation, configurationRevision: configurationRevision, fs: fs)] = value
+  }
+}
 
 private final class FPNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
   func urlSession(
@@ -18,11 +42,14 @@ private final class FPNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unc
 }
 
 actor FPRcloneBridge {
-  private var descriptor: FPRuntimeDescriptor
+  private var descriptor: FPRuntimeDescriptor?
+  private let record: FPDomainRecord?
   private let session: URLSession
+  private var lastActivitySignal = Date.distantPast
 
-  init() throws {
-    descriptor = try FPSharedStore.descriptor()
+  init(record: FPDomainRecord? = nil) {
+    self.record = record
+    descriptor = try? FPSharedStore.descriptor()
     let configuration = URLSessionConfiguration.ephemeral
     configuration.timeoutIntervalForRequest = 60
     configuration.timeoutIntervalForResource = 24 * 60 * 60
@@ -39,19 +66,38 @@ actor FPRcloneBridge {
       throw FPBridgeError.malformedResponse
     }
     var lastError: Error = FPBridgeError.runtimeUnavailable
-    for attempt in 0..<2 {
+    for attempt in 0..<3 {
       do {
-        if attempt > 0 || descriptor.expiresAt.timeIntervalSinceNow < 15 * 60 {
-          descriptor = try FPSharedStore.descriptor()
-        }
+        try await ensureRuntimeReady()
+        signalActivityIfNeeded()
         return try await callOnce(method, parameters, timeout: timeout)
       } catch {
         fpBridgeLogger.error("RC \(method, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
         lastError = error
-        guard attempt == 0, shouldReloadDescriptor(after: error) else { throw error }
+        guard attempt < 2, shouldReloadDescriptor(after: error) else { throw error }
+        descriptor = nil
       }
     }
     throw lastError
+  }
+
+  func allowsDuplicateFiles(fs: String, configurationRevision: UUID?) async throws -> Bool {
+    try await ensureRuntimeReady()
+    guard let generation = descriptor?.generation else { throw FPBridgeError.runtimeUnavailable }
+    if let cached = await FPCapabilityCache.shared.value(
+      generation: generation, configurationRevision: configurationRevision, fs: fs
+    ) {
+      return cached
+    }
+    let response = try await call("operations/fsinfo", ["fs": fs], timeout: 60)
+    guard let features = response["Features"] as? [String: Any] else {
+      throw FPBridgeError.malformedResponse
+    }
+    let value = features["DuplicateFiles"] as? Bool ?? false
+    await FPCapabilityCache.shared.store(
+      value, generation: generation, configurationRevision: configurationRevision, fs: fs
+    )
+    return value
   }
 
   func runJob(
@@ -74,17 +120,20 @@ actor FPRcloneBridge {
     else {
       throw FPBridgeError.malformedResponse
     }
-    let generation = descriptor.generation
+    guard let generation = descriptor?.generation else {
+      throw FPBridgeError.runtimeUnavailable
+    }
     let timeoutNanoseconds = UInt64(timeout * 1_000_000_000)
     let start = DispatchTime.now().uptimeNanoseconds
     let deadline = start.addingReportingOverflow(timeoutNanoseconds).overflow
       ? UInt64.max
       : start + timeoutNanoseconds
+    var pollDelay: UInt64 = 150_000_000
     do {
       while DispatchTime.now().uptimeNanoseconds < deadline {
         try Task.checkCancellation()
         let status = try await call("job/status", ["jobid": jobID], timeout: 60)
-        guard descriptor.generation == generation,
+        guard descriptor?.generation == generation,
           let currentExecuteID = status["executeId"] as? String,
           currentExecuteID == executeID
         else {
@@ -112,7 +161,8 @@ actor FPRcloneBridge {
           }
           return dictionary
         }
-        try await Task.sleep(nanoseconds: 400_000_000)
+        try await Task.sleep(nanoseconds: pollDelay)
+        pollDelay = min(5_000_000_000, pollDelay * 2)
       }
       throw URLError(.timedOut)
     } catch {
@@ -133,11 +183,10 @@ actor FPRcloneBridge {
     generation: UUID
   ) async {
     await Task.detached(priority: .utility) {
-      guard let bridge = try? FPRcloneBridge(), await bridge.descriptor.generation == generation else {
-        return
-      }
+      let bridge = FPRcloneBridge()
+      guard await bridge.descriptor?.generation == generation else { return }
       guard let status = try? await bridge.call("job/status", ["jobid": jobID], timeout: 30),
-        await bridge.descriptor.generation == generation,
+        await bridge.descriptor?.generation == generation,
         let currentExecuteID = status["executeId"] as? String,
         currentExecuteID == executeID
       else { return }
@@ -146,9 +195,62 @@ actor FPRcloneBridge {
     }.value
   }
 
+  private func ensureRuntimeReady() async throws {
+    if let current = descriptor, descriptorIsUsable(current) { return }
+    if let current = try? FPSharedStore.descriptor(), descriptorIsUsable(current) {
+      descriptor = current
+      return
+    }
+
+    guard let record else { throw FPBridgeError.runtimeUnavailable }
+    requestRuntime(for: record)
+    let deadline = DispatchTime.now().uptimeNanoseconds + 30_000_000_000
+    var delay: UInt64 = 50_000_000
+    while DispatchTime.now().uptimeNanoseconds < deadline {
+      try Task.checkCancellation()
+      if let current = try? FPSharedStore.descriptor(), descriptorIsUsable(current) {
+        descriptor = current
+        signalActivityIfNeeded(force: true)
+        return
+      }
+      try await Task.sleep(nanoseconds: delay)
+      delay = min(500_000_000, delay * 2)
+    }
+    throw FPBridgeError.runtimeUnavailable
+  }
+
+  private func descriptorIsUsable(_ value: FPRuntimeDescriptor) -> Bool {
+    let processAlive = kill(value.processIdentifier, 0) == 0 || errno == EPERM
+    guard value.expiresAt > Date(), processAlive else { return false }
+    guard let record else { return true }
+    return value.isReady(for: record)
+  }
+
+  private func requestRuntime(for record: FPDomainRecord) {
+    DistributedNotificationCenter.default().post(
+      name: fpRuntimeRequestNotification,
+      object: record.id.uuidString,
+      userInfo: nil,
+      deliverImmediately: true
+    )
+  }
+
+  private func signalActivityIfNeeded(force: Bool = false) {
+    let now = Date()
+    guard force || now.timeIntervalSince(lastActivitySignal) >= 20 else { return }
+    lastActivitySignal = now
+    DistributedNotificationCenter.default().post(
+      name: fpRuntimeActivityNotification,
+      object: record?.id.uuidString,
+      userInfo: nil,
+      deliverImmediately: true
+    )
+  }
+
   private func callOnce(
     _ method: String, _ parameters: [String: Any], timeout: TimeInterval
   ) async throws -> [String: Any] {
+    guard let descriptor else { throw FPBridgeError.runtimeUnavailable }
     let processAlive = kill(descriptor.processIdentifier, 0) == 0 || errno == EPERM
     guard descriptor.expiresAt > Date(), processAlive else {
       throw FPBridgeError.runtimeUnavailable
