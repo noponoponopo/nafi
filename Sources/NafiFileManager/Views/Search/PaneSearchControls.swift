@@ -103,6 +103,17 @@ private struct FileSearchOptionsPopover: View {
         filterConfiguration
       }
 
+      if model.canRefreshSearchIndex {
+        Divider()
+        Button {
+          model.refreshSearchIndex()
+        } label: {
+          Label("リモート検索キャッシュを更新", systemImage: "arrow.clockwise")
+        }
+        .buttonStyle(.borderless)
+        .help("外部端末で変更した直後など、次の検索をリモートから再取得します")
+      }
+
       Text(model.searchDescription)
         .font(.caption)
         .foregroundStyle(.secondary)

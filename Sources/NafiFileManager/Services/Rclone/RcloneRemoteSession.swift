@@ -15,6 +15,18 @@ actor RcloneRemoteSession: RemoteServerSession {
   private let directoryCacheLifetime: TimeInterval = 2.5
   private let maximumCachedDirectories = 256
 
+  private struct CachedRecursiveCatalog {
+    let loadedAt: Date
+    let rootPath: String
+    let items: [RemoteFileItem]
+  }
+  private var recursiveCatalogCache: [String: CachedRecursiveCatalog] = [:]
+  private var recursiveCatalogLoading: [String: Task<[RemoteFileItem], Error>] = [:]
+  // Search catalog data is metadata only. Five minutes avoids repeatedly asking
+  // cloud providers for the same tree while still bounding remote-only staleness.
+  private let recursiveCatalogLifetime: TimeInterval = 5 * 60
+  private let maximumRecursiveCatalogRoots = 4
+
   private init(
     profile: ServerProfile,
     runtime: RcloneRuntime,
@@ -126,6 +138,189 @@ actor RcloneRemoteSession: RemoteServerSession {
       }
     }
     return items
+  }
+
+  func recursiveCatalog(at path: String) async throws -> [RemoteFileItem] {
+    let rootPath = RemotePath.normalized(path)
+    let now = Date()
+
+    // A cached ancestor catalog can answer a descendant search without another
+    // remote API call. Prefer the nearest ancestor to minimize in-memory work.
+    let covering = recursiveCatalogCache.values
+      .filter { now.timeIntervalSince($0.loadedAt) <= recursiveCatalogLifetime && Self.path($0.rootPath, contains: rootPath) }
+      .max { $0.rootPath.count < $1.rootPath.count }
+    if let covering {
+      if covering.rootPath == rootPath { return covering.items }
+      return covering.items.filter { Self.path(rootPath, contains: $0.path) }
+    }
+
+    // Actor reentrancy means a second pane can enter while the first request is
+    // awaiting rclone. Share the in-flight catalog build instead of issuing a
+    // duplicate full-tree listing.
+    if let (loadingRoot, loading) = coveringRecursiveLoad(for: rootPath) {
+      let items = try await loading.value
+      try Task.checkCancellation()
+      return loadingRoot == rootPath ? items : items.filter { Self.path(rootPath, contains: $0.path) }
+    }
+
+    // Do not wake/configure rclone when the metadata catalog can answer the
+    // search entirely from memory. Only a genuine cache miss crosses into the
+    // runtime. Recheck after the await because another pane may have filled it.
+    try await ensureReady()
+    let refreshedNow = Date()
+    let refreshedCovering = recursiveCatalogCache.values
+      .filter { refreshedNow.timeIntervalSince($0.loadedAt) <= recursiveCatalogLifetime && Self.path($0.rootPath, contains: rootPath) }
+      .max { $0.rootPath.count < $1.rootPath.count }
+    if let refreshedCovering {
+      return refreshedCovering.rootPath == rootPath
+        ? refreshedCovering.items
+        : refreshedCovering.items.filter { Self.path(rootPath, contains: $0.path) }
+    }
+    if let (loadingRoot, loading) = coveringRecursiveLoad(for: rootPath) {
+      let items = try await loading.value
+      try Task.checkCancellation()
+      return loadingRoot == rootPath ? items : items.filter { Self.path(rootPath, contains: $0.path) }
+    }
+
+    let task = Task<[RemoteFileItem], Error> { [weak self] in
+      guard let self else { throw CancellationError() }
+      return try await self.loadRecursiveCatalog(rootPath: rootPath)
+    }
+    recursiveCatalogLoading[rootPath] = task
+    do {
+      let items = try await task.value
+      recursiveCatalogLoading[rootPath] = nil
+      // Preserve successful work even when the pane that initiated the load was
+      // canceled after another pane had already joined the same request.
+      recursiveCatalogCache[rootPath] = CachedRecursiveCatalog(
+        loadedAt: Date(),
+        rootPath: rootPath,
+        items: items
+      )
+      trimRecursiveCatalogCacheIfNeeded()
+      try Task.checkCancellation()
+      return items
+    } catch {
+      recursiveCatalogLoading[rootPath] = nil
+      throw error
+    }
+  }
+
+  private func coveringRecursiveLoad(
+    for rootPath: String
+  ) -> (String, Task<[RemoteFileItem], Error>)? {
+    recursiveCatalogLoading
+      .filter { Self.path($0.key, contains: rootPath) }
+      .max { $0.key.count < $1.key.count }
+      .map { ($0.key, $0.value) }
+  }
+
+  private func loadRecursiveCatalog(rootPath: String) async throws -> [RemoteFileItem] {
+    guard !Self.isLinuxPseudoFilesystemPath(rootPath) else {
+      throw RemoteServerError.invalidResponse(
+        "Linuxの擬似ファイルシステムは再帰検索の対象外です。"
+      )
+    }
+    let cleanPath = try remoteArgument(rootPath)
+    let options: [String: JSONValue] = [
+      "recurse": .bool(true),
+      "showHash": .bool(false),
+      "noMimeType": .bool(true),
+      "metadata": .bool(false),
+    ]
+    var parameters: [String: JSONValue] = [
+      "fs": .string(RcloneConfiguration.fs(for: profile)),
+      "remote": .string(cleanPath),
+      "opt": .object(options),
+    ]
+    if rootPath == "/" {
+      parameters["_filter"] = .object([
+        "ExcludeRule": .array([.string("proc/**"), .string("sys/**"), .string("dev/**")])
+      ])
+    }
+    let response = try await runtime.call(
+      "operations/list",
+      parameters: parameters,
+      timeout: 300
+    )
+    guard let raw = response["list"] else { return [] }
+    let data = try JSONEncoder().encode(raw)
+    let entries = try JSONDecoder().decode([RcloneListEntry].self, from: data)
+    guard entries.count <= 250_000 else {
+      throw RemoteServerError.invalidResponse(
+        "検索インデックスが25万項目を超えました。より狭いフォルダから検索してください。"
+      )
+    }
+
+    func duplicateKey(_ relativePath: String) -> String {
+      let canonical = relativePath.precomposedStringWithCanonicalMapping
+      guard capabilities.caseInsensitive else { return canonical }
+      return canonical.folding(
+        options: [.caseInsensitive, .widthInsensitive],
+        locale: Locale(identifier: "en_US_POSIX")
+      )
+    }
+
+    let relativePaths = entries.map { entry in entry.path.isEmpty ? entry.name : entry.path }
+    let groups = Dictionary(grouping: zip(entries.indices, relativePaths), by: { duplicateKey($0.1) })
+    var occurrenceByKey: [String: Int] = [:]
+    var items: [RemoteFileItem] = []
+    items.reserveCapacity(entries.count)
+
+    for (index, entry) in entries.enumerated() {
+      try Task.checkCancellation()
+      let relativePath = relativePaths[index]
+      let key = duplicateKey(relativePath)
+      occurrenceByKey[key, default: 0] += 1
+      let position = occurrenceByKey[key] ?? 1
+      let isAmbiguous = (groups[key]?.count ?? 0) > 1
+      let token = isAmbiguous ? (entry.id ?? "index:\(position):\(relativePath)") : nil
+      let displayName = isAmbiguous ? "\(entry.name) — 重複 \(position)" : entry.name
+      items.append(
+        RemoteFileItem(
+          name: displayName,
+          path: RemotePath.appending(relativePath, to: rootPath),
+          isDirectory: entry.isDir,
+          size: entry.size.flatMap { $0 >= 0 ? UInt64($0) : nil },
+          modifiedAt: entry.modTime,
+          stableID: entry.id,
+          ambiguityToken: token
+        )
+      )
+    }
+    return items
+  }
+
+  private func trimRecursiveCatalogCacheIfNeeded() {
+    guard recursiveCatalogCache.count > maximumRecursiveCatalogRoots else { return }
+    let overflow = recursiveCatalogCache.count - maximumRecursiveCatalogRoots
+    for key in recursiveCatalogCache
+      .sorted(by: { $0.value.loadedAt < $1.value.loadedAt })
+      .prefix(overflow)
+      .map(\.key)
+    {
+      recursiveCatalogCache[key] = nil
+    }
+  }
+
+  func invalidateSearchCache() async {
+    recursiveCatalogLoading.values.forEach { $0.cancel() }
+    recursiveCatalogLoading.removeAll(keepingCapacity: true)
+    recursiveCatalogCache.removeAll(keepingCapacity: true)
+  }
+
+  private static func path(_ ancestor: String, contains descendant: String) -> Bool {
+    let parent = RemotePath.normalized(ancestor)
+    let child = RemotePath.normalized(descendant)
+    if parent == "/" { return true }
+    return child == parent || child.hasPrefix(parent + "/")
+  }
+
+  private static func isLinuxPseudoFilesystemPath(_ path: String) -> Bool {
+    guard let first = RemotePath.normalized(path)
+      .split(separator: "/", omittingEmptySubsequences: true).first
+    else { return false }
+    return first == "proc" || first == "sys" || first == "dev"
   }
 
   private func listDirectoryResponse(at path: String) async throws -> [String: JSONValue] {
@@ -361,6 +556,9 @@ actor RcloneRemoteSession: RemoteServerSession {
   func close() async {
     isClosed = true
     directoryCache.removeAll()
+    recursiveCatalogLoading.values.forEach { $0.cancel() }
+    recursiveCatalogLoading.removeAll()
+    recursiveCatalogCache.removeAll()
   }
 
   func stat(at path: String) async throws -> RcloneListEntry? {
@@ -497,6 +695,12 @@ actor RcloneRemoteSession: RemoteServerSession {
     let normalized = RemotePath.normalized(path)
     directoryCache[normalized] = nil
     directoryCache[RemotePath.parent(of: normalized)] = nil
+    // Any mutation may affect an ancestor recursive catalog. Cancel in-flight
+    // builds too, otherwise a stale pre-mutation listing could be cached after
+    // the write has completed.
+    recursiveCatalogLoading.values.forEach { $0.cancel() }
+    recursiveCatalogLoading.removeAll(keepingCapacity: true)
+    recursiveCatalogCache.removeAll(keepingCapacity: true)
   }
 
   private func joinedFS(path: String) -> String {

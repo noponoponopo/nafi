@@ -869,7 +869,9 @@ actor RcloneRuntime {
 
   private nonisolated static func resolveBinaryURL() -> URL? {
     let fm = FileManager.default
-    var candidates: [URL] = []
+    var candidates: [URL] = [
+      Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/rclone")
+    ]
     if let helper = Bundle.main.url(forAuxiliaryExecutable: "rclone") { candidates.append(helper) }
     if let resource = Bundle.main.resourceURL?.appendingPathComponent("Helpers/rclone") {
       candidates.append(resource)

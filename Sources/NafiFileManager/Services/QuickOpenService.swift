@@ -106,7 +106,7 @@ final class QuickOpenModel: ObservableObject {
     searchTask?.cancel()
     let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
     searchTask = Task { [weak self] in
-      if !immediate { try? await Task.sleep(nanoseconds: 160_000_000) }
+      if !immediate { try? await Task.sleep(nanoseconds: 280_000_000) }
       guard !Task.isCancelled, let self else { return }
       await self.performSearch(query)
     }
@@ -118,9 +118,9 @@ final class QuickOpenModel: ObservableObject {
       isSearching = false
       return
     }
-    let folded = query.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
-    let matchingBase = baseResults.filter {
-      $0.normalizedSearchText.contains(folded)
+    let terms = FileNameSearchMatcher.terms(query)
+    let matchingBase = baseResults.filter { result in
+      terms.allSatisfy(result.normalizedSearchText.contains)
     }
     isSearching = true
     let spotlight = await SpotlightSearchService.search(nameContaining: query, limit: 250)
@@ -156,7 +156,16 @@ private final class SpotlightQueryContext {
   init(text: String, limit: Int) {
     self.limit = limit
     query.searchScopes = [NSMetadataQueryUserHomeScope]
-    query.predicate = NSPredicate(format: "%K CONTAINS[cd] %@", NSMetadataItemFSNameKey, text)
+    let terms = FileNameSearchMatcher.terms(text)
+    query.predicate = NSCompoundPredicate(
+      andPredicateWithSubpredicates: terms.map { term in
+        NSCompoundPredicate(
+          orPredicateWithSubpredicates: FileNameSearchMatcher.spotlightVariants(for: term).map { variant in
+            NSPredicate(format: "%K CONTAINS[cd] %@", NSMetadataItemFSNameKey, variant)
+          }
+        )
+      }
+    )
     query.sortDescriptors = [
       NSSortDescriptor(
         key: NSMetadataItemFSNameKey,

@@ -75,7 +75,7 @@ private struct SearchResultsHeader: View {
     .foregroundStyle(.secondary)
     .padding(.horizontal, 13)
     .frame(height: 28)
-    .background(.bar)
+    .nafiChromeBackground(.bar)
   }
 
   private func sortButton(_ title: String, sort: FileSort) -> some View {

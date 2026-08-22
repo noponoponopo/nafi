@@ -252,6 +252,27 @@ final class RobustnessTests: XCTestCase {
   }
 
   @MainActor
+  func testTogglingSelectionMaintainsPrimaryDragURL() {
+    let firstURL = URL(fileURLWithPath: "/tmp/first.txt")
+    let secondURL = URL(fileURLWithPath: "/tmp/second.txt")
+    let addedURL = URL(fileURLWithPath: "/tmp/added.txt")
+    let selection = FileSelectionController()
+
+    selection.replace(with: [firstURL, secondURL], primary: firstURL)
+    selection.toggle(addedURL)
+
+    XCTAssertEqual(selection.primaryURL, addedURL)
+    XCTAssertEqual(selection.dragURLs.first, addedURL)
+    XCTAssertEqual(Set(selection.dragURLs), [firstURL, secondURL, addedURL])
+
+    selection.toggle(addedURL)
+
+    XCTAssertNotNil(selection.primaryURL)
+    XCTAssertEqual(selection.dragURLs.first, selection.primaryURL)
+    XCTAssertEqual(Set(selection.dragURLs), [firstURL, secondURL])
+  }
+
+  @MainActor
   func testNewlySplitPaneCanBeClosedDirectly() {
     let workspace = WorkspaceModel(
       initialURL: FileManager.default.temporaryDirectory,
@@ -378,5 +399,25 @@ final class RobustnessTests: XCTestCase {
         XCTFail("Unexpected error: \(error)")
       }
     }
+  }
+}
+
+extension RobustnessTests {
+  func testFileNameSearchUsesANDTermsAndJapaneseWidthFolding() {
+    let terms = FileNameSearchMatcher.terms(" Report   ２０２６ ")
+    XCTAssertEqual(terms, ["report", "2026"])
+    XCTAssertEqual(Set(FileNameSearchMatcher.spotlightVariants(for: "2026")), Set(["2026", "２０２６"]))
+    XCTAssertTrue(
+      FileNameSearchMatcher.matches(
+        normalizedCandidate: FileNameSearchMatcher.normalize("2026_Final_REPORT.pdf"),
+        terms: terms
+      )
+    )
+    XCTAssertFalse(
+      FileNameSearchMatcher.matches(
+        normalizedCandidate: FileNameSearchMatcher.normalize("report-2025.pdf"),
+        terms: terms
+      )
+    )
   }
 }

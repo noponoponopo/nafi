@@ -14,9 +14,12 @@ struct FPIdentifierCodec {
 
   private static let prefix = "nafi."
   private static let maximumPayloadBytes = 64 * 1024
-  private static let maximumPathBytes = 32 * 1024
+  // PATH_MAX on macOS is 1024 bytes; a deeper remote path cannot materialize
+  // inside FPFS anyway, and oversized identifiers are what turn a pathological
+  // traversal (e.g. /proc/thread-self/root/proc/...) into unbounded daemon churn.
+  private static let maximumPathBytes = 1_024
   private static let maximumIdentityBytes = 16 * 1024
-  private static let maximumComponents = 1_024
+  private static let maximumComponents = 256
 
   static func identifier(
     for path: String,

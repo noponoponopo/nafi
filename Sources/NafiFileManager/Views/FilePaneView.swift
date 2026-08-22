@@ -176,7 +176,7 @@ private struct FilePaneStatusBar: View {
     .foregroundStyle(.secondary)
     .padding(.horizontal, 10)
     .frame(height: 24)
-    .background(.bar)
+    .nafiChromeBackground(.bar)
   }
 }
 
@@ -326,7 +326,7 @@ private struct FileListHeader: View {
     .foregroundStyle(.secondary)
     .padding(.horizontal, 13)
     .frame(height: 28)
-    .background(.bar)
+    .nafiChromeBackground(.bar)
   }
 
   private func sortButton(_ title: String, sort: FileSort) -> some View {
@@ -557,6 +557,7 @@ struct FileGalleryView: View {
 
 private struct GalleryPreview: View {
   @EnvironmentObject private var appState: AppState
+  @AppStorage(EnergyPreferenceKey.ultraEfficiency) private var ultraEfficiency = true
   let model: FilePaneModel
   let selectedURL: URL?
 
@@ -564,8 +565,35 @@ private struct GalleryPreview: View {
     ZStack {
       if let selected = model.item(for: selectedURL) {
         VStack(spacing: 0) {
-          EmbeddedQuickLookView(url: selected.url)
+          if ultraEfficiency {
+            VStack(spacing: 14) {
+              Image(nsImage: selected.icon)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(maxWidth: 192, maxHeight: 192)
+                .accessibilityHidden(true)
+
+              Text(selected.name)
+                .font(.headline)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .truncationMode(.middle)
+                .frame(maxWidth: 360)
+
+              Button {
+                model.ensureSelected(selected)
+                model.previewSelected()
+              } label: {
+                Label("Quick Lookを開く", systemImage: "eye")
+              }
+              .buttonStyle(.bordered)
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(24)
+          } else {
+            EmbeddedQuickLookView(url: selected.url)
+              .frame(maxWidth: .infinity, maxHeight: .infinity)
+          }
 
           if QuickEditSupport.isEditable(selected) {
             Divider()
@@ -580,10 +608,19 @@ private struct GalleryPreview: View {
             }
             .padding(.horizontal, 12)
             .frame(height: 46)
-            .background(.bar)
+            .nafiChromeBackground(.bar)
           }
         }
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background {
+          RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(ultraEfficiency ? Color(nsColor: .controlBackgroundColor) : Color.clear)
+            .background {
+              if !ultraEfficiency {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                  .fill(.regularMaterial)
+              }
+            }
+        }
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .padding(18)
       } else {
@@ -634,7 +671,7 @@ private struct GalleryFilmstrip: View {
         }
       }
     }
-    .background(.bar)
+    .nafiChromeBackground(.bar)
   }
 }
 
@@ -686,7 +723,9 @@ final class EmbeddedQuickLookContainer: NSView {
     super.init(frame: frameRect)
 
     guard let preview else { return }
-    preview.autostarts = true
+    // Never auto-play media just because Gallery view is visible. Explicit Quick Look
+    // remains available; this avoids continuous decode/render work while idle.
+    preview.autostarts = false
     preview.wantsLayer = true
     preview.layer?.masksToBounds = true
     preview.autoresizingMask = [.width, .height]

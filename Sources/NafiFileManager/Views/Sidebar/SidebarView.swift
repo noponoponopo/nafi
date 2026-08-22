@@ -45,7 +45,7 @@ struct SidebarView: View {
     .listStyle(.sidebar)
     .scrollContentBackground(.hidden)
     .contentMargins(.trailing, 8, for: .scrollContent)
-    .background(.regularMaterial)
+    .nafiChromeBackground(.sidebar)
     .frame(minWidth: 120, idealWidth: 240)
     .safeAreaInset(edge: .bottom, spacing: 0) {
       SidebarFooter {
@@ -248,7 +248,7 @@ private struct SidebarFooter: View {
     .font(.caption)
     .padding(.horizontal, 12)
     .frame(height: 34)
-    .background(.ultraThinMaterial)
+    .nafiChromeBackground(.footer)
   }
 }
 

@@ -21,17 +21,7 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     let items: [StoredItem]
   }
 
-  private struct StoredItem: Codable {
-    let filename: String
-    let path: String
-    let isDirectory: Bool
-    let size: Int64?
-    let modification: Date?
-    let identityToken: String?
-    let contentFingerprint: String
-    let readOnly: Bool
-    let unavailable: Bool
-  }
+  private typealias StoredItem = FPSnapshotItem
 
   private struct EnumerationCache {
     let generation: UUID
@@ -43,6 +33,7 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
   private let relativePath: String
   private let domain: NSFileProviderDomain
   private let isWorkingSet: Bool
+  private let materializedEnumerator: NSFileProviderEnumerator?
   private let lock = NSLock()
   private var invalidated = false
   private var tasks: [UUID: Task<Void, Never>] = [:]
@@ -51,7 +42,6 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
   private var refreshObserver: NSObjectProtocol?
   private let pageSize = 500
   private let maximumPageTokenBytes = 1_024
-  private static let workingSetAnchor = Data("nafi-working-set".utf8)
 
   init(containerIdentifier: NSFileProviderItemIdentifier, domain: NSFileProviderDomain) throws {
     isWorkingSet = containerIdentifier == .workingSet
@@ -60,14 +50,27 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
       : try FPIdentifierCodec.path(for: containerIdentifier)
     self.containerIdentifier = containerIdentifier
     self.domain = domain
+    if isWorkingSet {
+      guard let manager = NSFileProviderManager(for: domain) else {
+        throw CocoaError(.featureUnsupported)
+      }
+      // Apple requires a replicated provider's working set to contain every
+      // materialized item. Delegate to the system's local materialized-set
+      // enumerator: this is compliant and, importantly, performs zero remote I/O.
+      materializedEnumerator = manager.enumeratorForMaterializedItems()
+    } else {
+      materializedEnumerator = nil
+    }
     super.init()
-    refreshObserver = DistributedNotificationCenter.default().addObserver(
-      forName: fpRefreshRequestNotification,
-      object: domain.identifier.rawValue,
-      queue: nil
-    ) { [weak self] _ in
-      guard let self else { return }
-      self.signalCurrentContainer()
+    if containerIdentifier != .rootContainer && containerIdentifier != .workingSet {
+      refreshObserver = DistributedNotificationCenter.default().addObserver(
+        forName: fpRefreshRequestNotification,
+        object: domain.identifier.rawValue,
+        queue: nil
+      ) { [weak self] _ in
+        guard let self else { return }
+        self.signalCurrentContainer()
+      }
     }
   }
 
@@ -86,6 +89,7 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     enumerationCache = nil
     lock.unlock()
     active.forEach { $0.cancel() }
+    materializedEnumerator?.invalidate()
     if let refreshObserver {
       DistributedNotificationCenter.default().removeObserver(refreshObserver)
       self.refreshObserver = nil
@@ -109,7 +113,11 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     startingAt page: NSFileProviderPage
   ) {
     if isWorkingSet {
-      observer.finishEnumerating(upTo: nil)
+      guard let materializedEnumerator else {
+        observer.finishEnumeratingWithError(CocoaError(.featureUnsupported))
+        return
+      }
+      materializedEnumerator.enumerateItems(for: observer, startingAt: page)
       return
     }
     let token = UUID()
@@ -177,10 +185,11 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     from syncAnchor: NSFileProviderSyncAnchor
   ) {
     if isWorkingSet {
-      observer.finishEnumeratingChanges(
-        upTo: NSFileProviderSyncAnchor(Self.workingSetAnchor),
-        moreComing: false
-      )
+      guard let materializedEnumerator else {
+        observer.finishEnumeratingWithError(CocoaError(.featureUnsupported))
+        return
+      }
+      materializedEnumerator.enumerateChanges?(for: observer, from: syncAnchor)
       return
     }
     let token = UUID()
@@ -215,10 +224,10 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
           guard let old = previousMap[item.itemIdentifier] else { return true }
           return !self.sameVersion(old.itemVersion, item.itemVersion)
         }
-        for chunk in updated.chunked(maximum: 2_000) where !chunk.isEmpty {
+        for chunk in updated.chunked(maximum: 1_000) where !chunk.isEmpty {
           observer.didUpdate(chunk)
         }
-        for chunk in deleted.chunked(maximum: 2_000) where !chunk.isEmpty {
+        for chunk in deleted.chunked(maximum: 1_000) where !chunk.isEmpty {
           observer.didDeleteItems(withIdentifiers: chunk)
         }
 
@@ -237,12 +246,15 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
   func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
     if isWorkingSet {
-      completionHandler(NSFileProviderSyncAnchor(Self.workingSetAnchor))
+      materializedEnumerator?.currentSyncAnchor?(completionHandler: completionHandler)
+      if materializedEnumerator == nil { completionHandler(nil) }
       return
     }
     do {
-      let snapshot = try loadSnapshot()
-      completionHandler(NSFileProviderSyncAnchor(Data(snapshot.generation.uuidString.utf8)))
+      let url = try snapshotURL()
+      let generation = try FPSharedStore.cachedSnapshotGeneration(at: url)
+        ?? loadSnapshot(at: url).generation
+      completionHandler(NSFileProviderSyncAnchor(Data(generation.uuidString.utf8)))
     } catch {
       completionHandler(nil)
     }
@@ -253,7 +265,13 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     let record = try FPSharedStore.domainRecord(for: domain)
     let bridge = FPRcloneBridge(record: record)
     let relative = relativePath
-    let response = try await bridge.call("operations/list", [
+    if FPSharedStore.isMachinePseudoFilesystemPath(relative, record: record) {
+      // The root listing intentionally hides these pseudo-filesystems. Old
+      // daemon rows can still ask for one directly; make that container empty
+      // rather than reopening a symlink-rich Linux tree.
+      return []
+    }
+    var parameters: [String: Any] = [
       "fs": record.fs,
       "remote": try fullPath(relative, record: record),
       "opt": [
@@ -263,7 +281,16 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         "noMimeType": true,
         "metadata": false,
       ],
-    ], timeout: 300)
+    ]
+    // When the domain root resolves to a machine root (remote root, not a
+    // user subtree), Linux pseudo-filesystems are dynamic, meaningless in
+    // Finder, and enormous. macOS crawls every enumerated folder for indexing,
+    // so listing them costs thousands of SFTP round trips per crawl. Hide them
+    // at the machine root only; same-named folders in real subtrees are kept.
+    if try fullPath(relative, record: record).isEmpty {
+      parameters["_filter"] = ["ExcludeRule": ["proc/**", "sys/**", "dev/**"]]
+    }
+    let response = try await bridge.call("operations/list", parameters, timeout: 300)
     guard let list = response["list"] as? [[String: Any]], list.count <= 250_000 else {
       throw FPBridgeError.malformedResponse
     }
@@ -281,20 +308,25 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
       if leftSize != rightSize { return leftSize < rightSize }
       return ((lhs["ModTime"] as? String) ?? "") < ((rhs["ModTime"] as? String) ?? "")
     }
+    let duplicateLocale = Locale(identifier: "en_US_POSIX")
     let grouped = Dictionary(grouping: ordered) { object in
-      duplicateKey((object["Name"] as? String) ?? "")
+      duplicateKey((object["Name"] as? String) ?? "", locale: duplicateLocale)
     }
     var usedPathKeys = Set(grouped.keys)
     var occurrence: [String: Int] = [:]
     var result: [NafiFileProviderItem] = []
     result.reserveCapacity(ordered.count)
 
+    let fractionalDateFormatter = ISO8601DateFormatter()
+    fractionalDateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let standardDateFormatter = ISO8601DateFormatter()
+
     for object in ordered {
       try Task.checkCancellation()
       guard let originalName = object["Name"] as? String, !originalName.isEmpty else {
         throw FPBridgeError.malformedResponse
       }
-      let key = duplicateKey(originalName)
+      let key = duplicateKey(originalName, locale: duplicateLocale)
       let index = occurrence[key, default: 0]
       occurrence[key] = index + 1
       let duplicate = (grouped[key]?.count ?? 0) > 1
@@ -311,7 +343,11 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
           name: displayName,
           isDirectory: object["IsDir"] as? Bool ?? false,
           size: (object["Size"] as? NSNumber)?.int64Value,
-          modTime: parseDate(object["ModTime"] as? String),
+          modTime: parseDate(
+            object["ModTime"] as? String,
+            fractional: fractionalDateFormatter,
+            standard: standardDateFormatter
+          ),
           readOnly: duplicate,
           unavailable: duplicate,
           identityToken: duplicate ? syntheticID : nil,
@@ -321,24 +357,34 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         let safeToken = shortDigest(Data("\(originalName)|\(syntheticID)".utf8))
         var safeName = ".nafi-unavailable-\(safeToken)"
         var attempt = 1
-        while usedPathKeys.contains(duplicateKey(safeName)) {
+        while usedPathKeys.contains(duplicateKey(safeName, locale: duplicateLocale)) {
           safeName = ".nafi-unavailable-\(safeToken)-\(attempt)"
           attempt += 1
           guard attempt <= 10_000 else { throw FPBridgeError.malformedResponse }
         }
-        usedPathKeys.insert(duplicateKey(safeName))
+        usedPathKeys.insert(duplicateKey(safeName, locale: duplicateLocale))
         let safePath = try FPIdentifierCodec.appending(safeName, to: relative)
         result.append(try NafiFileProviderItem(
           path: safePath,
           name: "扱えないリモート名 — \(safeToken)",
           isDirectory: object["IsDir"] as? Bool ?? false,
           size: (object["Size"] as? NSNumber)?.int64Value,
-          modTime: parseDate(object["ModTime"] as? String),
+          modTime: parseDate(
+            object["ModTime"] as? String,
+            fractional: fractionalDateFormatter,
+            standard: standardDateFormatter
+          ),
           readOnly: true,
           unavailable: true,
           identityToken: syntheticID,
           contentFingerprint: fingerprint
         ))
+      } catch FPBridgeError.malformedResponse {
+        // A child whose accumulated path cannot be represented in the codec
+        // (for example one more level into an already pathological depth) is
+        // skipped. Failing the whole folder here would make the daemon retry
+        // the enumeration forever.
+        continue
       }
     }
     return result
@@ -353,10 +399,10 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     return child.isEmpty ? root : "\(root)/\(child)"
   }
 
-  private func duplicateKey(_ value: String) -> String {
+  private func duplicateKey(_ value: String, locale: Locale) -> String {
     value.precomposedStringWithCanonicalMapping.folding(
       options: [.caseInsensitive, .widthInsensitive],
-      locale: Locale(identifier: "en_US_POSIX")
+      locale: locale
     )
   }
 
@@ -369,17 +415,17 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     ].joined(separator: "|")
   }
 
-  private func parseDate(_ value: String?) -> Date? {
+  private func parseDate(
+    _ value: String?,
+    fractional: ISO8601DateFormatter,
+    standard: ISO8601DateFormatter
+  ) -> Date? {
     guard let value, value != "2000-01-01T00:00:00Z" else { return nil }
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+    return fractional.date(from: value) ?? standard.date(from: value)
   }
 
   private func snapshotURL() throws -> URL {
-    let key = Data("\(domain.identifier.rawValue)|\(containerIdentifier.rawValue)".utf8)
-    return try FPSharedStore.snapshotsDirectory()
-      .appendingPathComponent(shortDigest(key, full: true) + ".json")
+    try FPSharedStore.snapshotFileURL(domain: domain, container: containerIdentifier)
   }
 
   private func saveSnapshot(_ items: [NafiFileProviderItem], generation: UUID) throws {
@@ -402,10 +448,16 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     let url = try snapshotURL()
     try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
     try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    FPSharedStore.rememberSnapshotGeneration(generation, at: url)
+    FPSharedStore.cleanupSnapshotsIfNeeded(in: url.deletingLastPathComponent())
+
   }
 
   private func loadSnapshot() throws -> StoredSnapshot {
-    let url = try snapshotURL()
+    try loadSnapshot(at: snapshotURL())
+  }
+
+  private func loadSnapshot(at url: URL) throws -> StoredSnapshot {
     guard FileManager.default.fileExists(atPath: url.path) else {
       throw NSFileProviderError(.syncAnchorExpired)
     }
@@ -418,6 +470,7 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
       guard snapshot.items.count <= 250_000, savedAt.isFinite,
         savedAt > now - 7 * 24 * 60 * 60, savedAt <= now + 24 * 60 * 60
       else { throw FPBridgeError.malformedResponse }
+      FPSharedStore.rememberSnapshotGeneration(snapshot.generation, at: url)
       return snapshot
     } catch {
       try? FileManager.default.removeItem(at: url)
@@ -426,17 +479,7 @@ final class NafiFileProviderEnumerator: NSObject, NSFileProviderEnumerator {
   }
 
   private func restore(_ item: StoredItem) throws -> NafiFileProviderItem {
-    try NafiFileProviderItem(
-      path: item.path,
-      name: item.filename,
-      isDirectory: item.isDirectory,
-      size: item.size,
-      modTime: item.modification,
-      readOnly: item.readOnly,
-      unavailable: item.unavailable,
-      identityToken: item.identityToken,
-      contentFingerprint: item.contentFingerprint
-    )
+    try NafiFileProviderItem(snapshot: item)
   }
 
   private func encodePage(_ token: PageToken) throws -> NSFileProviderPage {

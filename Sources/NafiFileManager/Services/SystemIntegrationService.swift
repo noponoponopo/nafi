@@ -288,7 +288,6 @@ final class SystemIntegrationService: ObservableObject {
     let byID = Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
     let removed = fileProviderRecords.values.filter { byID[$0.id] == nil }
     var changed = false
-    var domainMetadataUpdates: [ServerProfile] = []
     for id in fileProviderProfileIDs {
       guard let profile = byID[id] else { continue }
       let previous = fileProviderRecords[id]
@@ -300,7 +299,6 @@ final class SystemIntegrationService: ObservableObject {
       {
         fileProviderRecords[id] = updated
         changed = true
-        if previous?.displayName != updated.displayName { domainMetadataUpdates.append(profile) }
       }
     }
     if changed {
@@ -308,12 +306,16 @@ final class SystemIntegrationService: ObservableObject {
       catch { errorMessage = "File Provider設定を更新できません。\n\(error.localizedDescription)" }
     }
 
-    for profile in domainMetadataUpdates {
+    // Reconcile every published domain, not only renamed ones. This upgrades
+    // existing Tahoe registrations to supportsStringSearchRequest=true without
+    // asking the user to remove and re-add the File Provider domain.
+    for id in fileProviderProfileIDs {
+      guard let profile = byID[id] else { continue }
       Task {
         do { try await addFileProviderDomain(profile) }
         catch {
           await MainActor.run {
-            self.errorMessage = "File Providerの表示名を更新できません。\n\(error.localizedDescription)"
+            self.errorMessage = "File Providerドメインを更新できません。\n\(error.localizedDescription)"
           }
         }
       }
@@ -374,7 +376,18 @@ final class SystemIntegrationService: ObservableObject {
     let existing = try await registeredFileProviderDomains().first {
       $0.identifier == domain.identifier
     }
+    #if compiler(>=6.2)
+    if #available(macOS 26.0, *) {
+      // Tahoe can ask File Provider directly for remote-only search results.
+      // Older systems continue to expose the working set through Spotlight.
+      domain.supportsStringSearchRequest = true
+      if existing?.displayName == domain.displayName, existing?.supportsStringSearchRequest == true { return }
+    } else if existing?.displayName == domain.displayName {
+      return
+    }
+    #else
     if existing?.displayName == domain.displayName { return }
+    #endif
     // File Provider treats adding the same identifier as a domain metadata
     // update. This is also the standard way to update domain state.
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -422,4 +435,98 @@ final class SystemIntegrationService: ObservableObject {
     }
   }
   #endif
+
+  /// Recovery path for a poisoned fileproviderd database (for example after a
+  /// pathological traversal filled it with junk items). Removes every nafi File
+  /// Provider domain so the daemon drops its per-domain databases, clears the
+  /// regenerable enumeration snapshots, and re-registers the persisted domains.
+  /// Runs from `nafi --repair-file-providers`; the normal app reconcile loop
+  /// republishes records on the next launch regardless.
+  static func repairFileProviderDomains() async {
+    #if canImport(FileProvider)
+    let storeURL = AppStoragePaths.sharedFile(named: "file-provider-domains.json")
+    var records: [FileProviderDomainRecord] = []
+    if let data = try? AppStoragePaths.readRegularFile(at: storeURL, maximumBytes: 4 * 1_024 * 1_024),
+      let decoded = try? JSONDecoder().decode([FileProviderDomainRecord].self, from: data)
+    {
+      records = decoded
+    }
+    guard !records.isEmpty else {
+      print("repair aborted: no persisted File Provider records")
+      return
+    }
+
+    let registered = (try? await registeredFileProviderDomains()) ?? []
+    let prefix = "app.nafi.filemanager.remote."
+    let stale = registered.filter { $0.identifier.rawValue.hasPrefix(prefix) }
+    for domain in stale {
+      try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        NSFileProviderManager.remove(domain) { _ in continuation.resume() }
+      }
+      print("removed domain: \(domain.displayName)")
+    }
+
+    // Delete the stale materialized FPFS tree. After NSFileProviderManager.remove
+    // these are plain directories (not mounts) and keep whatever the daemon
+    // materialized historically — including junk from a poisoned crawl. A
+    // re-added domain that finds them on disk re-imports the old rows
+    // (materialization|itemChangedRem churn), so they must go before re-adding.
+    let cloudStorage = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/CloudStorage", isDirectory: true)
+    if let volumes = try? FileManager.default.contentsOfDirectory(
+      at: cloudStorage, includingPropertiesForKeys: nil
+    ) {
+      let wanted = Set(records.map { "nafi-\($0.displayName)" })
+      for volume in volumes where wanted.contains(volume.lastPathComponent) {
+        try? FileManager.default.removeItem(at: volume)
+        print("removed materialized volume: \(volume.lastPathComponent)")
+      }
+    }
+    let snapshots = AppStoragePaths.sharedDirectory
+      .appendingPathComponent("FileProviderSnapshots", isDirectory: true)
+    if let files = try? FileManager.default.contentsOfDirectory(
+      at: snapshots, includingPropertiesForKeys: nil
+    ) {
+      var removed = 0
+      for file in files where file.pathExtension == "json" {
+        try? FileManager.default.removeItem(at: file)
+        removed += 1
+      }
+      print("removed snapshots: \(removed)")
+    }
+
+    if !stale.isEmpty {
+      try? await Task.sleep(nanoseconds: 5_000_000_000)
+    }
+
+    for record in records {
+      let domain = NSFileProviderDomain(
+        identifier: NSFileProviderDomainIdentifier(
+          rawValue: "app.nafi.filemanager.remote.\(record.id.uuidString.lowercased())"
+        ),
+        displayName: record.displayName
+      )
+      if #available(macOS 26.0, *) {
+        domain.supportsStringSearchRequest = true
+      }
+      try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        NSFileProviderManager.add(domain) { _ in continuation.resume() }
+      }
+      print("re-added domain: \(record.displayName)")
+    }
+    print("repair complete")
+    #else
+    print("File Provider is unavailable on this system")
+    #endif
+  }
+
+  private static func registeredFileProviderDomains() async throws -> [NSFileProviderDomain] {
+    try await withCheckedThrowingContinuation {
+      (continuation: CheckedContinuation<[NSFileProviderDomain], Error>) in
+      NSFileProviderManager.getDomainsWithCompletionHandler { domains, error in
+        if let error { continuation.resume(throwing: error) }
+        else { continuation.resume(returning: domains) }
+      }
+    }
+  }
 }

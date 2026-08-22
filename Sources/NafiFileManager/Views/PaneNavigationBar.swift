@@ -29,7 +29,7 @@ struct PaneNavigationBar: View {
     .controlSize(.small)
     .padding(.horizontal, 9)
     .frame(height: 39)
-    .background(.bar)
+    .nafiChromeBackground(.bar)
   }
 }
 

@@ -107,7 +107,11 @@ final class FilePaneModel: ObservableObject, Identifiable {
   @Published var showHidden: Bool
   @Published var searchText = "" {
     didSet {
-      if searchText != oldValue { scheduleSearch(debounceNanoseconds: 180_000_000) }
+      guard searchText != oldValue else { return }
+      // Recursive search may start Spotlight or a remote metadata catalog build.
+      // A slightly longer debounce coalesces normal typing into one query while
+      // current-folder filtering remains effectively immediate.
+      scheduleSearch(debounceNanoseconds: searchScope.searchesRecursively ? 300_000_000 : 90_000_000)
     }
   }
   @Published var searchScope: FileSearchScope = .currentFolder {
@@ -173,6 +177,21 @@ final class FilePaneModel: ObservableObject, Identifiable {
   private var ignoreFileSystemNotificationsUntil = Date.distantPast
   private var pendingSelectionURL: URL?
 
+  /// A completed recursive search can answer a stricter follow-up query without
+  /// touching Spotlight, the filesystem, or the remote catalog again. This is
+  /// only safe when the previous result was complete (not capped at 5,000).
+  private struct RecursiveSearchSnapshot {
+    let queryTerms: [String]
+    let directory: URL
+    let scope: FileSearchScope
+    let showHidden: Bool
+    let filter: FileSearchFilter
+    let rootURL: URL
+    let items: [FileItem]
+    let didReachLimit: Bool
+  }
+  private var recursiveSearchSnapshot: RecursiveSearchSnapshot?
+
   init(id: UUID = UUID(), initialURL: URL, showHidden: Bool = false, viewMode: FileViewMode = .list)
   {
     self.id = id
@@ -191,6 +210,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
                 || NafiURL.isDescendant(root, of: $0)
             })
           {
+            self.recursiveSearchSnapshot = nil
             self.scheduleSearch(debounceNanoseconds: 130_000_000)
             return
           }
@@ -236,6 +256,24 @@ final class FilePaneModel: ObservableObject, Identifiable {
 
   var searchDescription: String {
     "\(searchScope.label)・\(searchFilter.summary)"
+  }
+
+  var canRefreshSearchIndex: Bool { isRecursiveSearchActive && isRemote }
+
+  func refreshSearchIndex() {
+    guard isRecursiveSearchActive else { return }
+    recursiveSearchSnapshot = nil
+    let directory = currentURL
+    let query = searchText
+    Task { [weak self] in
+      if let profileID = NafiURL.profileID(in: directory),
+        let session = try? await RemoteFileSystemRegistry.shared.session(for: profileID)
+      {
+        await session.invalidateSearchCache()
+      }
+      guard let self, NafiURL.sameLocation(self.currentURL, directory), self.searchText == query else { return }
+      self.scheduleSearch()
+    }
   }
 
   func searchLocationLabel(for item: FileItem) -> String {
@@ -444,6 +482,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
     searchTask?.cancel()
     allItems.removeAll(keepingCapacity: true)
     searchItems.removeAll(keepingCapacity: true)
+    recursiveSearchSnapshot = nil
     searchRootURL = nil
     searchDidReachLimit = false
     itemLookup.removeAll(keepingCapacity: true)
@@ -1183,10 +1222,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
     sort: FileSort,
     descending: Bool
   ) -> [FileItem] {
-    let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).folding(
-      options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
-      locale: Locale(identifier: "ja_JP")
-    )
+    let searchTerms = FileNameSearchMatcher.terms(query)
 
     var directories: [FileItem] = []
     var files: [FileItem] = []
@@ -1194,8 +1230,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
     files.reserveCapacity(items.count)
 
     for item in items
-    where (normalizedQuery.isEmpty || item.normalizedName.contains(normalizedQuery))
-      && (normalizedQuery.isEmpty || filter.matches(item))
+    where (searchTerms.isEmpty || FileNameSearchMatcher.matches(normalizedCandidate: item.normalizedName, terms: searchTerms))
+      && (searchTerms.isEmpty || filter.matches(item))
     {
       if item.isDirectory {
         directories.append(item)
@@ -1285,6 +1321,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       isSearchLoading = false
       updateLoadingState()
       searchItems.removeAll(keepingCapacity: true)
+      recursiveSearchSnapshot = nil
       searchRootURL = nil
       searchDidReachLimit = false
       rebuildItemLookup(using: allItems)
@@ -1297,6 +1334,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       isSearchLoading = false
       updateLoadingState()
       searchItems.removeAll(keepingCapacity: true)
+      recursiveSearchSnapshot = nil
       searchRootURL = nil
       searchDidReachLimit = false
       rebuildItemLookup(using: allItems)
@@ -1310,6 +1348,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
     let scope = searchScope
     let showHidden = showHidden
     let filter = searchFilter
+    let terms = FileNameSearchMatcher.terms(query)
+    let previousSnapshot = recursiveSearchSnapshot
     let token = UUID()
     searchToken = token
     isSearchLoading = true
@@ -1322,18 +1362,36 @@ final class FilePaneModel: ObservableObject, Identifiable {
       guard !Task.isCancelled else { return }
 
       let result: Result<FileSearchResult, Error>
-      do {
+      if let snapshot = previousSnapshot,
+        !snapshot.didReachLimit,
+        NafiURL.sameLocation(snapshot.directory, directory),
+        snapshot.scope == scope,
+        snapshot.showHidden == showHidden,
+        snapshot.filter == filter,
+        Self.isSearchRefinement(from: snapshot.queryTerms, to: terms)
+      {
+        // A stricter AND/sub-string query can only remove items. Once a prior
+        // result is known complete, filter that small result set directly.
+        let refined = snapshot.items.filter {
+          FileNameSearchMatcher.matches(normalizedCandidate: $0.normalizedName, terms: terms)
+        }
         result = .success(
-          try await FileSearchService.search(
-            query: query,
-            from: directory,
-            scope: scope,
-            showHidden: showHidden,
-            filter: filter
-          )
+          FileSearchResult(items: refined, rootURL: snapshot.rootURL, didReachLimit: false)
         )
-      } catch {
-        result = .failure(error)
+      } else {
+        do {
+          result = .success(
+            try await FileSearchService.search(
+              query: query,
+              from: directory,
+              scope: scope,
+              showHidden: showHidden,
+              filter: filter
+            )
+          )
+        } catch {
+          result = .failure(error)
+        }
       }
 
       guard let self, !Task.isCancelled, self.searchToken == token,
@@ -1347,6 +1405,7 @@ final class FilePaneModel: ObservableObject, Identifiable {
       case .failure(let error):
         if error is CancellationError { return }
         self.searchItems = []
+        self.recursiveSearchSnapshot = nil
         self.searchRootURL = nil
         self.searchDidReachLimit = false
         self.rebuildItemLookup(using: [])
@@ -1355,6 +1414,16 @@ final class FilePaneModel: ObservableObject, Identifiable {
         self.errorMessage = error.localizedDescription
       case .success(let searchResult):
         self.searchItems = searchResult.items
+        self.recursiveSearchSnapshot = RecursiveSearchSnapshot(
+          queryTerms: terms,
+          directory: directory,
+          scope: scope,
+          showHidden: showHidden,
+          filter: filter,
+          rootURL: searchResult.rootURL,
+          items: searchResult.items,
+          didReachLimit: searchResult.didReachLimit
+        )
         self.searchRootURL = searchResult.rootURL
         self.searchDidReachLimit = searchResult.didReachLimit
         self.rebuildItemLookup(using: searchResult.items)
@@ -1363,6 +1432,15 @@ final class FilePaneModel: ObservableObject, Identifiable {
         self.selectionController.retain(Set(searchResult.items.map(\.url)))
         self.errorMessage = nil
       }
+    }
+  }
+
+  private static func isSearchRefinement(from oldTerms: [String], to newTerms: [String]) -> Bool {
+    guard !oldTerms.isEmpty, !newTerms.isEmpty else { return false }
+    // If every old substring is contained by at least one new substring, every
+    // new match necessarily belongs to the old result set. Term order is free.
+    return oldTerms.allSatisfy { oldTerm in
+      newTerms.contains { newTerm in newTerm.contains(oldTerm) }
     }
   }
 

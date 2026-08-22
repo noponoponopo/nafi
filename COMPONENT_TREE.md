@@ -92,11 +92,14 @@ PaneSearchControl
 └─ FilePaneModel
    ├─ current-folder query → in-memory arrange/filter
    └─ recursive or storage-wide query → FileSearchService
-      ├─ local root → detached FileManager enumerator
-      └─ remote root → UnifiedFileSystemService → RemoteServerSession
+      ├─ local root → one-shot Spotlight (NSMetadataQuery)
+      │  └─ unindexed/timeout fallback → detached FileManager enumerator
+      └─ remote root → RemoteServerSession.recursiveCatalog
+         ├─ one metadata-only recursive rclone listing on cache miss
+         └─ short-lived normalized-name catalog on repeat queries
 ```
 
-`FileSearchFilter` is a value object shared by the in-memory and recursive search paths. It keeps folder-only, content-kind, and extension-group behavior consistent. Recursive results are flat rows with parent-location labels so duplicate names remain distinguishable. The result limit is `FileSearchService.resultLimit`, currently 5,000.
+`FileSearchFilter` is a value object shared by the in-memory and recursive search paths. It keeps folder-only, content-kind, and extension-group behavior consistent. Query tokens are normalized and ANDed, including case/diacritic/full-width differences. When a previous recursive result is complete and the next query only narrows it, `FilePaneModel` filters that result directly without re-querying Spotlight or rescanning the remote catalog. Recursive results are flat rows with parent-location labels so duplicate names remain distinguishable. The result limit is `FileSearchService.resultLimit`, currently 5,000. See `SEARCH_ARCHITECTURE.md` for remote/Finder search behavior and energy invariants.
 
 ## File-operation data flow
 
@@ -155,4 +158,6 @@ Other macOS app / Finder
       └─ private local transfer directory → macOS File Provider materialization
 ```
 
-The containing app is not sandboxed and publishes records and the expiring RC descriptor directly into the File Provider extension container. The extension needs only its own sandbox container and loopback network access, so local builds do not depend on a provisioned App Group. Existing App Group records are migrated once. A new domain's macOS working-set request is rooted at the remote root before normal folder enumeration begins. Point lookups and version checks use operations/stat so a save/delete does not enumerate a large parent directory. File fetches use operations/copyfile for a single object and retain the parent-rooted exact-filter fallback only for the known read-only Box metadata failure. Manual refresh signals the root and working set without enabling periodic polling.
+The containing app is not sandboxed and publishes records and the expiring RC descriptor directly into the File Provider extension container. The extension needs only its own sandbox container and loopback network access, so local builds do not depend on a provisioned App Group. Existing App Group records are migrated once. A new domain's macOS working-set request is rooted at the remote root before normal folder enumeration begins. Point lookups and version checks use operations/stat so a save/delete does not enumerate a large parent directory. File fetches use operations/copyfile for a single object and retain the parent-rooted exact-filter fallback only for the known read-only Box metadata failure. Manual refresh signals the root and working set without enabling periodic polling. Folder enumeration shares one process-local loopback URLSession capped at eight concurrent RC connections. Sync-anchor reads reuse cached snapshot generations, and snapshot cleanup runs only after writes with a 15-minute minimum interval.
+
+Path identifiers are capped at macOS PATH_MAX (1024 bytes, 256 components); a child whose path would exceed the cap is skipped instead of failing the folder, and an identifier that no longer decodes is reported as noSuchItem so fileproviderd prunes the row instead of retrying. Because operations/stat resolves symlinks server-side, a child's recorded classification in its parent's enumeration snapshot is authoritative: item(for:) and enumerator(for:) never upgrade a recorded non-directory to a folder, which is what stops /proc/thread-self/root-style symlink-cycle descents when a domain root resolves to a Linux machine root. Machine-root proc/sys/dev paths are also rejected for stale direct container requests, not only hidden from the fresh root listing. The Finder search catalog excludes the proc/sys/dev pseudo-filesystems and is capped at 250,000 entries, matching the app-side recursive search catalog. `nafi --repair-file-providers` removes and re-adds the owning domains and clears materialized/snapshot caches when fileproviderd has already retained poisoned state.

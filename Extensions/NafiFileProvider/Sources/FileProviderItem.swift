@@ -17,6 +17,7 @@ final class NafiFileProviderItem: NSObject, NSFileProviderItem {
   let isDirectory: Bool
   let identityToken: String?
   let contentFingerprint: String
+  var lastUsedDate: Date? { nil }
 
   init(
     path: String,
@@ -54,10 +55,16 @@ final class NafiFileProviderItem: NSObject, NSFileProviderItem {
 
     var allowed: NSFileProviderItemCapabilities = unavailable ? [] : [.allowsReading]
     if isRoot && !unavailable {
-      allowed = [.allowsReading, .allowsAddingSubItems]
+      allowed = [.allowsReading, .allowsAddingSubItems, .allowsContentEnumerating]
     } else if !readOnly && !unavailable {
       allowed.formUnion([.allowsWriting, .allowsRenaming, .allowsReparenting, .allowsDeleting, .allowsTrashing])
-      if isDirectory { allowed.insert(.allowsAddingSubItems) }
+      if isDirectory {
+        allowed.formUnion([.allowsAddingSubItems, .allowsContentEnumerating])
+      }
+    } else if isDirectory && !unavailable {
+      // Read-only folders still need to advertise that Finder may enumerate
+      // their contents. Omitting this creates contradictory metadata.
+      allowed.insert(.allowsContentEnumerating)
     }
     capabilities = allowed
 
@@ -74,6 +81,20 @@ final class NafiFileProviderItem: NSObject, NSFileProviderItem {
       metadataVersion: Data(metadataToken.utf8)
     )
     super.init()
+  }
+
+  convenience init(snapshot item: FPSnapshotItem) throws {
+    try self.init(
+      path: item.path,
+      name: item.filename,
+      isDirectory: item.isDirectory,
+      size: item.size,
+      modTime: item.modification,
+      readOnly: item.readOnly,
+      unavailable: item.unavailable,
+      identityToken: item.identityToken,
+      contentFingerprint: item.contentFingerprint
+    )
   }
 
   static func root(displayName: String) throws -> NafiFileProviderItem {
@@ -98,3 +119,7 @@ final class NafiFileProviderItem: NSObject, NSFileProviderItem {
     return item
   }
 }
+#if compiler(>=6.2)
+@available(macOS 26.0, *)
+extension NafiFileProviderItem: NSFileProviderSearchResult {}
+#endif

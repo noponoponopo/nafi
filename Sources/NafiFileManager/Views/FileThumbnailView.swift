@@ -12,6 +12,7 @@ struct FileThumbnailView: View {
   @AppStorage(ThumbnailPreferenceKey.localVideos) private var localVideos = true
   @AppStorage(ThumbnailPreferenceKey.remoteImages) private var remoteImages = false
   @AppStorage(ThumbnailPreferenceKey.remoteVideos) private var remoteVideos = false
+  @AppStorage(EnergyPreferenceKey.ultraEfficiency) private var ultraEfficiency = true
 
   @State private var thumbnail: NSImage?
 
@@ -57,6 +58,9 @@ struct FileThumbnailView: View {
 
   private var thumbnailsEnabled: Bool {
     guard let kind = item.thumbnailMediaKind else { return false }
+    if NafiEnergyPolicy.suppressAutomaticThumbnail(ultraEfficiency: ultraEfficiency) {
+      return false
+    }
     let isRemote = NafiURL.isRemote(item.url)
     switch (isRemote, kind) {
     case (false, .image): return localImages

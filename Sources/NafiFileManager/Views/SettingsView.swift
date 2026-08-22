@@ -4,6 +4,7 @@ struct SettingsView: View {
   @EnvironmentObject private var appState: AppState
   @AppStorage("Nafi.defaultShowHidden") private var defaultShowHidden = false
   @AppStorage("Nafi.defaultViewMode") private var defaultViewMode = FileViewMode.list.rawValue
+  @AppStorage(EnergyPreferenceKey.ultraEfficiency) private var ultraEfficiency = true
   @AppStorage(ThumbnailPreferenceKey.localImages) private var localImageThumbnails = true
   @AppStorage(ThumbnailPreferenceKey.localVideos) private var localVideoThumbnails = true
   @AppStorage(ThumbnailPreferenceKey.remoteImages) private var remoteImageThumbnails = false
@@ -62,6 +63,13 @@ struct SettingsView: View {
             appState.activeModel.viewMode = mode
           }
         }
+      }
+
+      Section("省電力") {
+        Toggle("超省電力モード", isOn: $ultraEfficiency)
+        Text("オンでは、メイン画面のライブぼかしを静的なシステム色へ置き換え、すべての自動サムネイルと埋め込みQuick Lookを止めます。ファイルを開く操作・手動Quick Look・手動更新は制限しません。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
       }
 
       Section("サムネイル") {

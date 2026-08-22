@@ -64,7 +64,7 @@ struct FileInspectorView: View {
         Spacer()
       }
       .padding(20)
-      .background(.bar)
+      .nafiChromeBackground(.bar)
 
       Form {
         Section("一般") {

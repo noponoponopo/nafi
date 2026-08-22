@@ -125,7 +125,7 @@ struct DropStackView: View {
       .foregroundStyle(.secondary)
       .padding(.horizontal, 13)
       .frame(height: 28)
-      .background(.bar)
+      .nafiChromeBackground(.bar)
       Divider()
       ScrollView {
         if !isAtRoot && isLoadingFolder {
@@ -243,7 +243,7 @@ struct DropStackView: View {
       }
       .frame(height: 122)
       .fixedSize(horizontal: false, vertical: true)
-      .background(.bar)
+      .nafiChromeBackground(.bar)
     }
   }
 

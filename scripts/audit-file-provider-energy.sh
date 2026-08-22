@@ -15,7 +15,7 @@ fi
 pass "point lookups use operations/stat"
 
 # Normal directory enumeration intentionally avoids hashes; content is fetched lazily.
-if ! grep -A12 'bridge.call("operations/list"' "$EXT/FileProviderEnumerator.swift" | grep -q '"showHash": false'; then
+if ! sed -n '/private func listItems()/,/guard let list/p' "$EXT/FileProviderEnumerator.swift" | grep -q '"showHash": false'; then
   fail "directory enumeration unexpectedly requests hashes"
 fi
 pass "directory enumeration does not request hashes"
@@ -43,5 +43,21 @@ if grep -R -n -E 'scheduledTimer|Timer\.publish|DispatchSource\.makeTimerSource'
   fail "clock-driven polling found in File Provider extension"
 fi
 pass "no File Provider timer polling"
+
+# File Provider requests share a bounded loopback session instead of creating
+# one connection pool per bridge instance.
+if ! grep -q 'httpMaximumConnectionsPerHost = 8' "$EXT/RcloneBridge.swift"; then
+  fail "File Provider RC connection cap missing"
+fi
+pass "File Provider RC connections are capped"
+
+# Sync-anchor reads must not rescan or decode the full snapshot on every call.
+if ! grep -q 'cachedSnapshotGeneration' "$EXT/FileProviderEnumerator.swift"; then
+  fail "snapshot generation cache missing"
+fi
+if ! grep -q 'cleanupSnapshotsIfNeeded' "$EXT/FileProviderEnumerator.swift"; then
+  fail "snapshot cleanup is not write-triggered"
+fi
+pass "snapshot anchor and cleanup work are bounded"
 
 echo "File Provider energy invariants passed."

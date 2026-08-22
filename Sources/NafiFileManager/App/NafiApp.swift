@@ -5,6 +5,18 @@ struct NafiApp: App {
   @NSApplicationDelegateAdaptor(NafiAppDelegate.self) private var appDelegate
   @StateObject private var appState = AppState()
 
+  init() {
+    // CLI recovery path: rebuild nafi's File Provider domains from scratch.
+    // Used when fileproviderd's database is poisoned (endless item churn) and
+    // needs a domain removal + re-add cycle that only the owning app may run.
+    if ProcessInfo.processInfo.arguments.contains("--repair-file-providers") {
+      Task {
+        await SystemIntegrationService.repairFileProviderDomains()
+        exit(0)
+      }
+    }
+  }
+
   var body: some Scene {
     Window("nafi", id: "browser") {
       RootView(request: nil)

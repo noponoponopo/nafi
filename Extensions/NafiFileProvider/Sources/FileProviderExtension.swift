@@ -70,8 +70,21 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
           return
         }
         let relative = try usableIdentifier(identifier).path
-        guard let value = try await statIfExists(relative, record: record, bridge: bridge, strongVersion: false) else {
+        if FPSharedStore.isMachinePseudoFilesystemPath(relative, record: record) {
           throw FPBridgeError.noSuchItem
+        }
+        guard var value = try await statIfExists(relative, record: record, bridge: bridge, strongVersion: false) else {
+          throw FPBridgeError.noSuchItem
+        }
+        if value.isDirectory,
+          let recorded = FPSharedStore.recordedChild(relative, domain: domain),
+          !recorded.isDirectory
+        {
+          // operations/stat resolves symlinks server-side, so a symlink child of
+          // an enumerated folder would be reclassified as a directory here and
+          // invite endless descent through /proc/thread-self/root/… cycles. The
+          // parent enumeration's listing is authoritative for classification.
+          value = try NafiFileProviderItem(snapshot: recorded)
         }
         progress.completedUnitCount = 1
         completionHandler(value, nil)
@@ -387,11 +400,41 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
     return progress
   }
 
+  func materializedItemsDidChange(completionHandler: @escaping () -> Void) {
+    // The working set mirrors the system's materialized set locally. Signal only
+    // when macOS says that set actually changed; no timer and no rclone call.
+    guard let manager = NSFileProviderManager(for: domain) else {
+      completionHandler()
+      return
+    }
+    manager.signalEnumerator(for: .workingSet) { _ in completionHandler() }
+  }
+
   func enumerator(
     for containerItemIdentifier: NSFileProviderItemIdentifier,
     request: NSFileProviderRequest
   ) throws -> NSFileProviderEnumerator {
     do {
+      if containerItemIdentifier != .rootContainer, containerItemIdentifier != .workingSet {
+        let path: String
+        do {
+          path = try FPIdentifierCodec.path(for: containerItemIdentifier)
+        } catch {
+          // Same reasoning as usableIdentifier: an undecodable identifier must
+          // prune, not surface as a retriable server failure.
+          throw FPBridgeError.noSuchItem
+        }
+        let record = try FPSharedStore.domainRecord(for: domain)
+        if FPSharedStore.isMachinePseudoFilesystemPath(path, record: record) {
+          throw FPBridgeError.noSuchItem
+        }
+        if let recorded = FPSharedStore.recordedChild(path, domain: domain), !recorded.isDirectory {
+          // The parent enumeration recorded this child as a non-directory (for
+          // example a symlink). Refuse to enumerate it even if a stat-follow
+          // point lookup once reported it as a folder.
+          throw FPBridgeError.noSuchItem
+        }
+      }
       return try NafiFileProviderEnumerator(
         containerIdentifier: containerItemIdentifier,
         domain: domain
@@ -404,7 +447,16 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
   private func usableIdentifier(
     _ identifier: NSFileProviderItemIdentifier
   ) throws -> FPIdentifierCodec.Decoded {
-    let decoded = try FPIdentifierCodec.decode(identifier)
+    let decoded: FPIdentifierCodec.Decoded
+    do {
+      decoded = try FPIdentifierCodec.decode(identifier)
+    } catch {
+      // A structurally invalid identifier (for example a path that outgrew the
+      // codec's caps during a pathological traversal) is cached daemon state,
+      // not a server fault. Reporting it missing lets fileproviderd prune the
+      // row; mapping it to serverUnreachable would retry forever.
+      throw FPBridgeError.noSuchItem
+    }
     guard decoded.identity == nil else {
       // Generic rclone path APIs cannot select one member of a duplicate-name
       // set reliably. Keep it visible but never mutate an arbitrary sibling.
@@ -1286,6 +1338,11 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
   }
 
   private func signal(parent: String) {
+    #if compiler(>=6.2)
+    if let record = try? FPSharedStore.domainRecord(for: domain) {
+      Task { await FPRemoteSearchCatalogCache.shared.invalidate(domainID: record.id) }
+    }
+    #endif
     guard let manager = NSFileProviderManager(for: domain) else { return }
     let parentIdentifier = (try? FPIdentifierCodec.identifier(for: parent)) ?? .rootContainer
     manager.signalEnumerator(for: parentIdentifier) { _ in }
@@ -1304,3 +1361,321 @@ final class NafiFileProviderExtension: NSObject, NSFileProviderReplicatedExtensi
     return (error as? FPBridgeError)?.fileProviderError ?? error
   }
 }
+
+#if compiler(>=6.2)
+private struct FPRemoteSearchEntry: Sendable {
+  let path: String
+  let name: String
+  var displayName: String
+  var identityToken: String?
+  var isDuplicate: Bool
+  let isDirectory: Bool
+  let size: Int64?
+  let modTime: Date?
+  let backendID: String?
+  let normalizedName: String
+
+  var fingerprint: String {
+    [String(size ?? -1), modTime.map { String($0.timeIntervalSinceReferenceDate) } ?? "", String(isDirectory)]
+      .joined(separator: "|")
+  }
+}
+
+private actor FPRemoteSearchCatalogCache {
+  static let shared = FPRemoteSearchCatalogCache()
+
+  private struct Cached {
+    let loadedAt: Date
+    let revision: UUID?
+    let rootPath: String
+    let entries: [FPRemoteSearchEntry]
+  }
+
+  private var values: [UUID: Cached] = [:]
+  private var loading: [UUID: Task<[FPRemoteSearchEntry], Error>] = [:]
+  private let lifetime: TimeInterval = 2 * 60
+
+  func invalidate(domainID: UUID) {
+    values[domainID] = nil
+    loading[domainID]?.cancel()
+    loading[domainID] = nil
+  }
+
+  private static func normalizeName(_ value: String) -> String {
+    value.folding(
+      options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+      locale: Locale(identifier: "ja_JP")
+    )
+  }
+
+  private static func duplicateKey(_ value: String) -> String {
+    value.precomposedStringWithCanonicalMapping.folding(
+      options: [.caseInsensitive, .widthInsensitive],
+      locale: Locale(identifier: "en_US_POSIX")
+    )
+  }
+
+  func entries(record: FPDomainRecord, bridge: FPRcloneBridge) async throws -> [FPRemoteSearchEntry] {
+    if let cached = values[record.id],
+      cached.revision == record.configurationRevision,
+      cached.rootPath == record.rootPath,
+      Date().timeIntervalSince(cached.loadedAt) <= lifetime
+    {
+      return cached.entries
+    }
+    if let current = loading[record.id] { return try await current.value }
+
+    let task = Task<[FPRemoteSearchEntry], Error> {
+      let root = record.rootPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+      if !root.isEmpty, FPSharedStore.isLinuxPseudoFilesystemPath(root) {
+        throw FPBridgeError.remote("Linuxの擬似ファイルシステムは再帰検索の対象外です。")
+      }
+      var parameters: [String: Any] = [
+        "fs": record.fs,
+        "remote": root,
+        "opt": [
+          "recurse": true,
+          "showHash": false,
+          "noMimeType": true,
+          "metadata": false,
+        ],
+      ]
+      // When the domain root resolves to a machine root, Linux pseudo-
+      // filesystems are pure noise in Finder search and enormous. Scoped to
+      // that case so a real folder named "proc" in a user subtree stays
+      // searchable. rclone's recursive walk never follows symlinks, so these
+      // rules only skip real trees.
+      if root.isEmpty {
+        parameters["_filter"] = ["ExcludeRule": ["proc/**", "sys/**", "dev/**"]]
+      }
+      let response = try await bridge.call("operations/list", parameters, timeout: 300)
+      guard let raw = response["list"] as? [[String: Any]], raw.count <= 250_000 else {
+        throw FPBridgeError.malformedResponse
+      }
+      var result: [FPRemoteSearchEntry] = []
+      result.reserveCapacity(raw.count)
+      // Reuse formatters across the entire recursive response. Constructing two
+      // ISO8601 formatters per remote entry is disproportionately expensive on a
+      // six-figure catalog and provides no search-quality benefit.
+      let fractionalDateFormatter = ISO8601DateFormatter()
+      fractionalDateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      let standardDateFormatter = ISO8601DateFormatter()
+      for object in raw {
+        try Task.checkCancellation()
+        let rawPath = (object["Path"] as? String) ?? (object["Name"] as? String) ?? ""
+        guard !rawPath.isEmpty,
+          let path = try? FPIdentifierCodec.validatedPath(rawPath),
+          let name = try? FPIdentifierCodec.validatedName((object["Name"] as? String) ?? (path as NSString).lastPathComponent)
+        else { continue }
+        let size = (object["Size"] as? NSNumber)?.int64Value
+        let modTime: Date? = {
+          guard let text = object["ModTime"] as? String, text != "2000-01-01T00:00:00Z" else { return nil }
+          return fractionalDateFormatter.date(from: text) ?? standardDateFormatter.date(from: text)
+        }()
+        result.append(FPRemoteSearchEntry(
+          path: path,
+          name: name,
+          displayName: name,
+          identityToken: nil,
+          isDuplicate: false,
+          isDirectory: object["IsDir"] as? Bool ?? false,
+          size: size,
+          modTime: modTime,
+          backendID: object["ID"] as? String,
+          normalizedName: Self.normalizeName(name)
+        ))
+      }
+
+      // Duplicate detection is catalog metadata, not query work. Compute it once
+      // here so every Finder keystroke does not rebuild an O(N) grouping table.
+      let groups = Dictionary(grouping: result.indices, by: { Self.duplicateKey(result[$0].path) })
+      for indices in groups.values where indices.count > 1 {
+        for (position, index) in indices.enumerated() {
+          result[index].isDuplicate = true
+          result[index].identityToken = result[index].backendID ?? "search:\(position + 1):\(result[index].path)"
+          result[index].displayName = "\(result[index].name) — 重複 \(position + 1)"
+        }
+      }
+      return result
+    }
+    loading[record.id] = task
+    do {
+      let result = try await task.value
+      loading[record.id] = nil
+      values[record.id] = Cached(
+        loadedAt: Date(),
+        revision: record.configurationRevision,
+        rootPath: record.rootPath,
+        entries: result
+      )
+      return result
+    } catch {
+      loading[record.id] = nil
+      throw error
+    }
+  }
+}
+
+@available(macOS 26.0, *)
+private final class NafiFileProviderSearchEnumerator: NSObject, NSFileProviderSearchEnumerator {
+  private let domain: NSFileProviderDomain
+  private let text: String
+  private let requestedLimit: Int
+  private let lock = NSLock()
+  private var invalidated = false
+  private var tasks: [UUID: Task<Void, Never>] = [:]
+
+  init(domain: NSFileProviderDomain, text: String, desiredNumberOfResults: Int) {
+    self.domain = domain
+    self.text = text
+    requestedLimit = max(1, min(desiredNumberOfResults > 0 ? desiredNumberOfResults : 500, 5_000))
+  }
+
+  func invalidate() {
+    lock.lock()
+    invalidated = true
+    let active = Array(tasks.values)
+    tasks.removeAll()
+    lock.unlock()
+    active.forEach { $0.cancel() }
+  }
+
+  func enumerateSearchResults(
+    for observer: any NSFileProviderSearchEnumerationObserver,
+    startingAt page: NSFileProviderPage?
+  ) {
+    let token = UUID()
+    let task = Task { [weak self] in
+      defer { self?.removeTask(token) }
+      guard let self else { return }
+      do {
+        try self.checkActive()
+        let record = try FPSharedStore.domainRecord(for: domain)
+        let entries = try await FPRemoteSearchCatalogCache.shared.entries(
+          record: record,
+          bridge: FPRcloneBridge(record: record)
+        )
+        try Task.checkCancellation()
+
+        let terms = Self.terms(text)
+        guard !terms.isEmpty else {
+          observer.didEnumerate([])
+          observer.finishEnumerating(upTo: nil)
+          return
+        }
+
+        var ranked: [(Int, NafiFileProviderItem)] = []
+        ranked.reserveCapacity(min(entries.count, requestedLimit * 4))
+
+        for entry in entries {
+          try Task.checkCancellation()
+          let normalizedName = entry.normalizedName
+          guard terms.allSatisfy(normalizedName.contains) else { continue }
+          let item = try NafiFileProviderItem(
+            path: entry.path,
+            name: entry.displayName,
+            isDirectory: entry.isDirectory,
+            size: entry.size,
+            modTime: entry.modTime,
+            readOnly: entry.isDuplicate,
+            unavailable: entry.isDuplicate,
+            identityToken: entry.identityToken,
+            contentFingerprint: entry.fingerprint
+          )
+          let rank: Int
+          if normalizedName == terms.joined(separator: " ") { rank = 0 }
+          else if terms.first.map(normalizedName.hasPrefix) == true { rank = 1 }
+          else { rank = 2 }
+          ranked.append((rank, item))
+        }
+
+        ranked.sort {
+          if $0.0 != $1.0 { return $0.0 < $1.0 }
+          return $0.1.filename.localizedStandardCompare($1.1.filename) == .orderedAscending
+        }
+        if ranked.count > requestedLimit { ranked.removeSubrange(requestedLimit...) }
+
+        let start = Self.offset(from: page)
+        guard start <= ranked.count else { throw FPBridgeError.malformedResponse }
+        let observerLimit = observer.maximumNumberOfResultsPerPage
+        guard observerLimit > 0 else {
+          observer.finishEnumerating(upTo: nil)
+          return
+        }
+        let pageSize = min(observerLimit, requestedLimit, 200)
+        let end = min(ranked.count, start + pageSize)
+        let results: [any NSFileProviderSearchResult] = ranked[start..<end].map { $0.1 }
+        observer.didEnumerate(results)
+        if end < ranked.count {
+          observer.finishEnumerating(upTo: Self.page(for: end))
+        } else {
+          observer.finishEnumerating(upTo: nil)
+        }
+      } catch {
+        observer.finishEnumeratingWithError((error as? FPBridgeError)?.fileProviderError ?? error)
+      }
+    }
+    register(task, token: token)
+  }
+
+  private static func normalize(_ value: String) -> String {
+    value.trimmingCharacters(in: .whitespacesAndNewlines).folding(
+      options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+      locale: Locale(identifier: "ja_JP")
+    )
+  }
+
+  private static func terms(_ value: String) -> [String] {
+    normalize(value).split(whereSeparator: { $0.isWhitespace }).map(String.init).filter { !$0.isEmpty }
+  }
+
+  private static func offset(from page: NSFileProviderPage?) -> Int {
+    guard let page else { return 0 }
+    let data = page.rawValue
+    guard data.count == MemoryLayout<UInt64>.size else { return 0 }
+    return data.reduce(0) { ($0 << 8) | Int($1) }
+  }
+
+  private static func page(for offset: Int) -> NSFileProviderPage {
+    var value = UInt64(offset).bigEndian
+    return withUnsafeBytes(of: &value) { NSFileProviderPage(Data($0)) }
+  }
+
+  private func checkActive() throws {
+    try Task.checkCancellation()
+    lock.lock()
+    let stopped = invalidated
+    lock.unlock()
+    if stopped { throw CancellationError() }
+  }
+
+  private func register(_ task: Task<Void, Never>, token: UUID) {
+    lock.lock()
+    if invalidated {
+      lock.unlock()
+      task.cancel()
+      return
+    }
+    tasks[token] = task
+    lock.unlock()
+  }
+
+  private func removeTask(_ token: UUID) {
+    lock.lock()
+    tasks[token] = nil
+    lock.unlock()
+  }
+}
+
+@available(macOS 26.0, *)
+extension NafiFileProviderExtension: NSFileProviderSearching {
+  func searchEnumerator(for request: NSFileProviderStringSearchRequest) -> any NSFileProviderSearchEnumerator {
+    NafiFileProviderSearchEnumerator(
+      domain: domain,
+      text: request.query,
+      desiredNumberOfResults: request.desiredNumberOfResults
+    )
+  }
+}
+
+#endif

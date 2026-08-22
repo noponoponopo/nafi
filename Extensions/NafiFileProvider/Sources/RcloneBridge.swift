@@ -40,25 +40,36 @@ private final class FPNoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unc
     completionHandler(nil)
   }
 }
-
-actor FPRcloneBridge {
-  private var descriptor: FPRuntimeDescriptor?
-  private let record: FPDomainRecord?
+private actor FPURLSessionPool {
+  static let shared = FPURLSessionPool()
   private let session: URLSession
-  private var lastActivitySignal = Date.distantPast
 
-  init(record: FPDomainRecord? = nil) {
-    self.record = record
-    descriptor = try? FPSharedStore.descriptor()
+  init() {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.timeoutIntervalForRequest = 60
     configuration.timeoutIntervalForResource = 24 * 60 * 60
     configuration.urlCache = nil
+    configuration.httpMaximumConnectionsPerHost = 8
     session = URLSession(
       configuration: configuration,
       delegate: FPNoRedirectDelegate(),
       delegateQueue: nil
     )
+  }
+
+  func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+    try await session.data(for: request)
+  }
+}
+
+actor FPRcloneBridge {
+  private var descriptor: FPRuntimeDescriptor?
+  private let record: FPDomainRecord?
+  private var lastActivitySignal = Date.distantPast
+
+  init(record: FPDomainRecord? = nil) {
+    self.record = record
+    descriptor = try? FPSharedStore.descriptor()
   }
 
   func call(_ method: String, _ parameters: [String: Any], timeout: TimeInterval = 120) async throws -> [String: Any] {
@@ -227,8 +238,8 @@ actor FPRcloneBridge {
   }
 
   private func requestRuntime(for record: FPDomainRecord) {
-    DistributedNotificationCenter.default().post(
-      name: fpRuntimeRequestNotification,
+    DistributedNotificationCenter.default().postNotificationName(
+      fpRuntimeRequestNotification,
       object: record.id.uuidString,
       userInfo: nil,
       deliverImmediately: true
@@ -237,10 +248,10 @@ actor FPRcloneBridge {
 
   private func signalActivityIfNeeded(force: Bool = false) {
     let now = Date()
-    guard force || now.timeIntervalSince(lastActivitySignal) >= 20 else { return }
+    guard force || now.timeIntervalSince(lastActivitySignal) >= 30 else { return }
     lastActivitySignal = now
-    DistributedNotificationCenter.default().post(
-      name: fpRuntimeActivityNotification,
+    DistributedNotificationCenter.default().postNotificationName(
+      fpRuntimeActivityNotification,
       object: record?.id.uuidString,
       userInfo: nil,
       deliverImmediately: true
@@ -266,7 +277,7 @@ actor FPRcloneBridge {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     let auth = Data("\(descriptor.username):\(descriptor.password)".utf8).base64EncodedString()
     request.setValue("Basic \(auth)", forHTTPHeaderField: "Authorization")
-    let (data, response) = try await session.data(for: request)
+    let (data, response) = try await FPURLSessionPool.shared.data(for: request)
     guard data.count <= 64 * 1024 * 1024, let http = response as? HTTPURLResponse else {
       throw FPBridgeError.malformedResponse
     }

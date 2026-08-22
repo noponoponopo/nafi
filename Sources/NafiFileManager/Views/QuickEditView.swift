@@ -261,7 +261,7 @@ struct QuickEditView: View {
     }
     .padding(.horizontal, 16)
     .frame(height: 58)
-    .background(.bar)
+    .nafiChromeBackground(.bar)
   }
 
   private var footer: some View {
@@ -298,6 +298,6 @@ struct QuickEditView: View {
     .foregroundStyle(.secondary)
     .padding(.horizontal, 14)
     .frame(height: 44)
-    .background(.bar)
+    .nafiChromeBackground(.bar)
   }
 }

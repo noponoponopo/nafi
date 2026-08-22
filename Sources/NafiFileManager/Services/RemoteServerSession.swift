@@ -3,6 +3,8 @@ import Foundation
 protocol RemoteServerSession: AnyObject, Sendable {
   func listDirectory(at path: String) async throws -> [RemoteFileItem]
   func statItem(at path: String) async throws -> RemoteFileItem?
+  func recursiveCatalog(at path: String) async throws -> [RemoteFileItem]
+  func invalidateSearchCache() async
   func createDirectory(at path: String) async throws
   func renameItem(at oldPath: String, to newPath: String) async throws
   func removeItem(at path: String, isDirectory: Bool) async throws

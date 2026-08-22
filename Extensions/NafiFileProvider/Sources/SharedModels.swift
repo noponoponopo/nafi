@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import FileProvider
 import Foundation
@@ -20,13 +21,29 @@ struct FPRuntimeDescriptor: Codable {
   }
 }
 
-struct FPDomainRecord: Codable {
+struct FPDomainRecord: Codable, Sendable {
   let id: UUID
   let displayName: String
   let fs: String
   let rootPath: String
   let updatedAt: Date
   let configurationRevision: UUID?
+}
+
+
+/// One persisted enumeration-snapshot row. Shared between the enumerator that
+/// writes snapshots and the extension that consults them to keep a child's
+/// recorded type authoritative over server-side stat (which follows symlinks).
+struct FPSnapshotItem: Codable, Sendable {
+  let filename: String
+  let path: String
+  let isDirectory: Bool
+  let size: Int64?
+  let modification: Date?
+  let identityToken: String?
+  let contentFingerprint: String
+  let readOnly: Bool
+  let unavailable: Bool
 }
 
 enum FPRemoteTransactionPhase: String, Codable {
@@ -57,10 +74,35 @@ struct FPRemoteTransactionRecord: Codable {
 }
 
 enum FPSharedStore {
+  static func isLinuxPseudoFilesystemPath(_ path: String) -> Bool {
+    guard let first = path.split(separator: "/", omittingEmptySubsequences: true).first else {
+      return false
+    }
+    return first == "proc" || first == "sys" || first == "dev"
+  }
+
+  static func isMachinePseudoFilesystemPath(
+    _ path: String,
+    record: FPDomainRecord
+  ) -> Bool {
+    let root = record.rootPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    return root.isEmpty && isLinuxPseudoFilesystemPath(path)
+  }
   static var root: URL? {
     FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
       .appendingPathComponent("nafi", isDirectory: true)
   }
+
+  private struct SnapshotGenerationCacheEntry {
+    let modifiedAt: Date?
+    let fileSize: Int64?
+    let generation: UUID
+  }
+
+  private static let snapshotGenerationLock = NSLock()
+  private static var snapshotGenerations: [String: SnapshotGenerationCacheEntry] = [:]
+  private static let snapshotCleanupLock = NSLock()
+  private static var lastSnapshotCleanup = Date.distantPast
 
   static func descriptor() throws -> FPRuntimeDescriptor {
     guard let url = root?.appendingPathComponent("rclone-runtime.json") else {
@@ -128,8 +170,145 @@ enum FPSharedStore {
     guard let root else { throw FPBridgeError.runtimeUnavailable }
     let url = root.appendingPathComponent("FileProviderSnapshots", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-    cleanupSnapshots(in: url)
     return url
+  }
+
+  /// Stable per-container snapshot location, shared by the enumerator that
+  /// writes snapshots and the extension that consults them.
+  static func snapshotFileURL(
+    domain: NSFileProviderDomain,
+    container: NSFileProviderItemIdentifier
+  ) throws -> URL {
+    let key = Data("\(domain.identifier.rawValue)|\(container.rawValue)".utf8)
+    let digest = SHA256.hash(data: key).map { String(format: "%02x", $0) }.joined()
+    return try snapshotsDirectory().appendingPathComponent(digest + ".json")
+  }
+
+  /// Non-destructive read of a child's recorded classification from its parent
+  /// container's snapshot. Server-side stat follows symlinks, so a symlink child
+  /// of an enumerated folder (for example /proc/thread-self) would otherwise be
+  /// reclassified as a directory on every point lookup and invite unbounded
+  /// descent through /proc/thread-self/root/proc/…-style cycles.
+  static func recordedChild(_ childPath: String, domain: NSFileProviderDomain) -> FPSnapshotItem? {
+    let parent = FPIdentifierCodec.parentPath(of: childPath)
+    guard parent != childPath,
+      let parentIdentifier = try? FPIdentifierCodec.identifier(for: parent),
+      let url = try? snapshotFileURL(domain: domain, container: parentIdentifier)
+    else { return nil }
+
+    // Only small parent listings participate. The pathological ancestors
+    // (proc, sys, and ordinary folders) all fit comfortably; a multi-megabyte
+    // snapshot is a giant real directory whose children are real directories.
+    if let snapshot = recordedParentSnapshot(at: url) {
+      return snapshot.items.first { $0.path == childPath }
+    }
+    return nil
+  }
+
+  private static let recordedSnapshotLock = NSLock()
+  private static var recordedSnapshots: [String: RecordedSnapshot] = [:]
+
+  private struct RecordedSnapshot {
+    let modifiedAt: Date?
+    let fileSize: Int64?
+    let savedAt: Date
+    let items: [FPSnapshotItem]
+  }
+
+  private static func recordedParentSnapshot(at url: URL) -> RecordedSnapshot? {
+    struct Envelope: Codable {
+      let savedAt: Date
+      let items: [FPSnapshotItem]
+    }
+
+    let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+    guard let values = try? url.resourceValues(forKeys: keys),
+      let fileSize = values.fileSize
+    else { return nil }
+
+    recordedSnapshotLock.lock()
+    if let cached = recordedSnapshots[url.path],
+      cached.modifiedAt == values.contentModificationDate,
+      cached.fileSize == Int64(fileSize)
+    {
+      recordedSnapshotLock.unlock()
+      return freshOrNull(cached)
+    }
+    // Evict rather than grow: a handful of folders dominate every crawl.
+    if recordedSnapshots.count >= 32 {
+      recordedSnapshots.removeAll(keepingCapacity: true)
+    }
+    recordedSnapshotLock.unlock()
+
+    guard fileSize <= 4 * 1024 * 1024,
+      let data = try? regularFileData(at: url, maximumBytes: 4 * 1024 * 1024),
+      let envelope = try? JSONDecoder().decode(Envelope.self, from: data)
+    else { return nil }
+
+    let snapshot = RecordedSnapshot(
+      modifiedAt: values.contentModificationDate,
+      fileSize: Int64(fileSize),
+      savedAt: envelope.savedAt,
+      items: envelope.items
+    )
+    recordedSnapshotLock.lock()
+    recordedSnapshots[url.path] = snapshot
+    recordedSnapshotLock.unlock()
+    return freshOrNull(snapshot)
+  }
+
+  private static func freshOrNull(_ snapshot: RecordedSnapshot) -> RecordedSnapshot? {
+    let savedAt = snapshot.savedAt.timeIntervalSinceReferenceDate
+    let now = Date().timeIntervalSinceReferenceDate
+    guard savedAt.isFinite,
+      savedAt > now - 24 * 60 * 60,
+      savedAt <= now + 24 * 60 * 60
+    else { return nil }
+    return snapshot
+  }
+
+  static func cachedSnapshotGeneration(at url: URL) -> UUID? {
+    let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+    guard let values = try? url.resourceValues(forKeys: keys),
+      let modifiedAt = values.contentModificationDate,
+      let fileSize = values.fileSize
+    else { return nil }
+
+    snapshotGenerationLock.lock()
+    defer { snapshotGenerationLock.unlock() }
+    guard let cached = snapshotGenerations[url.path],
+      cached.modifiedAt == modifiedAt,
+      cached.fileSize == Int64(fileSize)
+    else { return nil }
+    return cached.generation
+  }
+
+  static func rememberSnapshotGeneration(_ generation: UUID, at url: URL) {
+    let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+    guard let values = try? url.resourceValues(forKeys: keys) else { return }
+
+    snapshotGenerationLock.lock()
+    if snapshotGenerations.count >= 512 {
+      snapshotGenerations.removeAll(keepingCapacity: true)
+    }
+    snapshotGenerations[url.path] = SnapshotGenerationCacheEntry(
+      modifiedAt: values.contentModificationDate,
+      fileSize: values.fileSize.map(Int64.init),
+      generation: generation
+    )
+    snapshotGenerationLock.unlock()
+  }
+
+  static func cleanupSnapshotsIfNeeded(in directory: URL) {
+    snapshotCleanupLock.lock()
+    let now = Date()
+    guard now.timeIntervalSince(lastSnapshotCleanup) >= 15 * 60 else {
+      snapshotCleanupLock.unlock()
+      return
+    }
+    lastSnapshotCleanup = now
+    snapshotCleanupLock.unlock()
+    cleanupSnapshots(in: directory)
   }
 
   static func saveTransaction(_ record: FPRemoteTransactionRecord) throws {
@@ -287,7 +466,7 @@ enum FPSharedStore {
 
   private static func cleanupSnapshots(in directory: URL) {
     let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
-    guard var values = try? FileManager.default.contentsOfDirectory(
+    guard let values = try? FileManager.default.contentsOfDirectory(
       at: directory,
       includingPropertiesForKeys: Array(keys),
       options: [.skipsHiddenFiles]

@@ -11,6 +11,9 @@ struct RemoteFileItem: Identifiable, Hashable, Sendable {
   let hashes: [String: String]
   let metadata: [String: String]
   let ambiguityToken: String?
+  /// Search-normalized once when the remote entry is created so repeated
+  /// keystrokes do not refold every filename in a large recursive catalog.
+  let normalizedName: String
 
   init(
     name: String,
@@ -34,6 +37,10 @@ struct RemoteFileItem: Identifiable, Hashable, Sendable {
     self.hashes = hashes
     self.metadata = metadata
     self.ambiguityToken = ambiguityToken
+    normalizedName = name.folding(
+      options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+      locale: Locale(identifier: "ja_JP")
+    )
   }
 
   var id: String { stableID.map { "id:\($0)" } ?? path }

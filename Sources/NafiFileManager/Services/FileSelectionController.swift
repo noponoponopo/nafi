@@ -35,13 +35,25 @@ final class FileSelectionController: ObservableObject {
   }
 
   func toggle(_ url: URL) {
-    var next = selectedURLs
-    if next.remove(url) == nil {
-      next.insert(url)
-      apply(next, primary: url)
+    objectWillChange.send()
+
+    if selectedURLs.remove(url) != nil {
+      if let index = dragURLs.firstIndex(of: url) {
+        dragURLs.swapAt(index, dragURLs.index(before: dragURLs.endIndex))
+        dragURLs.removeLast()
+      }
+      if primaryURL == url {
+        primaryURL = dragURLs.first
+      }
     } else {
-      apply(next, primary: primaryURL == url ? next.first : primaryURL)
+      selectedURLs.insert(url)
+      primaryURL = url
+      dragURLs.append(url)
+      dragURLs.swapAt(dragURLs.startIndex, dragURLs.index(before: dragURLs.endIndex))
     }
+
+    count = selectedURLs.count
+    flags[url]?.isSelected = selectedURLs.contains(url)
   }
 
   func formUnion(_ urls: Set<URL>, primary: URL?) {
