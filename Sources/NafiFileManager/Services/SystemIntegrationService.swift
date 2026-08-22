@@ -506,9 +506,11 @@ final class SystemIntegrationService: ObservableObject {
         ),
         displayName: record.displayName
       )
+      #if compiler(>=6.2)
       if #available(macOS 26.0, *) {
         domain.supportsStringSearchRequest = true
       }
+      #endif
       try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
         NSFileProviderManager.add(domain) { _ in continuation.resume() }
       }
