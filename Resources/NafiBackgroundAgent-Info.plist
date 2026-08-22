@@ -5,8 +5,8 @@
   <key>CFBundleName</key><string>NafiBackgroundAgent</string>
   <key>CFBundleExecutable</key><string>nafi-background-agent</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.9.0</string>
-  <key>CFBundleVersion</key><string>40</string>
+  <key>CFBundleShortVersionString</key><string>0.10.0</string>
+  <key>CFBundleVersion</key><string>41</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
 </dict></plist>
