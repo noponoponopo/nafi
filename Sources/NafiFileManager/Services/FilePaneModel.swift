@@ -1224,20 +1224,14 @@ final class FilePaneModel: ObservableObject, Identifiable {
   ) -> [FileItem] {
     let searchTerms = FileNameSearchMatcher.terms(query)
 
-    var directories: [FileItem] = []
-    var files: [FileItem] = []
-    directories.reserveCapacity(items.count / 4)
-    files.reserveCapacity(items.count)
+    var matched: [FileItem] = []
+    matched.reserveCapacity(items.count)
 
     for item in items
     where (searchTerms.isEmpty || FileNameSearchMatcher.matches(normalizedCandidate: item.normalizedName, terms: searchTerms))
       && (searchTerms.isEmpty || filter.matches(item))
     {
-      if item.isDirectory {
-        directories.append(item)
-      } else {
-        files.append(item)
-      }
+      matched.append(item)
     }
 
     @Sendable func comesBefore(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
@@ -1263,6 +1257,26 @@ final class FilePaneModel: ObservableObject, Identifiable {
         return lhs.normalizedName.localizedStandardCompare(rhs.normalizedName) == .orderedAscending
       }
       return descending ? comparison == .orderedDescending : comparison == .orderedAscending
+    }
+
+    // 更新日順はフォルダとファイルを区別せず、時系列で混ぜて並べる。
+    // 名前・サイズ・種類では従来どおりフォルダを先にまとめる。
+    if sort == .modified {
+      matched.sort(by: comesBefore)
+      return matched
+    }
+
+    var directories: [FileItem] = []
+    var files: [FileItem] = []
+    directories.reserveCapacity(matched.count / 4)
+    files.reserveCapacity(matched.count)
+
+    for item in matched {
+      if item.isDirectory {
+        directories.append(item)
+      } else {
+        files.append(item)
+      }
     }
 
     directories.sort(by: comesBefore)
