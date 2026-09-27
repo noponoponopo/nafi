@@ -103,13 +103,12 @@ private struct RootViewContent: View {
         set: { if !$0 { dismissActiveAlert() } }
       )
     ) {
-      if serverManager.hostKeyApprovalRequest != nil {
+      if let request = serverManager.hostKeyApprovalRequest {
         Button("信頼して接続") {
-          guard let request = serverManager.hostKeyApprovalRequest else { return }
           Task { await serverManager.approveHostKey(request) }
         }
         Button("キャンセル", role: .cancel) {
-          serverManager.dismissHostKeyApproval()
+          serverManager.dismissHostKeyApproval(request.id)
         }
       } else {
         Button("OK", role: .cancel) { dismissActiveAlert() }
@@ -149,16 +148,19 @@ private struct RootViewContent: View {
 
   private var hostKeyApprovalMessage: String {
     guard let request = serverManager.hostKeyApprovalRequest else { return "" }
-    let endpoint = request.scan.port == 22
+    let endpoint =
+      request.scan.port == 22
       ? request.scan.host
       : "[\(request.scan.host)]:\(request.scan.port)"
-    let heading = request.isKeyChange
+    let heading =
+      request.isKeyChange
       ? "登録済みのホストキーと異なります。接続先が正しい場合だけ更新してください。"
       : "このサーバーはまだ登録されていません。指紋を確認してから接続してください。"
     let newKeys = request.scan.keys
       .map { "\($0.algorithm): \($0.fingerprint)" }
       .joined(separator: "\n")
-    let oldKeys = request.existingIdentities.isEmpty
+    let oldKeys =
+      request.existingIdentities.isEmpty
       ? ""
       : "\n\n登録済みの指紋:\n" + request.existingIdentities.joined(separator: "\n")
     return "\(request.profileName)\n\(endpoint)\n\n\(heading)\n\n取得した指紋:\n\(newKeys)\(oldKeys)"

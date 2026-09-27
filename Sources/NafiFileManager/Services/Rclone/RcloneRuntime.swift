@@ -1,10 +1,12 @@
+import AppKit
 import Foundation
 import Security
+
 #if canImport(Darwin)
-import Darwin
+  import Darwin
 #endif
 #if canImport(FoundationNetworking)
-import FoundationNetworking
+  import FoundationNetworking
 #endif
 
 struct RcloneProfileSecrets: Sendable {
@@ -26,6 +28,41 @@ struct RcloneProfileSecrets: Sendable {
       keyPassphrase: keyPassphrase,
       sessionToken: sessionToken
     )
+  }
+}
+
+enum RcloneConfigVisibility {
+  static func missing(
+    _ expected: Set<String>, in response: [String: JSONValue]
+  ) throws -> Set<String> {
+    guard let remotes = response["remotes"]?.arrayValue,
+      remotes.count <= 10_000,
+      remotes.allSatisfy({ $0.stringValue != nil })
+    else { throw RcloneRuntimeError.invalidResponse("rcloneの接続先一覧を検証できません。") }
+    return expected.subtracting(remotes.compactMap(\.stringValue))
+  }
+}
+
+actor RcloneConfigWriteQueue {
+  private var tail: (id: UUID, task: Task<Void, Never>)?
+
+  func run<Value: Sendable>(
+    _ write: @escaping @Sendable () async throws -> Value
+  ) async throws -> Value {
+    let predecessor = tail?.task
+    let id = UUID()
+    let operation = Task {
+      await predecessor?.value
+      try Task.checkCancellation()
+      return try await write()
+    }
+    tail = (id, Task { _ = try? await operation.value })
+    defer { if tail?.id == id { tail = nil } }
+    return try await withTaskCancellationHandler {
+      try await operation.value
+    } onCancel: {
+      operation.cancel()
+    }
   }
 }
 
@@ -52,7 +89,8 @@ private final class RcloneLogBuffer: @unchecked Sendable {
   }
 }
 
-private final class RcloneURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+private final class RcloneURLSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable
+{
   func urlSession(
     _ session: URLSession,
     task: URLSessionTask,
@@ -68,6 +106,7 @@ enum RcloneRuntimeError: LocalizedError, Sendable {
   case binaryMissing
   case launchFailed(String)
   case unavailable(String)
+  case operationFailed(String)
   case invalidResponse(String)
   case remoteConfiguration(String)
   case timedOut
@@ -78,6 +117,7 @@ enum RcloneRuntimeError: LocalizedError, Sendable {
       "rcloneが見つかりません。アプリ内のContents/Helpers/rclone、NAFI_RCLONE_PATH、Homebrewの順で検索しました。"
     case .launchFailed(let message): "rcloneを起動できません。\n\(message)"
     case .unavailable(let message): "rcloneへ接続できません。\n\(message)"
+    case .operationFailed(let message): "rcloneで処理できませんでした。\n\(message)"
     case .invalidResponse(let message): "rcloneから不正な応答を受け取りました。\n\(message)"
     case .remoteConfiguration(let message): "rclone接続設定を作成できません。\n\(message)"
     case .timedOut: "rcloneの応答がタイムアウトしました。"
@@ -104,7 +144,15 @@ actor RcloneRuntime {
   }
 
   private var state: State?
-  private var startTask: Task<State, Error>?
+  private var startTask: (id: UUID, task: Task<State, Error>)?
+  private var stopTask: (id: UUID, task: Task<Void, Error>)?
+  private var activeRequests = 0
+  private var configurationTasks: [UUID: (id: UUID, signature: Int, task: Task<String?, Error>)] =
+    [:]
+  private var verifiedRemotes = Set<String>()
+  private var unhealthyGeneration: UUID?
+  private var configurationWrites = RcloneConfigWriteQueue()
+  private var activeProviderProfileID: UUID?
   private var descriptorHeartbeat: Task<Void, Never>?
   private var oauthTokenMonitorTask: Task<Void, Never>?
   private var idleShutdownTask: Task<Void, Never>?
@@ -121,7 +169,8 @@ actor RcloneRuntime {
   init() {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.timeoutIntervalForRequest = 45
-    configuration.timeoutIntervalForResource = 120
+    configuration.timeoutIntervalForResource = 24 * 60 * 60
+    configuration.httpMaximumConnectionsPerHost = 16
     configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
     configuration.urlCache = nil
     session = URLSession(
@@ -149,20 +198,28 @@ actor RcloneRuntime {
     backend: String,
     parameters: [String: JSONValue]
   ) async throws -> RcloneConfigResponse {
-    try await prepareOAuthPort()
-    configuredProfiles[profileID] = nil
-    return try await providerConfigurationCall(
-      profileID: profileID,
-      backend: backend,
-      parameters: parameters,
-      continuation: nil
-    )
+    try Task.checkCancellation()
+    guard activeProviderProfileID == nil else {
+      throw RcloneRuntimeError.remoteConfiguration("別のアカウント設定を完了するか、キャンセルしてください。")
+    }
+    activeProviderProfileID = profileID
+    noteActivity()
+    do {
+      try await prepareOAuthPort()
+      configuredProfiles[profileID] = nil
+      return try await providerConfigurationCall(
+        profileID: profileID, backend: backend, parameters: parameters, continuation: nil
+      )
+    } catch {
+      if activeProviderProfileID == profileID { activeProviderProfileID = nil }
+      scheduleIdleShutdownIfEligible()
+      throw error
+    }
   }
 
   private func prepareOAuthPort() async throws {
     guard !Self.canBindOAuthPort() else { return }
-    await stop()
-    try await start()
+    await stopOAuthListener()
     guard Self.canBindOAuthPort() else {
       throw RcloneRuntimeError.remoteConfiguration(
         "認証用ポート53682が別のアプリで使用されています。使用中のアプリを終了してからもう一度お試しください。"
@@ -177,11 +234,12 @@ actor RcloneRuntime {
     state: String,
     result: String
   ) async throws -> RcloneConfigResponse {
-    try await providerConfigurationCall(
-      profileID: profileID,
-      backend: backend,
-      parameters: parameters,
-      continuation: (state, result)
+    try Task.checkCancellation()
+    guard activeProviderProfileID == profileID else {
+      throw RcloneRuntimeError.remoteConfiguration("アカウント設定は終了しています。もう一度開始してください。")
+    }
+    return try await providerConfigurationCall(
+      profileID: profileID, backend: backend, parameters: parameters, continuation: (state, result)
     )
   }
 
@@ -201,32 +259,79 @@ actor RcloneRuntime {
     _ = try await requireState()
   }
 
-  func stop() async {
-    try? await persistUpdatedOAuthTokens()
-    startTask?.cancel()
+  func cancelProviderAuthentication(profileID: UUID) async {
+    guard activeProviderProfileID == profileID else { return }
+    await stopOAuthListener()
+    if activeProviderProfileID == profileID { activeProviderProfileID = nil }
+    scheduleIdleShutdownIfEligible()
+  }
+
+  private func stopOAuthListener() async {
+    guard let current = state, current.process.isRunning else { return }
+    _ = try? await callRaw("config/oauthstop", parameters: [:], state: current, timeout: 5)
+  }
+
+  func stop() async throws {
+    if let stopTask {
+      try await stopTask.task.value
+      return
+    }
+    let id = UUID()
+    let task = Task { try await self.finishStop() }
+    stopTask = (id, task)
+    defer {
+      if stopTask?.id == id {
+        stopTask = nil
+        scheduleIdleShutdownIfEligible()
+      }
+    }
+    try await task.value
+  }
+
+  private func finishStop() async throws {
+    let starting = startTask
     startTask = nil
+    starting?.task.cancel()
+    let configurations = Array(configurationTasks.values)
+    configurationTasks.removeAll()
+    for entry in configurations { entry.task.cancel() }
     descriptorHeartbeat?.cancel()
     descriptorHeartbeat = nil
     oauthTokenMonitorTask?.cancel()
     oauthTokenMonitorTask = nil
     idleShutdownTask?.cancel()
     idleShutdownTask = nil
+    for entry in configurations { _ = try? await entry.task.value }
+    // Never discard a refreshed OAuth token if saving it to the vault failed.
+    do {
+      try await persistUpdatedOAuthTokens()
+    } catch {
+      NotificationCenter.default.post(
+        name: .nafiMaintenanceWarning, object: nil,
+        userInfo: ["message": "rcloneの更新済み認証情報を保存できません。認証情報を失わないようrcloneを終了せず、再試行します。"])
+      throw error
+    }
+    let unpublished = try? await starting?.task.value
+    let current = state ?? unpublished
+    state = nil
     configuredProfiles.removeAll()
+    verifiedRemotes.removeAll()
+    unhealthyGeneration = nil
+    activeProviderProfileID = nil
     fileProviderReadyProfiles.removeAll()
     oauthProfileIDs.removeAll()
     persistedOAuthTokens.removeAll()
-    guard let current = state else { return }
-    state = nil
+    guard let current else { return }
     _ = try? await callRaw("core/quit", parameters: [:], state: current, timeout: 3)
     await Self.terminate(current.process, graceNanoseconds: 500_000_000)
     current.outputPipe.fileHandleForReading.readabilityHandler = nil
     current.errorPipe.fileHandleForReading.readabilityHandler = nil
     try? FileManager.default.removeItem(at: current.configURL.deletingLastPathComponent())
-    try? FileManager.default.removeItem(at: AppStoragePaths.sharedFile(named: "rclone-runtime.json"))
+    Self.removeDescriptorIfOwned(by: current.process.processIdentifier)
   }
 
   func restart() async throws {
-    await stop()
+    try await stop()
     try await start()
   }
 
@@ -235,13 +340,59 @@ actor RcloneRuntime {
     secrets: RcloneProfileSecrets,
     sftpHostKeyAlgorithms: [String] = []
   ) async throws -> String? {
+    try Task.checkCancellation()
+    activeRequests += 1
+    noteActivity()
+    defer {
+      activeRequests -= 1
+      scheduleIdleShutdownIfEligible()
+    }
+    // Install the runtime before examining its generation-scoped configuration cache.
+    let current = try await requireState()
     var signatureHasher = Hasher()
     signatureHasher.combine(profile.rcloneConfigurationSignature)
     signatureHasher.combine(secrets.inMemorySignature)
     signatureHasher.combine(sftpHostKeyAlgorithms)
     let signature = signatureHasher.finalize()
-    if configuredProfiles[profile.id] == signature { return persistedOAuthTokens[profile.id] }
+    if let existing = configurationTasks[profile.id] {
+      if existing.signature == signature {
+        let value = try await existing.task.value
+        try Task.checkCancellation()
+        return value
+      }
+      _ = try? await existing.task.value
+      if configurationTasks[profile.id]?.id == existing.id { configurationTasks[profile.id] = nil }
+      try Task.checkCancellation()
+      return try await configure(
+        profile: profile, secrets: secrets, sftpHostKeyAlgorithms: sftpHostKeyAlgorithms)
+    }
+    if configuredProfiles[profile.id] == signature,
+      (profile.kind == .nfs || profile.kind == .afp
+        || verifiedRemotes.contains(RcloneConfiguration.remoteName(for: profile.id)))
+    {
+      return persistedOAuthTokens[profile.id]
+    }
+    let id = UUID()
+    let task = Task {
+      try await self.performConfiguration(
+        profile: profile, secrets: secrets, sftpHostKeyAlgorithms: sftpHostKeyAlgorithms,
+        signature: signature, current: current
+      )
+    }
+    configurationTasks[profile.id] = (id, signature, task)
+    defer {
+      if configurationTasks[profile.id]?.id == id { configurationTasks[profile.id] = nil }
+    }
+    let value = try await task.value
+    try Task.checkCancellation()
+    return value
+  }
 
+  private func performConfiguration(
+    profile: ServerProfile, secrets: RcloneProfileSecrets, sftpHostKeyAlgorithms: [String],
+    signature: Int, current: State
+  ) async throws -> String? {
+    try Task.checkCancellation()
     if profile.kind == .nfs || profile.kind == .afp {
       let path = RcloneConfiguration.fs(for: profile)
       var isDirectory: ObjCBool = false
@@ -260,7 +411,6 @@ actor RcloneRuntime {
       profile.sftpAuthentication == .privateKey,
       !secrets.keyPassphrase.isEmpty
     {
-      let current = try await requireState()
       configuredProfile.privateKeyPath = try await preparePrivateKey(
         profile.privateKeyPath,
         passphrase: secrets.keyPassphrase,
@@ -299,11 +449,22 @@ actor RcloneRuntime {
     ]
 
     do {
-      let listed = try await call("config/listremotes", timeout: 30)
-      let exists = listed["remotes"]?.arrayValue?.contains(where: {
-        $0.stringValue?.trimmingCharacters(in: CharacterSet(charactersIn: ":")) == remoteName
-      }) == true
-      _ = try await call(exists ? "config/update" : "config/create", parameters: payload, timeout: 90)
+      let response = try await serializedConfigurationWrite(
+        verifiedRemotes.contains(remoteName) ? "config/update" : "config/create",
+        parameters: payload, state: current, timeout: 90
+      )
+      if let message = response["Error"]?.stringValue, !message.isEmpty {
+        throw RcloneRuntimeError.remoteConfiguration(message)
+      }
+      guard response["Option"]?.objectValue == nil else {
+        throw RcloneRuntimeError.remoteConfiguration("接続先に対話型の設定が必要です。接続先の編集画面で認証を完了してください。")
+      }
+      try Task.checkCancellation()
+      guard state?.generation == current.generation else { throw CancellationError() }
+    } catch is CancellationError {
+      throw CancellationError()
+    } catch let error as RcloneRuntimeError {
+      throw error
     } catch {
       throw RcloneRuntimeError.remoteConfiguration(error.localizedDescription)
     }
@@ -316,15 +477,21 @@ actor RcloneRuntime {
   }
 
   func invalidateConfiguration(profileID: UUID) {
+    configurationTasks[profileID]?.task.cancel()
     configuredProfiles[profileID] = nil
     fileProviderReadyProfiles[profileID] = nil
     refreshDescriptor()
   }
 
-  func markFileProviderReady(profileID: UUID, configurationRevision: UUID?) {
-    guard let state, state.process.isRunning else { return }
-    fileProviderReadyProfiles[profileID] = configurationRevision?.uuidString.lowercased() ?? ""
-    refreshDescriptor()
+  func markFileProviderReady(profile: ServerProfile) throws {
+    guard let state, state.process.isRunning, unhealthyGeneration != state.generation,
+      (profile.kind == .nfs || profile.kind == .afp
+        || verifiedRemotes.contains(RcloneConfiguration.remoteName(for: profile.id)))
+    else { throw RcloneRuntimeError.unavailable("File Providerの接続設定が準備できていません。") }
+    var ready = fileProviderReadyProfiles
+    ready[profile.id] = profile.configurationRevision.uuidString.lowercased()
+    try Self.publishDescriptor(for: state, readyProfiles: ready)
+    fileProviderReadyProfiles = ready
   }
 
   /// Extends the idle lease for RC work issued by the File Provider extension.
@@ -349,7 +516,8 @@ actor RcloneRuntime {
         forKeys: [.isRegularFileKey, .fileSizeKey]
       )
     } catch {
-      throw RcloneRuntimeError.remoteConfiguration("SFTP秘密鍵を読み取れません。\n\(error.localizedDescription)")
+      throw RcloneRuntimeError.remoteConfiguration(
+        "SFTP秘密鍵を読み取れません。\n\(error.localizedDescription)")
     }
     guard values.isRegularFile == true,
       let size = values.fileSize,
@@ -412,17 +580,29 @@ actor RcloneRuntime {
   }
 
   func removeConfiguration(profileID: UUID) async {
+    let pending = configurationTasks[profileID]
+    pending?.task.cancel()
+    _ = try? await pending?.task.value
+    if configurationTasks[profileID]?.id == pending?.id { configurationTasks[profileID] = nil }
     configuredProfiles[profileID] = nil
     fileProviderReadyProfiles[profileID] = nil
-    refreshDescriptor()
     oauthProfileIDs.remove(profileID)
     persistedOAuthTokens[profileID] = nil
     stopOAuthTokenMonitorIfIdle()
-    _ = try? await call(
+    // Deleting a saved profile must not launch an otherwise idle daemon.
+    guard let current = state, current.process.isRunning else { return }
+    activeRequests += 1
+    noteActivity()
+    defer {
+      activeRequests -= 1
+      scheduleIdleShutdownIfEligible()
+    }
+    refreshDescriptor()
+    _ = try? await serializedConfigurationWrite(
       "config/delete",
-      parameters: ["name": .string(RcloneConfiguration.remoteName(for: profileID))]
+      parameters: ["name": .string(RcloneConfiguration.remoteName(for: profileID))],
+      state: current, timeout: 15
     )
-    _ = try? await call("fscache/clear")
   }
 
   private func startOAuthTokenMonitor() {
@@ -471,9 +651,15 @@ actor RcloneRuntime {
     parameters: [String: JSONValue] = [:],
     timeout: TimeInterval = 45
   ) async throws -> [String: JSONValue] {
+    try Task.checkCancellation()
+    activeRequests += 1
     noteActivity()
-    defer { scheduleIdleShutdownIfEligible() }
+    defer {
+      activeRequests -= 1
+      scheduleIdleShutdownIfEligible()
+    }
     let current = try await requireState()
+    try Task.checkCancellation()
     return try await callRaw(method, parameters: parameters, state: current, timeout: timeout)
   }
 
@@ -495,12 +681,14 @@ actor RcloneRuntime {
   }
 
   private func scheduleIdleShutdownIfEligible() {
-    guard state != nil else { return }
+    guard state != nil, stopTask == nil, activeRequests == 0, activeProviderProfileID == nil else {
+      return
+    }
     let generation = activityGeneration
     idleShutdownTask?.cancel()
     idleShutdownTask = Task { [weak self] in
-      // rclone is expensive only when kept resident. A short lease amortizes
-      // Finder bursts while still making the idle steady state daemon-free.
+      // Keep the lease even when unhealthy so File Provider's synchronous
+      // requests can finish before checking for active jobs and stopping.
       try? await Task.sleep(nanoseconds: 45 * 1_000_000_000)
       guard !Task.isCancelled else { return }
       await self?.shutdownIfStillIdle(generation: generation)
@@ -508,25 +696,75 @@ actor RcloneRuntime {
   }
 
   private func shutdownIfStillIdle(generation: UInt64) async {
-    guard generation == activityGeneration else { return }
+    guard generation == activityGeneration, activeRequests == 0,
+      let current = state, stopTask == nil, activeProviderProfileID == nil
+    else { return }
     idleShutdownTask = nil
-    await stop()
+    do {
+      // Never discard a refreshed credential just because its durable save failed.
+      try await persistUpdatedOAuthTokens()
+      guard generation == activityGeneration, activeRequests == 0,
+        state?.generation == current.generation
+      else { return }
+      // Include synchronous jobs issued directly by File Provider. job/list itself
+      // is excluded using rclone's response header, never by guessing a job count.
+      let jobs = try await callRaw("job/list", parameters: [:], state: current, timeout: 5)
+      guard generation == activityGeneration, activeRequests == 0,
+        state?.generation == current.generation
+      else { return }
+      let stats = try await callRaw("core/stats", parameters: [:], state: current, timeout: 5)
+      guard generation == activityGeneration, activeRequests == 0,
+        state?.generation == current.generation
+      else { return }
+      guard Self.canRetirePublishedRuntime(jobs: jobs, stats: stats) else {
+        scheduleIdleShutdownIfEligible()
+        return
+      }
+      try await stop()
+    } catch {
+      // An unresponsive helper may still be transferring data. Do not kill it.
+      if generation == activityGeneration { scheduleIdleShutdownIfEligible() }
+    }
   }
 
   private func requireState() async throws -> State {
-    if let state, state.process.isRunning { return state }
-    if let task = startTask { return try await task.value }
-
-    let task = Task<State, Error> { try await Self.launchWithRetries() }
-    startTask = task
+    if let stopping = stopTask {
+      try await stopping.task.value
+      if stopTask?.id == stopping.id { stopTask = nil }
+    }
+    try Task.checkCancellation()
+    if let state, state.process.isRunning {
+      guard unhealthyGeneration != state.generation else {
+        throw RcloneRuntimeError.unavailable(
+          "接続設定とrcloneの内部状態が一致しません。実行中の転送が終わり次第、rcloneを自動で再起動します。")
+      }
+      return state
+    }
+    let entry: (id: UUID, task: Task<State, Error>)
+    if let existing = startTask {
+      entry = existing
+    } else {
+      entry = (UUID(), Task { try await Self.launchWithRetries() })
+      startTask = entry
+    }
     do {
-      let newState = try await task.value
+      let newState = try await entry.task.value
+      // Every waiter observes the same fully installed state. No late waiter may
+      // clear configuration that another connection already created.
+      if state?.generation == newState.generation { return newState }
+      guard startTask?.id == entry.id, stopTask == nil else { throw CancellationError() }
+      // File Provider discovery is optional for direct pane connections. A damaged
+      // shared container must not tear down a working rclone daemon.
+      try? Self.publishDescriptor(for: newState, readyProfiles: [:])
       state = newState
       startTask = nil
       configuredProfiles.removeAll()
+      verifiedRemotes.removeAll()
+      unhealthyGeneration = nil
+      configurationWrites = RcloneConfigWriteQueue()
       fileProviderReadyProfiles.removeAll()
-      startOAuthTokenMonitor()
-      try Self.publishDescriptor(for: newState, readyProfiles: fileProviderReadyProfiles)
+      oauthProfileIDs.removeAll()
+      persistedOAuthTokens.removeAll()
       descriptorHeartbeat?.cancel()
       descriptorHeartbeat = Task { [weak self] in
         while !Task.isCancelled {
@@ -535,9 +773,19 @@ actor RcloneRuntime {
           await self?.refreshDescriptor()
         }
       }
+      scheduleIdleShutdownIfEligible()
       return newState
     } catch {
-      startTask = nil
+      if startTask?.id == entry.id {
+        startTask = nil
+        // Publication failed after launch: do not leak an unpublished daemon.
+        if let orphan = try? await entry.task.value {
+          await Self.terminate(orphan.process, graceNanoseconds: 150_000_000)
+          orphan.outputPipe.fileHandleForReading.readabilityHandler = nil
+          orphan.errorPipe.fileHandleForReading.readabilityHandler = nil
+          try? FileManager.default.removeItem(at: orphan.configURL.deletingLastPathComponent())
+        }
+      }
       throw error
     }
   }
@@ -548,6 +796,20 @@ actor RcloneRuntime {
     parameters: [String: JSONValue],
     continuation: (state: String, result: String)?
   ) async throws -> RcloneConfigResponse {
+    // User questions keep the interactive configuration alive without polling.
+    var awaitingAnswer = false
+    activeRequests += 1
+    noteActivity()
+    defer {
+      activeRequests -= 1
+      scheduleIdleShutdownIfEligible()
+    }
+    defer {
+      if !awaitingAnswer, activeProviderProfileID == profileID {
+        activeProviderProfileID = nil
+        scheduleIdleShutdownIfEligible()
+      }
+    }
     var options: [String: JSONValue] = [
       "obscure": .bool(true),
       "nonInteractive": .bool(true),
@@ -558,7 +820,7 @@ actor RcloneRuntime {
       options["state"] = .string(continuation.state)
       options["result"] = .string(continuation.result)
     }
-    return try await callDecodable(
+    let result = try await serializedConfigurationWrite(
       "config/create",
       parameters: [
         "name": .string(RcloneConfiguration.remoteName(for: profileID)),
@@ -566,8 +828,63 @@ actor RcloneRuntime {
         "parameters": .object(parameters),
         "opt": .object(options),
       ],
-      timeout: 15 * 60
+      state: try await requireState(), timeout: 15 * 60
     )
+    let response = try decoder.decode(RcloneConfigResponse.self, from: encoder.encode(result))
+    try Task.checkCancellation()
+    awaitingAnswer = response.option != nil && response.error.isEmpty
+    return response
+  }
+
+  private func serializedConfigurationWrite(
+    _ method: String,
+    parameters: [String: JSONValue],
+    state current: State,
+    timeout: TimeInterval
+  ) async throws -> [String: JSONValue] {
+    // rclone can save a concurrently created remote on disk without registering
+    // it in memory. Keep writes ordered for this daemon without blocking reads.
+    let generation = current.generation
+    return try await configurationWrites.run { [self] in
+      try await self.callConfigurationWrite(
+        method, parameters: parameters, generation: generation, timeout: timeout)
+    }
+  }
+
+  private func callConfigurationWrite(
+    _ method: String,
+    parameters: [String: JSONValue],
+    generation: UUID,
+    timeout: TimeInterval
+  ) async throws -> [String: JSONValue] {
+    guard let state, state.generation == generation else { throw CancellationError() }
+    guard unhealthyGeneration != generation else {
+      throw RcloneRuntimeError.unavailable("rclone内部の設定が不一致です。安全に終了して再起動するまで設定変更は行いません。")
+    }
+    let response = try await callRaw(method, parameters: parameters, state: state, timeout: timeout)
+    guard ["config/create", "config/update", "config/delete"].contains(method),
+      let name = parameters["name"]?.stringValue,
+      response["Option"]?.objectValue == nil,
+      response["Error"]?.stringValue?.isEmpty != false
+    else { return response }
+
+    var expected = verifiedRemotes
+    if method == "config/delete" { expected.remove(name) } else { expected.insert(name) }
+    let listing = try await callRaw("config/listremotes", parameters: [:], state: state, timeout: 15)
+    let missing = try RcloneConfigVisibility.missing(expected, in: listing)
+    guard missing.isEmpty else {
+      for profileID in configuredProfiles.keys
+      where missing.contains(RcloneConfiguration.remoteName(for: profileID)) {
+        configuredProfiles[profileID] = nil
+      }
+      unhealthyGeneration = generation
+      fileProviderReadyProfiles.removeAll()
+      refreshDescriptor()
+      throw RcloneRuntimeError.remoteConfiguration(
+        "rcloneが保存した接続先を認識していません。転送を中断せず、処理完了後に自動でrcloneを再起動します。")
+    }
+    verifiedRemotes = expected
+    return response
   }
 
   private func callRaw(
@@ -580,10 +897,7 @@ actor RcloneRuntime {
       throw RcloneRuntimeError.invalidResponse("RCタイムアウト値が不正です。")
     }
     guard state.process.isRunning || method == "core/quit" else {
-      self.state = nil
-      descriptorHeartbeat?.cancel()
-      descriptorHeartbeat = nil
-      try? FileManager.default.removeItem(at: AppStoragePaths.sharedFile(named: "rclone-runtime.json"))
+      clearExitedState(state)
       throw RcloneRuntimeError.unavailable("rcloneプロセスが終了しています。")
     }
 
@@ -617,26 +931,44 @@ actor RcloneRuntime {
       }
       if !(200..<300).contains(http.statusCode) {
         let object = try? decoder.decode([String: JSONValue].self, from: data)
-        let message = object?["error"]?.stringValue
+        let message =
+          object?["error"]?.stringValue
           ?? String(data: data.prefix(16_384), encoding: .utf8)
           ?? "HTTP \(http.statusCode)"
-        throw RcloneRuntimeError.invalidResponse(message)
+        throw RcloneRuntimeError.operationFailed(message)
       }
       if data.isEmpty { return [:] }
-      return try decoder.decode([String: JSONValue].self, from: data)
+      var result = try decoder.decode([String: JSONValue].self, from: data)
+      if safeMethod == "job/list", let ownID = http.value(forHTTPHeaderField: "x-rclone-jobid") {
+        for key in ["runningIds", "running_ids"] {
+          if let ids = result[key]?.arrayValue {
+            result[key] = .array(ids.filter { $0.intValue.map(String.init) != ownID })
+          }
+        }
+      }
+      return result
+    } catch is CancellationError {
+      throw CancellationError()
+    } catch let error as URLError where error.code == .cancelled {
+      throw CancellationError()
     } catch let error as RcloneRuntimeError {
       throw error
     } catch let error as URLError where error.code == .timedOut {
       throw RcloneRuntimeError.timedOut
     } catch {
       if !state.process.isRunning {
-        self.state = nil
-        descriptorHeartbeat?.cancel()
-        descriptorHeartbeat = nil
-        try? FileManager.default.removeItem(at: AppStoragePaths.sharedFile(named: "rclone-runtime.json"))
+        clearExitedState(state)
       }
       throw RcloneRuntimeError.unavailable(error.localizedDescription)
     }
+  }
+
+  private func clearExitedState(_ exited: State) {
+    guard state?.generation == exited.generation else { return }
+    state = nil
+    descriptorHeartbeat?.cancel()
+    descriptorHeartbeat = nil
+    Self.removeDescriptorIfOwned(by: exited.process.processIdentifier)
   }
 
   private nonisolated static func sameOrigin(_ lhs: URL?, _ rhs: URL) -> Bool {
@@ -648,21 +980,21 @@ actor RcloneRuntime {
 
   nonisolated static func canBindOAuthPort() -> Bool {
     #if canImport(Darwin)
-    let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-    guard descriptor >= 0 else { return false }
-    defer { Darwin.close(descriptor) }
-    var address = sockaddr_in()
-    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    address.sin_family = sa_family_t(AF_INET)
-    address.sin_port = UInt16(53_682).bigEndian
-    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-    return withUnsafePointer(to: &address) { pointer in
-      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+      let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+      guard descriptor >= 0 else { return false }
+      defer { Darwin.close(descriptor) }
+      var address = sockaddr_in()
+      address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+      address.sin_family = sa_family_t(AF_INET)
+      address.sin_port = UInt16(53_682).bigEndian
+      address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+      return withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+        }
       }
-    }
     #else
-    return true
+      return true
     #endif
   }
 
@@ -686,17 +1018,19 @@ actor RcloneRuntime {
     guard let binary = resolveBinaryURL() else { throw RcloneRuntimeError.binaryMissing }
 
     let fm = FileManager.default
-    await shutdownPublishedRuntimeIfPresent()
+    try await shutdownPublishedRuntimeIfPresent()
     cleanupStaleRuntimeDirectories()
     let runtimeRoot = AppStoragePaths.directory(named: "Runtime/rclone-\(UUID().uuidString)")
     let cacheURL = runtimeRoot.appendingPathComponent("cache", isDirectory: true)
     let configURL = runtimeRoot.appendingPathComponent("rclone.conf")
     try fm.createDirectory(at: cacheURL, withIntermediateDirectories: true)
-    guard fm.createFile(
-      atPath: configURL.path,
-      contents: Data(),
-      attributes: [.posixPermissions: 0o600]
-    ) else {
+    guard
+      fm.createFile(
+        atPath: configURL.path,
+        contents: Data(),
+        attributes: [.posixPermissions: 0o600]
+      )
+    else {
       try? fm.removeItem(at: runtimeRoot)
       throw RcloneRuntimeError.launchFailed("rclone設定ファイルを安全に作成できませんでした。")
     }
@@ -707,8 +1041,12 @@ actor RcloneRuntime {
     let output = Pipe()
     let errorOutput = Pipe()
     let logBuffer = RcloneLogBuffer()
-    output.fileHandleForReading.readabilityHandler = { handle in logBuffer.append(handle.availableData) }
-    errorOutput.fileHandleForReading.readabilityHandler = { handle in logBuffer.append(handle.availableData) }
+    output.fileHandleForReading.readabilityHandler = { handle in
+      logBuffer.append(handle.availableData)
+    }
+    errorOutput.fileHandleForReading.readabilityHandler = { handle in
+      logBuffer.append(handle.availableData)
+    }
     let process = Process()
     process.executableURL = binary
     process.arguments = [
@@ -745,6 +1083,9 @@ actor RcloneRuntime {
       )
       try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pidURL.path)
     } catch {
+      await terminate(process, graceNanoseconds: 150_000_000)
+      output.fileHandleForReading.readabilityHandler = nil
+      errorOutput.fileHandleForReading.readabilityHandler = nil
       try? fm.removeItem(at: runtimeRoot)
       throw RcloneRuntimeError.launchFailed(error.localizedDescription)
     }
@@ -771,7 +1112,8 @@ actor RcloneRuntime {
         throw CancellationError()
       }
       if !process.isRunning {
-        let message = logBuffer.text().isEmpty
+        let message =
+          logBuffer.text().isEmpty
           ? "終了コード \(process.terminationStatus)"
           : logBuffer.text()
         output.fileHandleForReading.readabilityHandler = nil
@@ -823,7 +1165,7 @@ actor RcloneRuntime {
           )
         }
       }
-      try await Task.sleep(nanoseconds: 120_000_000)
+      try? await Task.sleep(nanoseconds: 120_000_000)
     }
 
     await terminate(process, graceNanoseconds: 200_000_000)
@@ -841,7 +1183,7 @@ actor RcloneRuntime {
     process.interrupt()
     try? await Task.sleep(nanoseconds: 150_000_000)
     #if canImport(Darwin)
-    if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
+      if process.isRunning { _ = Darwin.kill(process.processIdentifier, SIGKILL) }
     #endif
   }
 
@@ -849,9 +1191,10 @@ actor RcloneRuntime {
     for state: State,
     readyProfiles: [UUID: String]
   ) throws {
-    let ready = Dictionary(uniqueKeysWithValues: readyProfiles.map { id, revision in
-      (id.uuidString.lowercased(), revision)
-    })
+    let ready = Dictionary(
+      uniqueKeysWithValues: readyProfiles.map { id, revision in
+        (id.uuidString.lowercased(), revision)
+      })
     let descriptor = RcloneRuntimeDescriptor(
       baseURL: state.baseURL,
       username: state.username,
@@ -862,9 +1205,10 @@ actor RcloneRuntime {
       fileProviderReadyProfiles: ready
     )
     let data = try JSONEncoder().encode(descriptor)
-    let destination = AppStoragePaths.sharedFile(named: "rclone-runtime.json")
-    try data.write(to: destination, options: [.atomic, .completeFileProtectionUnlessOpen])
-    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+    guard let destination = AppStoragePaths.fileProviderFile(named: "rclone-runtime.json") else {
+      throw RcloneRuntimeError.unavailable("File Providerの保存先に書き込めません。")
+    }
+    try AppStoragePaths.writePrivateAtomically(data, to: destination)
   }
 
   private nonisolated static func resolveBinaryURL() -> URL? {
@@ -889,10 +1233,19 @@ actor RcloneRuntime {
 
   private func refreshDescriptor() {
     guard let state, state.process.isRunning else {
-      try? FileManager.default.removeItem(at: AppStoragePaths.sharedFile(named: "rclone-runtime.json"))
+      if let url = AppStoragePaths.fileProviderFile(named: "rclone-runtime.json") {
+        try? FileManager.default.removeItem(at: url)
+      }
       return
     }
-    try? Self.publishDescriptor(for: state, readyProfiles: fileProviderReadyProfiles)
+    do {
+      try Self.publishDescriptor(for: state, readyProfiles: fileProviderReadyProfiles)
+    } catch {
+      fileProviderReadyProfiles.removeAll()
+      if let url = AppStoragePaths.fileProviderFile(named: "rclone-runtime.json") {
+        try? FileManager.default.removeItem(at: url)
+      }
+    }
   }
 
   private nonisolated static func randomSecret(byteCount: Int) throws -> String {
@@ -945,41 +1298,109 @@ actor RcloneRuntime {
     return parts[0] > 1 || (parts[0] == 1 && parts[1] >= 74)
   }
 
-  private nonisolated static func shutdownPublishedRuntimeIfPresent() async {
-    let descriptorURL = AppStoragePaths.sharedFile(named: "rclone-runtime.json")
-    guard let descriptor = publishedDescriptor(at: descriptorURL) else {
-      try? FileManager.default.removeItem(at: descriptorURL)
+  private nonisolated static func shutdownPublishedRuntimeIfPresent() async throws {
+    guard let descriptorURL = AppStoragePaths.fileProviderFile(named: "rclone-runtime.json"),
+      let descriptor = publishedDescriptor(at: descriptorURL) else { return }
+    let pid = descriptor.processIdentifier
+    if NSRunningApplication.runningApplications(withBundleIdentifier: "app.nafi.filemanager")
+      .contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
+      throw RcloneRuntimeError.unavailable("別のnafiが起動中です。接続や転送を中断しないよう、先にそちらを終了してください。")
+    }
+    guard kill(pid, 0) == 0 || errno == EPERM else {
+      removeDescriptorIfOwned(by: pid)
       return
     }
-    var request = URLRequest(url: descriptor.baseURL.appendingPathComponent("core/quit"))
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 2
+    configuration.timeoutIntervalForResource = 3
+    let session = URLSession(
+      configuration: configuration, delegate: RcloneURLSessionDelegate(), delegateQueue: nil)
+    let previousPID = try? await publishedRuntimeCall(
+      "core/pid", descriptor: descriptor, session: session)
+    guard let previousPID else {
+      if kill(pid, 0) == 0 || errno == EPERM {
+        throw RcloneRuntimeError.unavailable("前回のrcloneが応答しません。転送中の可能性があるため、自動で終了しません。")
+      }
+      removeDescriptorIfOwned(by: pid)
+      return
+    }
+    guard previousPID["pid"]?.intValue == Int64(pid) else {
+      // The descriptor may belong to a dead process whose PID was reused. Never kill it.
+      removeDescriptorIfOwned(by: pid)
+      return
+    }
+    guard let jobs = try? await publishedRuntimeCall(
+      "job/list", descriptor: descriptor, session: session),
+      let stats = try? await publishedRuntimeCall(
+        "core/stats", descriptor: descriptor, session: session)
+    else {
+      throw RcloneRuntimeError.unavailable("前回のrcloneの転送状態を確認できません。転送終了後に再接続してください。")
+    }
+    guard canRetirePublishedRuntime(jobs: jobs, stats: stats) else {
+      throw RcloneRuntimeError.unavailable("前回のrcloneが転送中です。中断を避けるため、完了後に再接続してください。")
+    }
+    _ = try? await publishedRuntimeCall("core/quit", descriptor: descriptor, session: session)
+    for _ in 0..<15 {
+      if kill(pid, 0) != 0 && errno == ESRCH {
+        removeDescriptorIfOwned(by: pid)
+        return
+      }
+      try await Task.sleep(nanoseconds: 100_000_000)
+    }
+    throw RcloneRuntimeError.unavailable("前回のrcloneを安全に終了できませんでした。転送状態を確認してから再接続してください。")
+  }
+
+  nonisolated static func canRetirePublishedRuntime(
+    jobs: [String: JSONValue], stats: [String: JSONValue]
+  ) -> Bool {
+    guard let running = (jobs["runningIds"] ?? jobs["running_ids"])?.arrayValue else { return false }
+    func inactive(_ value: JSONValue?) -> Bool {
+      if value == nil || value == .null { return true }
+      return value?.arrayValue?.isEmpty == true
+    }
+    return running.isEmpty && inactive(stats["transferring"]) && inactive(stats["checking"])
+  }
+
+  private nonisolated static func publishedRuntimeCall(
+    _ method: String,
+    descriptor: RcloneRuntimeDescriptor,
+    session: URLSession
+  ) async throws -> [String: JSONValue] {
+    var request = URLRequest(url: descriptor.baseURL.appendingPathComponent(method))
     request.httpMethod = "POST"
     request.httpBody = Data("{}".utf8)
-    request.timeoutInterval = 1
+    request.timeoutInterval = 2
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(
       "Basic \(Data("\(descriptor.username):\(descriptor.password)".utf8).base64EncodedString())",
       forHTTPHeaderField: "Authorization"
     )
-    let configuration = URLSessionConfiguration.ephemeral
-    configuration.timeoutIntervalForRequest = 1
-    configuration.timeoutIntervalForResource = 2
-    let session = URLSession(
-      configuration: configuration,
-      delegate: RcloneURLSessionDelegate(),
-      delegateQueue: nil
-    )
-    _ = try? await session.data(for: request)
-    try? FileManager.default.removeItem(at: descriptorURL)
+    let (data, response) = try await session.data(for: request)
+    guard let http = response as? HTTPURLResponse,
+      sameOrigin(http.url, descriptor.baseURL),
+      (200..<300).contains(http.statusCode), data.count <= 64 * 1_024
+    else { throw RcloneRuntimeError.unavailable("前回のrcloneの応答を検証できません。") }
+    var result = try JSONDecoder().decode([String: JSONValue].self, from: data)
+    if method == "job/list", let ownID = http.value(forHTTPHeaderField: "x-rclone-jobid") {
+      for key in ["runningIds", "running_ids"] {
+        if let ids = result[key]?.arrayValue {
+          result[key] = .array(ids.filter { $0.intValue.map(String.init) != ownID })
+        }
+      }
+    }
+    return result
   }
 
   private nonisolated static func cleanupStaleRuntimeDirectories() {
     let parent = AppStoragePaths.directory(named: "Runtime")
     let keys: Set<URLResourceKey> = [.contentModificationDateKey, .isDirectoryKey]
-    guard let entries = try? FileManager.default.contentsOfDirectory(
-      at: parent,
-      includingPropertiesForKeys: Array(keys),
-      options: [.skipsHiddenFiles]
-    ) else { return }
+    guard
+      let entries = try? FileManager.default.contentsOfDirectory(
+        at: parent,
+        includingPropertiesForKeys: Array(keys),
+        options: [.skipsHiddenFiles]
+      )
+    else { return }
     let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
     for entry in entries where entry.lastPathComponent.hasPrefix("rclone-") {
       guard let values = try? entry.resourceValues(forKeys: keys),
@@ -1000,9 +1421,11 @@ actor RcloneRuntime {
   }
 
   private nonisolated static func loopbackBaseURL(from log: String) -> URL? {
-    guard let expression = try? NSRegularExpression(
-      pattern: #"https?://127\.0\.0\.1:([0-9]{1,5})/"#
-    ) else { return nil }
+    guard
+      let expression = try? NSRegularExpression(
+        pattern: #"https?://127\.0\.0\.1:([0-9]{1,5})/"#
+      )
+    else { return nil }
     let range = NSRange(log.startIndex..<log.endIndex, in: log)
     guard let match = expression.firstMatch(in: log, range: range),
       let matchRange = Range(match.range(at: 0), in: log),
@@ -1014,8 +1437,8 @@ actor RcloneRuntime {
   }
 
   private nonisolated static func removeDescriptorIfOwned(by processIdentifier: Int32) {
-    let url = AppStoragePaths.sharedFile(named: "rclone-runtime.json")
-    guard let descriptor = publishedDescriptor(at: url),
+    guard let url = AppStoragePaths.fileProviderFile(named: "rclone-runtime.json"),
+      let descriptor = publishedDescriptor(at: url),
       descriptor.processIdentifier == processIdentifier
     else { return }
     try? FileManager.default.removeItem(at: url)
@@ -1024,10 +1447,11 @@ actor RcloneRuntime {
   private nonisolated static func publishedDescriptor(
     at url: URL
   ) -> RcloneRuntimeDescriptor? {
-    guard let data = try? AppStoragePaths.readRegularFile(
-      at: url,
-      maximumBytes: 64 * 1_024
-    ), !data.isEmpty,
+    guard
+      let data = try? AppStoragePaths.readRegularFile(
+        at: url,
+        maximumBytes: 64 * 1_024
+      ), !data.isEmpty,
       let descriptor = try? JSONDecoder().decode(RcloneRuntimeDescriptor.self, from: data),
       descriptor.processIdentifier > 1,
       descriptor.expiresAt.timeIntervalSinceReferenceDate.isFinite,

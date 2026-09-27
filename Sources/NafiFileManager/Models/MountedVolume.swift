@@ -1,6 +1,6 @@
 import Foundation
 
-struct MountedVolume: Identifiable, Hashable {
+struct MountedVolume: Identifiable, Hashable, Sendable {
   let url: URL
   let name: String
   let isLocal: Bool

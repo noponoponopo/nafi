@@ -16,13 +16,16 @@ final class ServerManager: ObservableObject {
   @Published private(set) var mountedVolumes: [MountedVolume] = []
   @Published var errorMessage: String?
   @Published private(set) var hostKeyApprovalRequest: SSHHostKeyApprovalRequest?
+  @Published private(set) var isSavingProfiles = false
 
   private let keychain = KeychainStore()
   private let persistenceURL: URL
+  private var mutatingProfiles = Set<UUID>()
   private var remoteSessions: [UUID: any RemoteServerSession] = [:]
-  private var passwordCache: [UUID: String] = [:]
-  private var keyPassphraseCache: [UUID: String] = [:]
-  private var sessionTokenCache: [UUID: String] = [:]
+  private var pendingHostKeyApprovals: [SSHHostKeyApprovalRequest] = []
+  private var mountObservers: [NSObjectProtocol] = []
+  private var mountedVolumesTask: Task<Void, Never>?
+  private var mountedVolumesNeedRefresh = false
   private var connectionTasks: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
   private var fileProviderConfigurationTasks: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
 
@@ -38,33 +41,50 @@ final class ServerManager: ObservableObject {
       }
     }
 
-    NSWorkspace.shared.notificationCenter.addObserver(
-      forName: NSWorkspace.didMountNotification,
-      object: nil,
-      queue: .main
-    ) { [weak self] _ in
-      Task { @MainActor in self?.refreshMountedVolumes() }
+    mountObservers.append(
+      NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.didMountNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor in self?.refreshMountedVolumes() }
+      })
+    mountObservers.append(
+      NSWorkspace.shared.notificationCenter.addObserver(
+        forName: NSWorkspace.didUnmountNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor in self?.refreshMountedVolumes() }
+      })
+  }
+
+  deinit {
+    for observer in mountObservers {
+      NSWorkspace.shared.notificationCenter.removeObserver(observer)
     }
-    NSWorkspace.shared.notificationCenter.addObserver(
-      forName: NSWorkspace.didUnmountNotification,
-      object: nil,
-      queue: .main
-    ) { [weak self] _ in
-      Task { @MainActor in self?.refreshMountedVolumes() }
-    }
+    mountedVolumesTask?.cancel()
+    for entry in connectionTasks.values { entry.task.cancel() }
+    for entry in fileProviderConfigurationTasks.values { entry.task.cancel() }
   }
 
   func state(for profile: ServerProfile) -> ServerConnectionState {
     states[profile.id] ?? .idle
   }
 
-  func dismissHostKeyApproval() {
+  func dismissHostKeyApproval(_ id: UUID? = nil) {
+    guard let current = hostKeyApprovalRequest, id == nil || current.id == id else { return }
     hostKeyApprovalRequest = nil
+    Task { @MainActor [weak self] in
+      await Task.yield()
+      guard let self, self.hostKeyApprovalRequest == nil, !self.pendingHostKeyApprovals.isEmpty
+      else { return }
+      self.hostKeyApprovalRequest = self.pendingHostKeyApprovals.removeFirst()
+    }
   }
 
   func approveHostKey(_ request: SSHHostKeyApprovalRequest) async {
-    guard hostKeyApprovalRequest == nil || hostKeyApprovalRequest?.id == request.id else { return }
-    hostKeyApprovalRequest = nil
+    dismissHostKeyApproval(request.id)
     do {
       try await SSHHostKeyService.shared.trust(request.scan)
     } catch {
@@ -93,8 +113,20 @@ final class ServerManager: ObservableObject {
     profile: ServerProfile,
     password: String,
     keyPassphrase: String,
-    sessionToken: String = ""
-  ) throws {
+    sessionToken: String = "",
+    replaceUnreadableSecrets: Bool = false,
+    originalSecrets: ServerSecrets? = nil
+  ) async throws {
+    guard !isSavingProfiles, !mutatingProfiles.contains(profile.id) else {
+      throw RemoteServerError.invalidResponse("別の接続設定を保存中です。")
+    }
+    isSavingProfiles = true
+    mutatingProfiles.insert(profile.id)
+    defer {
+      isSavingProfiles = false
+      mutatingProfiles.remove(profile.id)
+    }
+    try Task.checkCancellation()
     var profile = profile
     profile.name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines)
     profile.host = profile.host.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -109,12 +141,29 @@ final class ServerManager: ObservableObject {
       if !secretText.isEmpty { try RcloneConfiguration.validateParametersJSON(secretText) }
     }
     let oldProfile = profiles.first(where: { $0.id == profile.id })
-    let oldSecrets = try secretSnapshot(for: oldProfile ?? profile)
-    let suppliedSecrets = SecretSnapshot(
+    let oldSecrets: ServerSecrets?
+    do {
+      oldSecrets = oldProfile == nil ? nil : try await keychain.secrets(for: profile.id)
+    } catch {
+      guard replaceUnreadableSecrets else { throw error }
+      oldSecrets = nil
+    }
+    var suppliedSecrets = ServerSecrets(
       password: password,
       keyPassphrase: keyPassphrase,
       sessionToken: sessionToken
     )
+    if replaceUnreadableSecrets, profile.requiresStoredSecrets,
+      suppliedSecrets == ServerSecrets()
+    {
+      throw RemoteServerError.invalidResponse(
+        "旧版の認証情報を読めません。空の情報で上書きせず、接続の認証情報を再入力してください。")
+    }
+    if let originalSecrets, let oldSecrets, !replaceUnreadableSecrets {
+      suppliedSecrets = try suppliedSecrets.mergingUnchangedFields(
+        from: oldSecrets, baseline: originalSecrets, passwordIsJSON: profile.kind == .rclone
+      )
+    }
     if let oldProfile {
       if connectionConfigurationChanged(from: oldProfile, to: profile)
         || oldSecrets != suppliedSecrets
@@ -132,102 +181,87 @@ final class ServerManager: ObservableObject {
     }
     updatedProfiles.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
 
+    let previous = try await keychain.save(suppliedSecrets, for: profile.id)
     do {
-      try keychain.save(password: password, for: profile)
-      try keychain.saveKeyPassphrase(keyPassphrase, for: profile)
-      try keychain.saveSessionToken(sessionToken, for: profile)
-      try persistProfiles(updatedProfiles)
+      let url = persistenceURL
+      let snapshot = updatedProfiles
+      try await Task.detached(priority: .utility) {
+        try Self.writeProfiles(snapshot, to: url)
+      }.value
     } catch {
-      let rollbackFailures = restoreSecrets(oldSecrets, for: oldProfile ?? profile)
-      if rollbackFailures.isEmpty { throw error }
-      throw RemoteServerError.invalidResponse(
-        "接続設定を保存できず、Keychainの復元にも失敗しました。\n\(error.localizedDescription)\n\(rollbackFailures.joined(separator: "\n"))"
-      )
+      do {
+        try await keychain.restore(previous, for: profile.id, replacing: suppliedSecrets)
+      } catch let rollbackError {
+        throw RemoteServerError.invalidResponse(
+          "接続設定を保存できず、認証情報の復元にも失敗しました。\n\(error.localizedDescription)\n\(rollbackError.localizedDescription)"
+        )
+      }
+      throw error
     }
-
     profiles = updatedProfiles
-    passwordCache[profile.id] = password
-    keyPassphraseCache[profile.id] = keyPassphrase
-    sessionTokenCache[profile.id] = sessionToken
 
-    let mustReconnect = oldProfile.map {
-      connectionConfigurationChanged(from: $0, to: profile) || oldSecrets != suppliedSecrets
-    } ?? false
+    let mustReconnect =
+      oldProfile.map {
+        connectionConfigurationChanged(from: $0, to: profile) || oldSecrets != suppliedSecrets
+      } ?? false
     let oldSession = mustReconnect ? remoteSessions.removeValue(forKey: profile.id) : nil
     if mustReconnect {
       connectionTasks.removeValue(forKey: profile.id)?.task.cancel()
       states[profile.id] = .idle
     }
-    Task {
-      if let oldSession { await oldSession.close() }
-      if mustReconnect {
-        await RemoteFileSystemRegistry.shared.disconnect(profileID: profile.id)
-        await RcloneRuntime.shared.removeConfiguration(profileID: profile.id)
-      }
-      await RemoteFileSystemRegistry.shared.update(profile: profile)
+    if mustReconnect {
+      fileProviderConfigurationTasks.removeValue(forKey: profile.id)?.task.cancel()
     }
+    await keychain.finishMigration(for: profile.id)
+    if let oldSession { await oldSession.close() }
+    if mustReconnect {
+      await RemoteFileSystemRegistry.shared.disconnect(profileID: profile.id)
+      await RcloneRuntime.shared.removeConfiguration(profileID: profile.id)
+    }
+    await RemoteFileSystemRegistry.shared.update(profile: profile)
   }
 
-  func remove(_ profile: ServerProfile) throws {
+  func remove(_ profile: ServerProfile) async throws {
     guard profiles.contains(where: { $0.id == profile.id }) else { return }
-    let oldProfiles = profiles
+    guard !isSavingProfiles, !mutatingProfiles.contains(profile.id) else {
+      throw RemoteServerError.invalidResponse("別の接続設定を保存中です。")
+    }
+    isSavingProfiles = true
+    mutatingProfiles.insert(profile.id)
+    defer {
+      isSavingProfiles = false
+      mutatingProfiles.remove(profile.id)
+    }
     let updatedProfiles = profiles.filter { $0.id != profile.id }
-    let oldSecrets = try secretSnapshot(for: profile)
-
+    let previous = try await keychain.removeSecrets(for: profile.id)
     do {
-      try keychain.deleteSecrets(for: profile)
-      try persistProfiles(updatedProfiles)
+      let url = persistenceURL
+      let snapshot = updatedProfiles
+      try await Task.detached(priority: .utility) {
+        try Self.writeProfiles(snapshot, to: url)
+      }.value
     } catch {
-      let rollbackFailures = restoreSecrets(oldSecrets, for: profile)
-      if rollbackFailures.isEmpty {
-        try? persistProfiles(oldProfiles)
-        throw error
+      do {
+        try await keychain.restore(previous, for: profile.id, replacing: ServerSecrets())
+      } catch let rollbackError {
+        throw RemoteServerError.invalidResponse(
+          "接続設定を削除できず、認証情報の復元にも失敗しました。\n\(error.localizedDescription)\n\(rollbackError.localizedDescription)"
+        )
       }
-      throw RemoteServerError.invalidResponse(
-        "接続設定を削除できず、Keychainの復元にも失敗しました。\n\(error.localizedDescription)\n\(rollbackFailures.joined(separator: "\n"))"
-      )
+      throw error
     }
 
     connectionTasks.removeValue(forKey: profile.id)?.task.cancel()
+    fileProviderConfigurationTasks.removeValue(forKey: profile.id)?.task.cancel()
     let session = remoteSessions.removeValue(forKey: profile.id)
     profiles = updatedProfiles
     states[profile.id] = nil
-    passwordCache[profile.id] = nil
-    keyPassphraseCache[profile.id] = nil
-    sessionTokenCache[profile.id] = nil
-    Task {
-      if let session { await session.close() }
-      await RemoteFileSystemRegistry.shared.unregister(profileID: profile.id)
-      await RcloneRuntime.shared.removeConfiguration(profileID: profile.id)
-    }
-  }
-
-  private struct SecretSnapshot: Equatable {
-    let password: String
-    let keyPassphrase: String
-    let sessionToken: String
-  }
-
-  private func secretSnapshot(for profile: ServerProfile) throws -> SecretSnapshot {
-    SecretSnapshot(
-      password: try keychain.password(for: profile) ?? "",
-      keyPassphrase: try keychain.keyPassphrase(for: profile) ?? "",
-      sessionToken: try keychain.sessionToken(for: profile) ?? ""
-    )
-  }
-
-  private func restoreSecrets(_ snapshot: SecretSnapshot, for profile: ServerProfile) -> [String] {
-    var failures: [String] = []
-    do { try keychain.save(password: snapshot.password, for: profile) } catch {
-      failures.append(error.localizedDescription)
-    }
-    do { try keychain.saveKeyPassphrase(snapshot.keyPassphrase, for: profile) } catch {
-      failures.append(error.localizedDescription)
-    }
-    do { try keychain.saveSessionToken(snapshot.sessionToken, for: profile) } catch {
-      failures.append(error.localizedDescription)
-    }
-    return failures
+    pendingHostKeyApprovals.removeAll { $0.profileID == profile.id }
+    if hostKeyApprovalRequest?.profileID == profile.id { dismissHostKeyApproval() }
+    await keychain.finishMigration(for: profile.id)
+    if let session { await session.close() }
+    await RemoteFileSystemRegistry.shared.unregister(profileID: profile.id)
+    await RcloneRuntime.shared.removeConfiguration(profileID: profile.id)
   }
 
   private func validate(_ profile: ServerProfile) throws {
@@ -328,31 +362,18 @@ final class ServerManager: ObservableObject {
     case .rclone:
       let backend = profile.rcloneBackend.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !backend.isEmpty,
-        backend.range(of: #"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"#, options: .regularExpression) != nil
+        backend.range(of: #"^[A-Za-z0-9][A-Za-z0-9_ -]{0,127}$"#, options: .regularExpression)
+          != nil
       else { throw RemoteServerError.invalidResponse("rcloneバックエンド名が不正です。例: drive, onedrive, b2") }
       try RcloneConfiguration.validateParametersJSON(profile.rcloneParametersJSON)
 
-    case .nfs, .afp:
-      let mountText = profile.localMountPath.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !mountText.isEmpty else {
-        throw RemoteServerError.invalidResponse("macOSでマウント済みのローカルパスを指定してください。")
-      }
-      let expanded = NSString(string: mountText).expandingTildeInPath
-      let mountURL = URL(fileURLWithPath: expanded).standardizedFileURL
-      guard mountURL.path.hasPrefix("/"), mountURL.path.utf8.count <= 4_096 else {
-        throw RemoteServerError.invalidResponse("ローカルマウント先が不正です。")
-      }
-      if checkExternalResources {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: mountURL.path, isDirectory: &isDirectory),
-          isDirectory.boolValue,
-          FileManager.default.isReadableFile(atPath: mountURL.path)
-        else {
-          throw RemoteServerError.invalidResponse("マウント先を読み取れません: \(mountURL.path)")
+    case .nfs, .afp, .ftp, .smb, .webdav:
+      if [.nfs, .afp].contains(profile.kind), !profile.localMountPath.isEmpty {
+        let expanded = NSString(string: profile.localMountPath).expandingTildeInPath
+        guard expanded.hasPrefix("/"), expanded != "/" else {
+          throw RemoteServerError.invalidResponse("ローカルマウント先には絶対パスを指定してください。")
         }
       }
-
-    case .ftp, .smb, .webdav:
       let host = profile.host.trimmingCharacters(in: .whitespacesAndNewlines)
       let invalidHostCharacters = CharacterSet.whitespacesAndNewlines
         .union(.controlCharacters)
@@ -375,36 +396,31 @@ final class ServerManager: ObservableObject {
     oldProfile.rcloneConfigurationSignature != newProfile.rcloneConfigurationSignature
   }
 
-  func password(for profile: ServerProfile) -> String {
-    if let cached = passwordCache[profile.id] { return cached }
-    let value = (try? keychain.password(for: profile)) ?? ""
-    passwordCache[profile.id] = value
-    return value
+  func secrets(for profile: ServerProfile, retryUnlock: Bool = false) async throws -> ServerSecrets
+  {
+    if retryUnlock { await keychain.retryUnlock() }
+    return try await keychain.secrets(for: profile.id)
   }
 
-  func keyPassphrase(for profile: ServerProfile) -> String {
-    if let cached = keyPassphraseCache[profile.id] { return cached }
-    let value = (try? keychain.keyPassphrase(for: profile)) ?? ""
-    keyPassphraseCache[profile.id] = value
-    return value
-  }
-
-  func sessionToken(for profile: ServerProfile) -> String {
-    if let cached = sessionTokenCache[profile.id] { return cached }
-    let value = (try? keychain.sessionToken(for: profile)) ?? ""
-    sessionTokenCache[profile.id] = value
-    return value
+  private func connectionSecrets(for profile: ServerProfile) async throws -> RcloneProfileSecrets {
+    let value =
+      profile.requiresStoredSecrets ? try await keychain.secrets(for: profile.id) : ServerSecrets()
+    return RcloneProfileSecrets(
+      password: value.password, keyPassphrase: value.keyPassphrase, sessionToken: value.sessionToken
+    )
   }
 
   func persistOAuthToken(_ token: String, for profileID: UUID) async throws {
-    guard let profile = profiles.first(where: { $0.id == profileID }), profile.kind == .rclone else {
+    guard !isSavingProfiles, !mutatingProfiles.contains(profileID) else {
+      throw RemoteServerError.invalidResponse("接続設定の更新中です。")
+    }
+    guard let profile = profiles.first(where: { $0.id == profileID }), profile.kind == .rclone
+    else {
       throw RemoteServerError.invalidResponse("OAuth接続プロファイルが見つかりません。")
     }
-    let current = password(for: profile)
-    let updated = try RcloneConfiguration.replacingOAuthToken(token, in: current)
-    guard updated != current else { return }
-    try keychain.save(password: updated, for: profile)
-    passwordCache[profileID] = updated
+    try await keychain.updatePassword(for: profileID) { current in
+      try RcloneConfiguration.replacingOAuthToken(token, in: current)
+    }
     if let session = remoteSessions[profileID] as? RcloneRemoteSession {
       try await session.updateOAuthToken(token)
     }
@@ -426,29 +442,24 @@ final class ServerManager: ObservableObject {
   }
 
   func connectAutoProfiles() async {
-    for profile in profiles where profile.autoConnect {
-      for attempt in 0..<3 {
-        await connect(profile)
-        switch state(for: profile) {
-        case .connected, .helperRequired:
-          break
-        case .failed(let message) where RcloneRemoteSession.isHostKeyRelatedErrorMessage(message):
-          // Host-key failures require explicit fingerprint confirmation in the
-          // editor. Retrying cannot make an untrusted key trusted.
-          break
-        case .idle, .connecting, .failed:
-          if attempt < 2 {
-            let delay = UInt64(1 << attempt) * 1_000_000_000
-            try? await Task.sleep(nanoseconds: delay)
-            continue
-          }
+    let candidates = profiles.filter(\.autoConnect)
+    do {
+      try await keychain.prepare(profileIDs: candidates.filter(\.requiresStoredSecrets).map(\.id))
+    } catch {
+      errorMessage = error.localizedDescription
+    }
+    await withTaskGroup(of: Void.self) { group in
+      for profile in candidates {
+        group.addTask { [weak self] in
+          guard !Task.isCancelled else { return }
+          await self?.connect(profile)
         }
-        break
       }
     }
   }
 
   func configureFileProviderProfile(_ profileID: UUID) async {
+    guard !mutatingProfiles.contains(profileID) else { return }
     if let existing = fileProviderConfigurationTasks[profileID] {
       await existing.task.value
       return
@@ -469,16 +480,13 @@ final class ServerManager: ObservableObject {
   private func performFileProviderConfiguration(_ profileID: UUID) async {
     guard let profile = profiles.first(where: { $0.id == profileID }) else { return }
     do {
-      let secrets = RcloneProfileSecrets(
-        password: password(for: profile),
-        keyPassphrase: keyPassphrase(for: profile),
-        sessionToken: sessionToken(for: profile)
-      )
+      let secrets = try await connectionSecrets(for: profile)
       let sftpHostKeyAlgorithms: [String]
       if profile.kind == .sftp {
-        sftpHostKeyAlgorithms = (try? await SSHHostKeyService.shared.prepareKnownHosts(
-          host: profile.host, port: profile.port
-        )) ?? []
+        sftpHostKeyAlgorithms =
+          (try? await SSHHostKeyService.shared.prepareKnownHosts(
+            host: profile.host, port: profile.port
+          )) ?? []
       } else {
         sftpHostKeyAlgorithms = []
       }
@@ -487,16 +495,27 @@ final class ServerManager: ObservableObject {
         secrets: secrets,
         sftpHostKeyAlgorithms: sftpHostKeyAlgorithms
       )
-      await RcloneRuntime.shared.markFileProviderReady(
-        profileID: profile.id,
-        configurationRevision: profile.configurationRevision
-      )
+      guard !Task.isCancelled,
+        profiles.contains(where: {
+          $0.id == profile.id && $0.configurationRevision == profile.configurationRevision
+        })
+      else { return }
+      try await RcloneRuntime.shared.markFileProviderReady(profile: profile)
     } catch {
+      guard !Task.isCancelled,
+        profiles.contains(where: {
+          $0.id == profile.id && $0.configurationRevision == profile.configurationRevision
+        })
+      else { return }
+      if case .connected = states[profile.id] { return }
       states[profile.id] = .failed(error.localizedDescription)
     }
   }
 
-  func connect(_ profile: ServerProfile) async {
+  func connect(_ requestedProfile: ServerProfile) async {
+    guard !Task.isCancelled, !mutatingProfiles.contains(requestedProfile.id),
+      let profile = profiles.first(where: { $0.id == requestedProfile.id })
+    else { return }
     if let existing = connectionTasks[profile.id] {
       await existing.task.value
       return
@@ -505,7 +524,7 @@ final class ServerManager: ObservableObject {
     let token = UUID()
     let task: Task<Void, Never> = Task { @MainActor [weak self] in
       guard let self else { return }
-      await self.performConnect(profile)
+      await self.performConnect(profile, token: token)
     }
     connectionTasks[profile.id] = (token, task)
     await task.value
@@ -514,7 +533,7 @@ final class ServerManager: ObservableObject {
     }
   }
 
-  private func performConnect(_ profile: ServerProfile) async {
+  private func performConnect(_ profile: ServerProfile, token: UUID) async {
     guard profiles.contains(where: { $0.id == profile.id }) else {
       states[profile.id] = .failed("接続プロファイルが削除されています。")
       return
@@ -538,9 +557,9 @@ final class ServerManager: ObservableObject {
     states[profile.id] = .connecting
     switch profile.kind {
     case .sftp, .ftp, .s3, .smb, .webdav, .rclone:
-      await connectRclone(profile)
+      await connectRclone(profile, token: token)
     case .nfs, .afp:
-      await connectUsingNetFS(profile)
+      await connectUsingNetFS(profile, token: token)
     }
   }
 
@@ -549,9 +568,7 @@ final class ServerManager: ObservableObject {
     case .connected(let url):
       if remoteSessions[profile.id] != nil { return NafiURL.remoteRoot(for: profile) }
       return url
-    case .connecting:
-      return nil
-    case .idle, .helperRequired, .failed:
+    case .idle, .connecting, .helperRequired, .failed:
       await connect(profile)
       if case .connected(let url) = state(for: profile) {
         return remoteSessions[profile.id] != nil ? NafiURL.remoteRoot(for: profile) : url
@@ -561,6 +578,9 @@ final class ServerManager: ObservableObject {
   }
 
   func disconnect(_ profile: ServerProfile) async {
+    guard !mutatingProfiles.contains(profile.id) else { return }
+    mutatingProfiles.insert(profile.id)
+    defer { mutatingProfiles.remove(profile.id) }
     connectionTasks.removeValue(forKey: profile.id)?.task.cancel()
     if let session = remoteSessions.removeValue(forKey: profile.id) {
       await session.close()
@@ -569,17 +589,14 @@ final class ServerManager: ObservableObject {
       return
     }
 
-    let target: URL? = {
-      if case .connected(let url) = state(for: profile), let url { return url }
-      if !profile.localMountPath.isEmpty {
-        return URL(fileURLWithPath: NSString(string: profile.localMountPath).expandingTildeInPath)
-      }
-      let share = profile.path.split(separator: "/").last.map(String.init)
-      return mountedVolumes.first { volume in
-        guard let share else { return volume.name.localizedCaseInsensitiveContains(profile.host) }
-        return volume.name.localizedCaseInsensitiveContains(share)
-      }?.url
-    }()
+    guard [.nfs, .afp].contains(profile.kind) else {
+      states[profile.id] = .idle
+      await RemoteFileSystemRegistry.shared.disconnect(profileID: profile.id)
+      return
+    }
+    // Only unmount the exact volume this profile connected. Never guess by name.
+    let target: URL?
+    if case .connected(let url) = state(for: profile) { target = url } else { target = nil }
 
     guard let target else {
       states[profile.id] = .idle
@@ -615,62 +632,86 @@ final class ServerManager: ObservableObject {
   }
 
   func refreshMountedVolumes() {
-    let keys: [URLResourceKey] = [.volumeNameKey, .volumeIsLocalKey, .volumeIsReadOnlyKey]
-    let urls =
-      FileManager.default.mountedVolumeURLs(
-        includingResourceValuesForKeys: keys,
-        options: [.skipHiddenVolumes]
-      ) ?? []
-
-    mountedVolumes = urls.compactMap { url in
-      let values = try? url.resourceValues(forKeys: Set(keys))
-      return MountedVolume(
-        url: url,
-        name: values?.volumeName ?? url.lastPathComponent,
-        isLocal: values?.volumeIsLocal ?? true,
-        isReadOnly: values?.volumeIsReadOnly ?? false
-      )
+    guard mountedVolumesTask == nil else {
+      mountedVolumesNeedRefresh = true
+      return
     }
-    .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    mountedVolumesNeedRefresh = false
+    mountedVolumesTask = Task { [weak self] in
+      let volumes = await Task.detached(priority: .utility) { () -> [MountedVolume] in
+        let keys: Set<URLResourceKey> = [.volumeNameKey, .volumeIsLocalKey, .volumeIsReadOnlyKey]
+        let urls =
+          FileManager.default.mountedVolumeURLs(
+            includingResourceValuesForKeys: Array(keys), options: [.skipHiddenVolumes]
+          ) ?? []
+        return urls.map { url in
+          let values = try? url.resourceValues(forKeys: keys)
+          return MountedVolume(
+            url: url, name: values?.volumeName ?? url.lastPathComponent,
+            isLocal: values?.volumeIsLocal ?? true, isReadOnly: values?.volumeIsReadOnly ?? false)
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+      }.value
+      guard !Task.isCancelled, let self else { return }
+      if self.mountedVolumes != volumes { self.mountedVolumes = volumes }
+      self.mountedVolumesTask = nil
+      if self.mountedVolumesNeedRefresh { self.refreshMountedVolumes() }
+    }
   }
 
-  private func connectRclone(_ profile: ServerProfile) async {
+  private func isCurrentConnection(_ profile: ServerProfile, token: UUID) -> Bool {
+    !Task.isCancelled && connectionTasks[profile.id]?.token == token
+      && profiles.contains {
+        $0.id == profile.id && $0.configurationRevision == profile.configurationRevision
+      }
+  }
+
+  private func connectRclone(_ profile: ServerProfile, token: UUID) async {
     do {
-      let secrets = RcloneProfileSecrets(
-        password: password(for: profile),
-        keyPassphrase: keyPassphrase(for: profile),
-        sessionToken: sessionToken(for: profile)
-      )
+      let registryGeneration = await RemoteFileSystemRegistry.shared.connectionGeneration(
+        for: profile.id)
+      let secrets = try await connectionSecrets(for: profile)
       let session = try await RcloneRemoteSession.connect(
         profile: profile,
         secrets: secrets
       )
-      try Task.checkCancellation()
-      guard profiles.contains(where: { $0.id == profile.id }) else {
+      guard isCurrentConnection(profile, token: token) else {
         await session.close()
         return
       }
+      let accepted = await RemoteFileSystemRegistry.shared.register(
+        profile: profile, session: session, generation: registryGeneration
+      )
+      guard accepted, isCurrentConnection(profile, token: token) else {
+        await session.close()
+        if isCurrentConnection(profile, token: token) { states[profile.id] = .idle }
+        return
+      }
       remoteSessions[profile.id] = session
-      await RemoteFileSystemRegistry.shared.register(profile: profile, session: session)
       states[profile.id] = .connected(NafiURL.remoteRoot(for: profile))
     } catch is CancellationError {
-      states[profile.id] = .idle
+      if isCurrentConnection(profile, token: token) { states[profile.id] = .idle }
     } catch RcloneRuntimeError.binaryMissing {
+      guard isCurrentConnection(profile, token: token) else { return }
       states[profile.id] = .helperRequired(
         "rcloneが見つかりません。nafiに同梱するか、Homebrewでインストールしてください。"
       )
     } catch {
+      guard isCurrentConnection(profile, token: token) else { return }
       if profile.kind == .sftp,
         RcloneRemoteSession.isHostKeyRelatedErrorMessage(error.localizedDescription)
       {
         do {
           try await presentHostKeyApproval(for: profile)
         } catch {
-          states[profile.id] = .failed(error.localizedDescription)
+          if isCurrentConnection(profile, token: token) {
+            states[profile.id] = .failed(error.localizedDescription)
+          }
           return
         }
       }
-      states[profile.id] = .failed(error.localizedDescription)
+      if isCurrentConnection(profile, token: token) {
+        states[profile.id] = .failed(error.localizedDescription)
+      }
     }
   }
 
@@ -683,24 +724,34 @@ final class ServerManager: ObservableObject {
     guard profiles.contains(where: { $0.id == profile.id }) else {
       throw RemoteServerError.invalidResponse("接続プロファイルが削除されています。")
     }
-    if hostKeyApprovalRequest == nil || hostKeyApprovalRequest?.profileID == profile.id {
-      hostKeyApprovalRequest = SSHHostKeyApprovalRequest(
-        profileID: profile.id,
-        profileName: profile.name,
-        scan: scan,
-        existingIdentities: existing
-      )
+    guard !Task.isCancelled else { return }
+    let request = SSHHostKeyApprovalRequest(
+      profileID: profile.id, profileName: profile.name, scan: scan, existingIdentities: existing
+    )
+    if hostKeyApprovalRequest == nil {
+      hostKeyApprovalRequest = request
+    } else if hostKeyApprovalRequest?.profileID != profile.id,
+      !pendingHostKeyApprovals.contains(where: { $0.profileID == profile.id })
+    {
+      pendingHostKeyApprovals.append(request)
     }
   }
 
-  private func connectUsingNetFS(_ profile: ServerProfile) async {
+  private func connectUsingNetFS(_ profile: ServerProfile, token: UUID) async {
     guard let url = profile.connectionURL else {
       states[profile.id] = .failed("接続URLを作成できません")
       return
     }
 
     let username = profile.username
-    let password = password(for: profile)
+    let password: String
+    do { password = try await connectionSecrets(for: profile).password } catch {
+      if isCurrentConnection(profile, token: token) {
+        states[profile.id] = .failed(error.localizedDescription)
+      }
+      return
+    }
+    guard isCurrentConnection(profile, token: token) else { return }
     let mountPath: URL? = {
       guard !profile.localMountPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         return nil
@@ -720,7 +771,7 @@ final class ServerManager: ObservableObject {
       )
     }.value
 
-    if Task.isCancelled || !profiles.contains(where: { $0.id == profile.id }) {
+    if !isCurrentConnection(profile, token: token) {
       if case .success(let mountedURLs) = result {
         await Task.detached(priority: .utility) {
           for mountedURL in mountedURLs {
@@ -728,7 +779,6 @@ final class ServerManager: ObservableObject {
           }
         }.value
       }
-      states[profile.id] = .idle
       return
     }
 
@@ -847,24 +897,31 @@ final class ServerManager: ObservableObject {
 
   private func recoverQuarantinedProfilesIfPossible() {
     let directory = persistenceURL.deletingLastPathComponent()
-    guard let candidates = try? FileManager.default.contentsOfDirectory(
-      at: directory,
-      includingPropertiesForKeys: [.contentModificationDateKey],
-      options: [.skipsHiddenFiles]
-    ) else { return }
+    guard
+      let candidates = try? FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: [.contentModificationDateKey],
+        options: [.skipsHiddenFiles]
+      )
+    else { return }
     let backups = candidates.filter {
       $0.lastPathComponent.hasPrefix("servers.corrupt-") && $0.pathExtension == "json"
     }.sorted {
-      let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-      let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+      let lhs =
+        (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+        ?? .distantPast
+      let rhs =
+        (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+        ?? .distantPast
       return lhs > rhs
     }
 
     for backup in backups.prefix(10) {
-      guard let data = try? AppStoragePaths.readRegularFile(
-        at: backup,
-        maximumBytes: 8 * 1_024 * 1_024
-      ), var decoded = try? JSONDecoder().decode([ServerProfile].self, from: data),
+      guard
+        let data = try? AppStoragePaths.readRegularFile(
+          at: backup,
+          maximumBytes: 8 * 1_024 * 1_024
+        ), var decoded = try? JSONDecoder().decode([ServerProfile].self, from: data),
         decoded.count <= 10_000
       else { continue }
       var seen = Set<UUID>()
@@ -882,15 +939,17 @@ final class ServerManager: ObservableObject {
   }
 
   private func persistProfiles(_ values: [ServerProfile]) throws {
+    try Self.writeProfiles(values, to: persistenceURL)
+  }
+
+  private nonisolated static func writeProfiles(_ values: [ServerProfile], to persistenceURL: URL)
+    throws
+  {
     guard values.count <= 10_000 else { throw CocoaError(.fileWriteOutOfSpace) }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(values)
     guard data.count <= 8 * 1_024 * 1_024 else { throw CocoaError(.fileWriteOutOfSpace) }
-    try data.write(
-      to: persistenceURL,
-      options: [.atomic, .completeFileProtectionUnlessOpen]
-    )
-    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: persistenceURL.path)
+    try AppStoragePaths.writePrivateAtomically(data, to: persistenceURL)
   }
 }

@@ -4,7 +4,6 @@ import UniformTypeIdentifiers
 
 struct SidebarSectionHeader: View {
   let title: String
-  var topPadding: CGFloat = 0
   var showsAction = true
   var actionHelp: String
   var isActionDisabled = false
@@ -29,17 +28,7 @@ struct SidebarSectionHeader: View {
         .accessibilityLabel(actionHelp)
       }
     }
-    .padding(.top, topPadding)
-    .padding(.leading, 9)
-    // +ボタン中心を ServerSidebarRow の状態インジケーター中心
-    // (8 + 11 + 3.5 = 22.5pt from right) に揃える。
-    // listRowInsets.trailing(4) + frame(26)/2(13) を加味すると trailing は 5.5。
-    .padding(.trailing, 5.5)
-    .frame(maxWidth: .infinity, minHeight: 22, alignment: .center)
-    .contentShape(Rectangle())
-    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 1, trailing: 4))
-    .listRowBackground(Color.clear)
-    .listRowSeparator(.hidden)
+
   }
 }
 
@@ -275,8 +264,11 @@ struct ServerSidebarRow: View {
       Divider()
       Button("編集", action: edit)
       Button("削除", role: .destructive) {
-        do { try manager.remove(profile) }
-        catch { appState.presentationErrorMessage = error.localizedDescription }
+        Task {
+          do { try await manager.remove(profile) } catch {
+            appState.presentationErrorMessage = error.localizedDescription
+          }
+        }
       }
     }
     .help(helpText)

@@ -110,6 +110,7 @@ final class AppState: ObservableObject {
   var activeModel: FilePaneModel { workspace.activeModel }
 
   func register(window: NSWindow, for state: BrowserWindowState) {
+    guard nativeWindows[state.id]?.window !== window else { return }
     windowStates[state.id] = state
     nativeWindows[state.id] = WeakWindowBox(window)
     workspaceObservers[state.id] = state.workspace.objectWillChange.sink { [weak self] _ in
@@ -197,25 +198,22 @@ final class AppState: ObservableObject {
       defaultFileManager.refresh()
       cloudStorage.refresh()
       serverManager.refreshMountedVolumes()
-      await RcloneRuntime.shared.setOAuthTokenUpdateHandler { [weak serverManager] profileID, token in
+      await RcloneRuntime.shared.setOAuthTokenUpdateHandler {
+        [weak serverManager] profileID, token in
         guard let serverManager else { return }
         try await serverManager.persistOAuthToken(token, for: profileID)
       }
-      // rclone is intentionally lazy. Local-only sessions should not pay for a
-      // resident helper process, open loopback sockets, descriptor heartbeats,
-      // or RC housekeeping. The first remote/transfer operation starts it on demand.
-      await serverManager.connectAutoProfiles()
-      // File Provider remotes are configured only when Finder actually asks for
-      // them. Keeping them out of startup is what allows rclone to be fully off
-      // while the published domains are idle.
+      // Restore the interface independently of slow or unavailable servers.
+      syncManager.startScheduling()
+      systemIntegration.refresh()
+      restoreRemainingSessionTabsIfNeeded()
+      async let connections: Void = serverManager.connectAutoProfiles()
       let recoveryWarnings = await UnifiedFileSystemService.recoverPendingRemoteOperations()
       if !recoveryWarnings.isEmpty {
         self.presentationErrorMessage = recoveryWarnings.joined(separator: "\n\n")
       }
       await TransferQueue.shared.start()
-      syncManager.startScheduling()
-      systemIntegration.refresh()
-      restoreRemainingSessionTabsIfNeeded()
+      await connections
     }
     startupTask = task
     await task.value
@@ -262,7 +260,6 @@ final class AppState: ObservableObject {
       self?.presentQuickOpen()
     }
   }
-
 
   func handleExternalCommand(_ command: NafiExternalCommand) {
     NSApplication.shared.setActivationPolicy(.regular)

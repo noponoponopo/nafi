@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+  import Darwin
+#elseif canImport(Glibc)
+  import Glibc
+#endif
+
 enum AppStoragePaths {
   private static let directoryName = "nafi"
   private static let legacyDirectoryName = "Nami"
@@ -50,36 +56,43 @@ enum AppStoragePaths {
         withIntermediateDirectories: true,
         attributes: [.posixPermissions: 0o700]
       )
-      try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: destination.path)
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o700], ofItemAtPath: destination.path)
     } catch {
       // The eventual caller receives the concrete read/write error.
     }
     return destination
   }
 
-  static var sharedDirectory: URL {
+  static let fileProviderDirectory: URL? = {
+    // The host historically shares the extension's application-support directory.
+    // File access is process-specific on macOS; a shell probe is not authoritative.
     let value = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Containers/app.nafi.filemanager.fileprovider/Data", isDirectory: true)
       .appendingPathComponent("Library/Application Support/nafi", isDirectory: true)
-    try? FileManager.default.createDirectory(
-      at: value,
-      withIntermediateDirectories: true,
-      attributes: [.posixPermissions: 0o700]
-    )
-    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: value.path)
-    return value
-  }
+    do {
+      try FileManager.default.createDirectory(at: value, withIntermediateDirectories: true)
+      let probe = value.appendingPathComponent(".nafi-access-\(UUID().uuidString)")
+      try Data().write(to: probe, options: .atomic)
+      try FileManager.default.removeItem(at: probe)
+      return value
+    } catch {
+      return nil
+    }
+  }()
 
   static var legacyAppGroupDirectory: URL {
     FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent("Library/Group Containers/group.app.nafi.filemanager", isDirectory: true)
+      .appendingPathComponent(
+        "Library/Group Containers/group.app.nafi.filemanager", isDirectory: true
+      )
       .appendingPathComponent("Library/Application Support/nafi", isDirectory: true)
   }
 
-  static func sharedFile(named name: String) -> URL {
+  static func fileProviderFile(named name: String) -> URL? {
     let safe = (name as NSString).lastPathComponent
     precondition(safe == name && !name.isEmpty)
-    return sharedDirectory.appendingPathComponent(safe)
+    return fileProviderDirectory?.appendingPathComponent(safe)
   }
 
   static func file(named name: String) -> URL {
@@ -93,11 +106,31 @@ enum AppStoragePaths {
       return destination
     }
 
-    let legacy = applicationSupportDirectory
+    let legacy =
+      applicationSupportDirectory
       .appendingPathComponent(legacyDirectoryName, isDirectory: true)
       .appendingPathComponent(safeName, isDirectory: false)
     migrateLegacyFileIfNeeded(from: legacy, to: destination)
     return destination
+  }
+
+  static func writePrivateAtomically(_ data: Data, to url: URL) throws {
+    let temporary = url.deletingLastPathComponent().appendingPathComponent(
+      ".nafi-\(UUID().uuidString)")
+    let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+    guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer {
+      try? handle.close()
+      try? FileManager.default.removeItem(at: temporary)
+    }
+    try handle.write(contentsOf: data)
+    try handle.synchronize()
+    // Permissions are already correct before publication. No fallible work follows
+    // the atomic replacement, so disk and the actor's cached vault cannot diverge.
+    guard rename(temporary.path, url.path) == 0 else {
+      throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
   }
 
   static func readRegularFile(at url: URL, maximumBytes: Int) throws -> Data {
@@ -106,7 +139,9 @@ enum AppStoragePaths {
     }
     let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
     for attempt in 0..<2 {
-      let values = try url.resourceValues(forKeys: keys)
+      // NSURL caches resource values on an instance even after another writer replaces the file.
+      let freshURL = URL(fileURLWithPath: url.path)
+      let values = try freshURL.resourceValues(forKeys: keys)
       guard values.isRegularFile == true, values.isSymbolicLink != true,
         let size = values.fileSize, size >= 0, size <= maximumBytes
       else { throw CocoaError(.fileReadCorruptFile) }
@@ -126,7 +161,8 @@ enum AppStoragePaths {
       .replacingOccurrences(of: ":", with: "-")
     let base = url.deletingPathExtension().lastPathComponent
     let ext = url.pathExtension
-    let name = ext.isEmpty
+    let name =
+      ext.isEmpty
       ? "\(base).\(label)-\(suffix)"
       : "\(base).\(label)-\(suffix).\(ext)"
     let destination = uniqueURL(named: name, in: url.deletingLastPathComponent())

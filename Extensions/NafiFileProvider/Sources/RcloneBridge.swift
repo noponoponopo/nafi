@@ -207,11 +207,13 @@ actor FPRcloneBridge {
   }
 
   private func ensureRuntimeReady() async throws {
-    if let current = descriptor, descriptorIsUsable(current) { return }
+    // The host can revoke readiness after a config mismatch. Do not reuse a
+    // previously cached descriptor once the shared record has changed.
     if let current = try? FPSharedStore.descriptor(), descriptorIsUsable(current) {
       descriptor = current
       return
     }
+    descriptor = nil
 
     guard let record else { throw FPBridgeError.runtimeUnavailable }
     requestRuntime(for: record)

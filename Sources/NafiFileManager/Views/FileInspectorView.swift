@@ -100,6 +100,7 @@ struct FileInspectorView: View {
                 if let selectedApplicationURL {
                   Image(nsImage: applicationIcon(selectedApplicationURL))
                     .resizable()
+                    .scaledToFit()
                     .frame(width: 20, height: 20)
                   Text(applicationName(selectedApplicationURL))
                     .lineLimit(1)

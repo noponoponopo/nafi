@@ -5,7 +5,7 @@ struct RcloneProviderEditor: View {
   @Binding var backend: String
   @Binding var parametersJSON: String
   @Binding var secretJSON: String
-  let onConfigurationCompleted: @MainActor () throws -> Void
+  let onConfigurationCompleted: @MainActor () async throws -> Void
 
   @State private var provider: RcloneProviderDefinition?
   @State private var providers: [RcloneProviderDefinition] = []
@@ -21,6 +21,7 @@ struct RcloneProviderEditor: View {
   @State private var status: String?
   @State private var errorMessage: String?
   @State private var configurationTask: Task<Void, Never>?
+  @State private var configurationID: UUID?
 
   var body: some View {
     Group {
@@ -154,10 +155,12 @@ struct RcloneProviderEditor: View {
   @ViewBuilder
   private func configQuestionControl(_ option: RcloneProviderOption) -> some View {
     if option.type == "bool" {
-      Toggle(Self.label(for: option.name), isOn: Binding(
-        get: { answer == "true" },
-        set: { answer = $0 ? "true" : "false" }
-      ))
+      Toggle(
+        Self.label(for: option.name),
+        isOn: Binding(
+          get: { answer == "true" },
+          set: { answer = $0 ? "true" : "false" }
+        ))
     } else if !option.examples.isEmpty {
       Picker(Self.label(for: option.name), selection: $answer) {
         ForEach(option.examples) { example in
@@ -208,6 +211,8 @@ struct RcloneProviderEditor: View {
 
   @MainActor
   private func loadProvider() async {
+    cancelConfiguration()
+    let requestedBackend = backend
     isLoading = true
     status = nil
     question = nil
@@ -216,9 +221,12 @@ struct RcloneProviderEditor: View {
     useSharedDrive = Self.text(from: values["team_drive"])?.isEmpty == false
     do {
       let catalog = try await RcloneRuntime.shared.providerCatalog()
+      try Task.checkCancellation()
+      guard backend == requestedBackend else { return }
       providers = catalog.providers
-      provider = catalog.providers.first { $0.name == backend }
+      provider = catalog.providers.first { $0.name == requestedBackend }
     } catch {
+      guard !Task.isCancelled, backend == requestedBackend else { return }
       provider = nil
       errorMessage = error.localizedDescription
     }
@@ -227,6 +235,8 @@ struct RcloneProviderEditor: View {
 
   private func startConfiguration() {
     configurationTask?.cancel()
+    let operationID = UUID()
+    configurationID = operationID
     isConfiguring = true
     status = nil
     configurationTask = Task {
@@ -240,8 +250,11 @@ struct RcloneProviderEditor: View {
       } catch {
         if !Task.isCancelled { errorMessage = error.localizedDescription }
       }
-      if !Task.isCancelled { isConfiguring = false }
-      configurationTask = nil
+      if configurationID == operationID {
+        isConfiguring = false
+        configurationTask = nil
+        configurationID = nil
+      }
     }
   }
 
@@ -249,6 +262,8 @@ struct RcloneProviderEditor: View {
     let state = questionState
     let result = answer
     configurationTask?.cancel()
+    let operationID = UUID()
+    configurationID = operationID
     isConfiguring = true
     configurationTask = Task {
       do {
@@ -263,25 +278,30 @@ struct RcloneProviderEditor: View {
       } catch {
         if !Task.isCancelled { errorMessage = error.localizedDescription }
       }
-      if !Task.isCancelled { isConfiguring = false }
-      configurationTask = nil
+      if configurationID == operationID {
+        isConfiguring = false
+        configurationTask = nil
+        configurationID = nil
+      }
     }
   }
 
   private func cancelConfiguration() {
-    guard configurationTask != nil || isConfiguring else { return }
+    guard configurationTask != nil || isConfiguring || question != nil else { return }
     configurationTask?.cancel()
     configurationTask = nil
+    configurationID = nil
     isConfiguring = false
     question = nil
     questionState = ""
     answer = ""
     status = nil
-    Task { try? await RcloneRuntime.shared.restart() }
+    Task { await RcloneRuntime.shared.cancelProviderAuthentication(profileID: profileID) }
   }
 
   @MainActor
   private func handle(_ response: RcloneConfigResponse) async throws {
+    try Task.checkCancellation()
     guard response.error.isEmpty else {
       throw RcloneRuntimeError.remoteConfiguration(response.error)
     }
@@ -307,16 +327,23 @@ struct RcloneProviderEditor: View {
     }
 
     let generated = try await RcloneRuntime.shared.providerConfiguration(profileID: profileID)
-    let sensitiveNames = Set(provider?.options.filter { $0.isPassword || $0.sensitive }.map(\.name) ?? [])
+    try Task.checkCancellation()
+    let refreshedSecrets: Set<String> = ["token", "refresh_token", "access_token", "client_secret"]
+    let sensitiveNames = Set(
+      provider?.options.filter { $0.isPassword || $0.sensitive }.map(\.name) ?? []
+    )
+    .union(refreshedSecrets)
     for (key, value) in generated where key != "type" {
       if sensitiveNames.contains(key) {
-        if secrets[key] == nil { secrets[key] = value }
+        if secrets[key] == nil || refreshedSecrets.contains(key) { secrets[key] = value }
+        values[key] = nil
       } else {
         values[key] = value
       }
     }
     persistJSON()
-    try onConfigurationCompleted()
+    try await onConfigurationCompleted()
+    try Task.checkCancellation()
     question = nil
     answer = ""
     status = "アカウント設定済み"

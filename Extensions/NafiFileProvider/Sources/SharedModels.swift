@@ -88,10 +88,9 @@ enum FPSharedStore {
     let root = record.rootPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     return root.isEmpty && isLinuxPseudoFilesystemPath(path)
   }
-  static var root: URL? {
-    FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-      .appendingPathComponent("nafi", isDirectory: true)
-  }
+  static let root: URL? = FileManager.default.urls(
+    for: .applicationSupportDirectory, in: .userDomainMask
+  ).first?.appendingPathComponent("nafi", isDirectory: true)
 
   private struct SnapshotGenerationCacheEntry {
     let modifiedAt: Date?
@@ -130,10 +129,8 @@ enum FPSharedStore {
 
   static func domainRecord(for domain: NSFileProviderDomain) throws -> FPDomainRecord {
     guard let root else { throw FPBridgeError.domainUnavailable }
-    let data = try regularFileData(
-      at: root.appendingPathComponent("file-provider-domains.json"),
-      maximumBytes: 4 * 1024 * 1024
-    )
+    let store = root.appendingPathComponent("file-provider-domains.json")
+    let data = try regularFileData(at: store, maximumBytes: 4 * 1024 * 1024)
     let records = try JSONDecoder().decode([FPDomainRecord].self, from: data)
     guard records.count <= 10_000 else { throw FPBridgeError.malformedResponse }
     let raw = domain.identifier.rawValue

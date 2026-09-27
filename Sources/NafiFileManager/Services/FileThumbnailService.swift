@@ -65,7 +65,12 @@ final class FileThumbnailService {
     return cache
   }()
 
-  private var inFlight: [String: Task<NSImage?, Never>] = [:]
+  private struct PendingThumbnail {
+    let id: UUID
+    let task: Task<NSImage?, Never>
+    var waiters: Set<UUID>
+  }
+  private var inFlight: [String: PendingThumbnail] = [:]
 
   private init() {}
 
@@ -77,40 +82,62 @@ final class FileThumbnailService {
     if let cached = cache.object(forKey: cacheKey as NSString) {
       return cached
     }
-    if let task = inFlight[cacheKey] {
-      return await task.value
+    guard !Task.isCancelled else { return nil }
+    let waiterID = UUID()
+    let pending: PendingThumbnail
+    if var existing = inFlight[cacheKey] {
+      existing.waiters.insert(waiterID)
+      pending = existing
+      inFlight[cacheKey] = existing
+    } else {
+      let task = Task<NSImage?, Never>(priority: .utility) {
+        // Bound the download as well as decoding, not just Quick Look's final step.
+        guard await thumbnailGenerationLimiter.acquire() else { return nil }
+        let image: NSImage?
+        do {
+          try Task.checkCancellation()
+          image = try await UnifiedFileSystemService.withTemporaryLocalCopy(of: item.url) {
+            localURL in
+            guard !Task.isCancelled else { return nil }
+            return await ThumbnailRequest(url: localURL, size: requestSize, scale: scale).result()
+          }
+        } catch {
+          image = nil
+        }
+        await thumbnailGenerationLimiter.release()
+        return Task.isCancelled ? nil : image
+      }
+      pending = PendingThumbnail(id: UUID(), task: task, waiters: [waiterID])
+      inFlight[cacheKey] = pending
     }
 
-    let task = Task<NSImage?, Never>(priority: .utility) {
-      do {
-        return try await UnifiedFileSystemService.withTemporaryLocalCopy(of: item.url) { localURL in
-          guard await thumbnailGenerationLimiter.acquire() else { return nil }
-          if Task.isCancelled {
-            await thumbnailGenerationLimiter.release()
-            return nil
-          }
-          let image = await Self.generateThumbnail(
-            for: localURL,
-            pointSize: requestSize,
-            scale: scale
-          )
-          await thumbnailGenerationLimiter.release()
-          return image
-        }
-      } catch {
-        return nil
+    let image = await withTaskCancellationHandler {
+      await pending.task.value
+    } onCancel: {
+      Task { @MainActor in
+        self.releaseWaiter(waiterID, key: cacheKey, requestID: pending.id)
       }
     }
-    inFlight[cacheKey] = task
-
-    let image = await task.value
-    inFlight[cacheKey] = nil
-    if let image {
-      let pixelWidth = max(1, Int(image.size.width * scale))
-      let pixelHeight = max(1, Int(image.size.height * scale))
-      cache.setObject(image, forKey: cacheKey as NSString, cost: pixelWidth * pixelHeight * 4)
+    if inFlight[cacheKey]?.id == pending.id {
+      inFlight[cacheKey] = nil
+      if let image {
+        let pixelWidth = max(1, Int(image.size.width * scale))
+        let pixelHeight = max(1, Int(image.size.height * scale))
+        cache.setObject(image, forKey: cacheKey as NSString, cost: pixelWidth * pixelHeight * 4)
+      }
     }
-    return image
+    return Task.isCancelled ? nil : image
+  }
+
+  private func releaseWaiter(_ id: UUID, key: String, requestID: UUID) {
+    guard var pending = inFlight[key], pending.id == requestID else { return }
+    pending.waiters.remove(id)
+    if pending.waiters.isEmpty {
+      inFlight[key] = nil
+      pending.task.cancel()
+    } else {
+      inFlight[key] = pending
+    }
   }
 
   private func makeCacheKey(for item: FileItem, pointSize: CGSize, scale: CGFloat) -> String {
@@ -127,23 +154,45 @@ final class FileThumbnailService {
     return CGSize(width: edge, height: edge)
   }
 
-  private static func generateThumbnail(
-    for url: URL,
-    pointSize: CGSize,
-    scale: CGFloat
-  ) async -> NSImage? {
-    await withCheckedContinuation { continuation in
-      let request = QLThumbnailGenerator.Request(
-        fileAt: url,
-        size: pointSize,
-        scale: scale,
-        representationTypes: [.thumbnail]
-      )
-      QLThumbnailGenerator.shared.generateBestRepresentation(for: request) {
-        representation,
-        _ in
-        continuation.resume(returning: representation?.nsImage)
+}
+
+@MainActor
+private final class ThumbnailRequest {
+  private let request: QLThumbnailGenerator.Request
+  private var continuation: CheckedContinuation<NSImage?, Never>?
+  private var completed = false
+
+  init(url: URL, size: CGSize, scale: CGFloat) {
+    request = QLThumbnailGenerator.Request(
+      fileAt: url, size: size, scale: scale, representationTypes: [.thumbnail]
+    )
+  }
+
+  func result() async -> NSImage? {
+    await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        guard !completed, !Task.isCancelled else {
+          continuation.resume(returning: nil)
+          return
+        }
+        self.continuation = continuation
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
+          Task { @MainActor in self.finish(representation?.nsImage) }
+        }
+      }
+    } onCancel: {
+      Task { @MainActor in
+        QLThumbnailGenerator.shared.cancel(self.request)
+        self.finish(nil)
       }
     }
+  }
+
+  private func finish(_ image: NSImage?) {
+    guard !completed else { return }
+    completed = true
+    let pending = continuation
+    continuation = nil
+    pending?.resume(returning: image)
   }
 }

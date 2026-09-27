@@ -11,6 +11,12 @@ actor RcloneRemoteSession: RemoteServerSession {
     let loadedAt: Date
     let items: [RemoteFileItem]
   }
+  private struct DirectoryLoad {
+    let id: UUID
+    let task: Task<[RemoteFileItem], Error>
+  }
+  private var cacheGeneration: UInt64 = 0
+  private var directoryLoading: [String: DirectoryLoad] = [:]
   private var directoryCache: [String: CachedDirectory] = [:]
   private let directoryCacheLifetime: TimeInterval = 2.5
   private let maximumCachedDirectories = 256
@@ -21,7 +27,7 @@ actor RcloneRemoteSession: RemoteServerSession {
     let items: [RemoteFileItem]
   }
   private var recursiveCatalogCache: [String: CachedRecursiveCatalog] = [:]
-  private var recursiveCatalogLoading: [String: Task<[RemoteFileItem], Error>] = [:]
+  private var recursiveCatalogLoading: [String: DirectoryLoad] = [:]
   // Search catalog data is metadata only. Five minutes avoids repeatedly asking
   // cloud providers for the same tree while still bounding remote-only staleness.
   private let recursiveCatalogLifetime: TimeInterval = 5 * 60
@@ -83,14 +89,45 @@ actor RcloneRemoteSession: RemoteServerSession {
   }
 
   func listDirectory(at path: String) async throws -> [RemoteFileItem] {
-    try await ensureReady()
-    let cleanPath = try remoteArgument(path)
+    try Task.checkCancellation()
+    guard !isClosed else { throw RemoteServerError.notConnected }
     let cacheKey = RemotePath.normalized(path)
     if let cached = directoryCache[cacheKey],
       Date().timeIntervalSince(cached.loadedAt) <= directoryCacheLifetime
     {
       return cached.items
     }
+    if let pending = directoryLoading[cacheKey] {
+      let expectedGeneration = cacheGeneration
+      let items = try await pending.task.value
+      guard !isClosed, cacheGeneration == expectedGeneration else { throw CancellationError() }
+      try Task.checkCancellation()
+      return items
+    }
+    let generation = cacheGeneration
+    let id = UUID()
+    let task = Task { try await self.loadDirectory(at: cacheKey) }
+    directoryLoading[cacheKey] = DirectoryLoad(id: id, task: task)
+    defer {
+      if directoryLoading[cacheKey]?.id == id { directoryLoading[cacheKey] = nil }
+    }
+    let items = try await task.value
+    guard !isClosed, generation == cacheGeneration else { throw CancellationError() }
+    directoryCache[cacheKey] = CachedDirectory(loadedAt: Date(), items: items)
+    if directoryCache.count > maximumCachedDirectories {
+      for key in directoryCache.sorted(by: { $0.value.loadedAt < $1.value.loadedAt })
+        .prefix(directoryCache.count - maximumCachedDirectories).map(\.key)
+      {
+        directoryCache[key] = nil
+      }
+    }
+    try Task.checkCancellation()
+    return items
+  }
+
+  private func loadDirectory(at path: String) async throws -> [RemoteFileItem] {
+    try await ensureReady()
+    let cleanPath = try remoteArgument(path)
     let response = try await listDirectoryResponse(at: cleanPath)
     guard let raw = response["list"] else { return [] }
     let data = try JSONEncoder().encode(raw)
@@ -113,7 +150,8 @@ actor RcloneRemoteSession: RemoteServerSession {
       occurrenceByKey[key, default: 0] += 1
       let position = occurrenceByKey[key] ?? 1
       let isAmbiguous = (groups[key]?.count ?? 0) > 1
-      let token = isAmbiguous
+      let token =
+        isAmbiguous
         ? (entry.id ?? "index:\(position):\(entry.path)")
         : nil
       let displayName = isAmbiguous ? "\(entry.name) — 重複 \(position)" : entry.name
@@ -130,24 +168,23 @@ actor RcloneRemoteSession: RemoteServerSession {
         ambiguityToken: token
       )
     }.sorted(by: remoteItemSort)
-    directoryCache[cacheKey] = CachedDirectory(loadedAt: Date(), items: items)
-    if directoryCache.count > maximumCachedDirectories {
-      let overflow = directoryCache.count - maximumCachedDirectories
-      for key in directoryCache.sorted(by: { $0.value.loadedAt < $1.value.loadedAt }).prefix(overflow).map(\.key) {
-        directoryCache[key] = nil
-      }
-    }
+    try Task.checkCancellation()
     return items
   }
 
   func recursiveCatalog(at path: String) async throws -> [RemoteFileItem] {
+    try Task.checkCancellation()
+    guard !isClosed else { throw RemoteServerError.notConnected }
     let rootPath = RemotePath.normalized(path)
     let now = Date()
 
     // A cached ancestor catalog can answer a descendant search without another
     // remote API call. Prefer the nearest ancestor to minimize in-memory work.
     let covering = recursiveCatalogCache.values
-      .filter { now.timeIntervalSince($0.loadedAt) <= recursiveCatalogLifetime && Self.path($0.rootPath, contains: rootPath) }
+      .filter {
+        now.timeIntervalSince($0.loadedAt) <= recursiveCatalogLifetime
+          && Self.path($0.rootPath, contains: rootPath)
+      }
       .max { $0.rootPath.count < $1.rootPath.count }
     if let covering {
       if covering.rootPath == rootPath { return covering.items }
@@ -158,9 +195,12 @@ actor RcloneRemoteSession: RemoteServerSession {
     // awaiting rclone. Share the in-flight catalog build instead of issuing a
     // duplicate full-tree listing.
     if let (loadingRoot, loading) = coveringRecursiveLoad(for: rootPath) {
+      let expectedGeneration = cacheGeneration
       let items = try await loading.value
+      guard !isClosed, cacheGeneration == expectedGeneration else { throw CancellationError() }
       try Task.checkCancellation()
-      return loadingRoot == rootPath ? items : items.filter { Self.path(rootPath, contains: $0.path) }
+      return loadingRoot == rootPath
+        ? items : items.filter { Self.path(rootPath, contains: $0.path) }
     }
 
     // Do not wake/configure rclone when the metadata catalog can answer the
@@ -169,7 +209,10 @@ actor RcloneRemoteSession: RemoteServerSession {
     try await ensureReady()
     let refreshedNow = Date()
     let refreshedCovering = recursiveCatalogCache.values
-      .filter { refreshedNow.timeIntervalSince($0.loadedAt) <= recursiveCatalogLifetime && Self.path($0.rootPath, contains: rootPath) }
+      .filter {
+        refreshedNow.timeIntervalSince($0.loadedAt) <= recursiveCatalogLifetime
+          && Self.path($0.rootPath, contains: rootPath)
+      }
       .max { $0.rootPath.count < $1.rootPath.count }
     if let refreshedCovering {
       return refreshedCovering.rootPath == rootPath
@@ -177,19 +220,29 @@ actor RcloneRemoteSession: RemoteServerSession {
         : refreshedCovering.items.filter { Self.path(rootPath, contains: $0.path) }
     }
     if let (loadingRoot, loading) = coveringRecursiveLoad(for: rootPath) {
+      let expectedGeneration = cacheGeneration
       let items = try await loading.value
+      guard !isClosed, cacheGeneration == expectedGeneration else { throw CancellationError() }
       try Task.checkCancellation()
-      return loadingRoot == rootPath ? items : items.filter { Self.path(rootPath, contains: $0.path) }
+      return loadingRoot == rootPath
+        ? items : items.filter { Self.path(rootPath, contains: $0.path) }
     }
 
+    let id = UUID()
+    let generation = cacheGeneration
     let task = Task<[RemoteFileItem], Error> { [weak self] in
       guard let self else { throw CancellationError() }
       return try await self.loadRecursiveCatalog(rootPath: rootPath)
     }
-    recursiveCatalogLoading[rootPath] = task
+    recursiveCatalogLoading[rootPath] = DirectoryLoad(id: id, task: task)
+    defer {
+      if recursiveCatalogLoading[rootPath]?.id == id { recursiveCatalogLoading[rootPath] = nil }
+    }
     do {
       let items = try await task.value
-      recursiveCatalogLoading[rootPath] = nil
+      guard !isClosed, generation == cacheGeneration, !task.isCancelled else {
+        throw CancellationError()
+      }
       // Preserve successful work even when the pane that initiated the load was
       // canceled after another pane had already joined the same request.
       recursiveCatalogCache[rootPath] = CachedRecursiveCatalog(
@@ -201,7 +254,6 @@ actor RcloneRemoteSession: RemoteServerSession {
       try Task.checkCancellation()
       return items
     } catch {
-      recursiveCatalogLoading[rootPath] = nil
       throw error
     }
   }
@@ -212,7 +264,7 @@ actor RcloneRemoteSession: RemoteServerSession {
     recursiveCatalogLoading
       .filter { Self.path($0.key, contains: rootPath) }
       .max { $0.key.count < $1.key.count }
-      .map { ($0.key, $0.value) }
+      .map { ($0.key, $0.value.task) }
   }
 
   private func loadRecursiveCatalog(rootPath: String) async throws -> [RemoteFileItem] {
@@ -262,7 +314,8 @@ actor RcloneRemoteSession: RemoteServerSession {
     }
 
     let relativePaths = entries.map { entry in entry.path.isEmpty ? entry.name : entry.path }
-    let groups = Dictionary(grouping: zip(entries.indices, relativePaths), by: { duplicateKey($0.1) })
+    let groups = Dictionary(
+      grouping: zip(entries.indices, relativePaths), by: { duplicateKey($0.1) })
     var occurrenceByKey: [String: Int] = [:]
     var items: [RemoteFileItem] = []
     items.reserveCapacity(entries.count)
@@ -294,7 +347,8 @@ actor RcloneRemoteSession: RemoteServerSession {
   private func trimRecursiveCatalogCacheIfNeeded() {
     guard recursiveCatalogCache.count > maximumRecursiveCatalogRoots else { return }
     let overflow = recursiveCatalogCache.count - maximumRecursiveCatalogRoots
-    for key in recursiveCatalogCache
+    for key
+      in recursiveCatalogCache
       .sorted(by: { $0.value.loadedAt < $1.value.loadedAt })
       .prefix(overflow)
       .map(\.key)
@@ -304,7 +358,11 @@ actor RcloneRemoteSession: RemoteServerSession {
   }
 
   func invalidateSearchCache() async {
-    recursiveCatalogLoading.values.forEach { $0.cancel() }
+    cacheGeneration &+= 1
+    directoryLoading.values.forEach { $0.task.cancel() }
+    directoryLoading.removeAll(keepingCapacity: true)
+    directoryCache.removeAll(keepingCapacity: true)
+    recursiveCatalogLoading.values.forEach { $0.task.cancel() }
     recursiveCatalogLoading.removeAll(keepingCapacity: true)
     recursiveCatalogCache.removeAll(keepingCapacity: true)
   }
@@ -317,8 +375,9 @@ actor RcloneRemoteSession: RemoteServerSession {
   }
 
   private static func isLinuxPseudoFilesystemPath(_ path: String) -> Bool {
-    guard let first = RemotePath.normalized(path)
-      .split(separator: "/", omittingEmptySubsequences: true).first
+    guard
+      let first = RemotePath.normalized(path)
+        .split(separator: "/", omittingEmptySubsequences: true).first
     else { return false }
     return first == "proc" || first == "sys" || first == "dev"
   }
@@ -493,7 +552,8 @@ actor RcloneRemoteSession: RemoteServerSession {
     guard item?.isDirectory == false else { throw originalError }
 
     let destinationParent = localURL.deletingLastPathComponent()
-    try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+      at: destinationParent, withIntermediateDirectories: true)
     let staging = destinationParent.appendingPathComponent(
       ".nafi-box-download-\(UUID().uuidString)",
       isDirectory: true
@@ -555,8 +615,11 @@ actor RcloneRemoteSession: RemoteServerSession {
 
   func close() async {
     isClosed = true
+    cacheGeneration &+= 1
+    directoryLoading.values.forEach { $0.task.cancel() }
+    directoryLoading.removeAll()
     directoryCache.removeAll()
-    recursiveCatalogLoading.values.forEach { $0.cancel() }
+    recursiveCatalogLoading.values.forEach { $0.task.cancel() }
     recursiveCatalogLoading.removeAll()
     recursiveCatalogCache.removeAll()
   }
@@ -669,7 +732,8 @@ actor RcloneRemoteSession: RemoteServerSession {
         }
         if status.finished {
           guard status.success == true, status.error.isEmpty else {
-            throw RemoteServerError.invalidResponse(status.error.isEmpty ? "rclone処理に失敗しました。" : status.error)
+            throw RemoteServerError.invalidResponse(
+              status.error.isEmpty ? "rclone処理に失敗しました。" : status.error)
           }
           return
         }
@@ -679,12 +743,14 @@ actor RcloneRemoteSession: RemoteServerSession {
         pollDelay = min(5_000_000_000, pollDelay * 2)
       }
     } catch {
+      let runtime = self.runtime
       await Task.detached(priority: .utility) {
-        let runtime = RcloneRuntime.shared
-        guard let status: RcloneJobStatus = try? await runtime.callDecodable(
-          "job/status",
-          parameters: ["jobid": .integer(job.jobID)]
-        ), status.executeID == job.executeID else { return }
+        guard
+          let status: RcloneJobStatus = try? await runtime.callDecodable(
+            "job/status",
+            parameters: ["jobid": .integer(job.jobID)]
+          ), status.executeID == job.executeID
+        else { return }
         _ = try? await runtime.call("job/stop", parameters: ["jobid": .integer(job.jobID)])
       }.value
       throw error
@@ -692,13 +758,16 @@ actor RcloneRemoteSession: RemoteServerSession {
   }
 
   private func invalidateCache(containing path: String) {
+    cacheGeneration &+= 1
+    directoryLoading.values.forEach { $0.task.cancel() }
+    directoryLoading.removeAll(keepingCapacity: true)
     let normalized = RemotePath.normalized(path)
     directoryCache[normalized] = nil
     directoryCache[RemotePath.parent(of: normalized)] = nil
     // Any mutation may affect an ancestor recursive catalog. Cancel in-flight
     // builds too, otherwise a stale pre-mutation listing could be cached after
     // the write has completed.
-    recursiveCatalogLoading.values.forEach { $0.cancel() }
+    recursiveCatalogLoading.values.forEach { $0.task.cancel() }
     recursiveCatalogLoading.removeAll(keepingCapacity: true)
     recursiveCatalogCache.removeAll(keepingCapacity: true)
   }
@@ -725,6 +794,8 @@ actor RcloneRemoteSession: RemoteServerSession {
     ) {
       secrets = try secrets.replacingOAuthToken(token)
     }
+    try Task.checkCancellation()
+    guard !isClosed else { throw RemoteServerError.notConnected }
   }
 
   func updateOAuthToken(_ token: String) throws {

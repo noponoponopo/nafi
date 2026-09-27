@@ -27,7 +27,6 @@ private struct ActiveWindowChromeContent: View {
       windowState: windowState,
       model: workspace.activeModel
     )
-    .id("\(workspace.activePaneID)-\(workspace.activeSession.activeTabID)")
   }
 }
 
@@ -58,16 +57,17 @@ private struct WindowChromeBridge: NSViewRepresentable {
     Coordinator(appState: appState, windowState: windowState)
   }
 
-  func makeNSView(context: Context) -> NSView {
-    NSView(frame: .zero)
+  func makeNSView(context: Context) -> WindowAttachmentView {
+    let view = WindowAttachmentView()
+    view.onWindowChange = { [weak coordinator = context.coordinator] window in
+      if let window { coordinator?.attach(to: window) }
+    }
+    return view
   }
 
-  func updateNSView(_ nsView: NSView, context: Context) {
+  func updateNSView(_ nsView: WindowAttachmentView, context: Context) {
     context.coordinator.update(title: title, representedURL: representedURL)
-    DispatchQueue.main.async {
-      guard let window = nsView.window else { return }
-      context.coordinator.attach(to: window)
-    }
+    if let window = nsView.window { context.coordinator.attach(to: window) }
   }
 
   @MainActor
@@ -76,7 +76,6 @@ private struct WindowChromeBridge: NSViewRepresentable {
     private weak var windowState: BrowserWindowState?
     private weak var window: NSWindow?
     private var observers: [NSObjectProtocol] = []
-    private var joinAttempts = 0
     private var title = "nafi"
     private var representedURL: URL?
 
@@ -104,7 +103,6 @@ private struct WindowChromeBridge: NSViewRepresentable {
       observers.forEach { NotificationCenter.default.removeObserver($0) }
       observers.removeAll(keepingCapacity: true)
       self.window = window
-      joinAttempts = 0
 
       window.tabbingMode = .preferred
       window.tabbingIdentifier = "app.nafi.filemanager.browser"
@@ -116,14 +114,17 @@ private struct WindowChromeBridge: NSViewRepresentable {
 
       let center = NotificationCenter.default
       observers.append(
-        center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) {
+        center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main)
+        {
           [weak appState, weak windowState] _ in
           guard let id = windowState?.id else { return }
           Task { @MainActor in appState?.activateWindow(id) }
         }
       )
       observers.append(
-        center.addObserver(forName: NSWindow.didBecomeMainNotification, object: window, queue: .main) {
+        center.addObserver(
+          forName: NSWindow.didBecomeMainNotification, object: window, queue: .main
+        ) {
           [weak appState, weak windowState] _ in
           guard let id = windowState?.id else { return }
           Task { @MainActor in appState?.activateWindow(id) }
@@ -143,10 +144,11 @@ private struct WindowChromeBridge: NSViewRepresentable {
     private func applyMetadata() {
       guard let window else { return }
       let displayTitle = title.isEmpty ? "nafi" : title
-      window.title = displayTitle
-      window.tab.title = displayTitle
-      window.tab.toolTip = representedURL?.path ?? displayTitle
-      window.representedURL = representedURL
+      if window.title != displayTitle { window.title = displayTitle }
+      if window.tab.title != displayTitle { window.tab.title = displayTitle }
+      let tooltip = representedURL?.path ?? displayTitle
+      if window.tab.toolTip != tooltip { window.tab.toolTip = tooltip }
+      if window.representedURL != representedURL { window.representedURL = representedURL }
       window.tabbingMode = .preferred
       window.tabbingIdentifier = "app.nafi.filemanager.browser"
     }
@@ -159,31 +161,31 @@ private struct WindowChromeBridge: NSViewRepresentable {
         return
       }
 
-      joinAttempts += 1
-      guard joinAttempts < 20 else {
-        // The parent may have closed between the Finder event and scene
-        // creation. In that exceptional case, fall back to a normal window
-        // instead of leaving the requested location hidden.
-        window.makeKeyAndOrderFront(nil)
-        appState.activateWindow(windowState.id)
-        return
-      }
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-        self?.attemptNativeTabJoin()
-      }
+      // Browser tabs register synchronously before attachment. A missing parent
+      // has closed; present one ordinary window instead of polling the main queue.
+      window.makeKeyAndOrderFront(nil)
+      appState.activateWindow(windowState.id)
     }
   }
 }
 
 /// Keeps utility/settings windows out of the browser's native tab group.
 struct WindowTabbingDisabler: NSViewRepresentable {
-  func makeNSView(context: Context) -> NSView {
-    NSView(frame: .zero)
+  func makeNSView(context: Context) -> WindowAttachmentView {
+    let view = WindowAttachmentView()
+    view.onWindowChange = { $0?.tabbingMode = .disallowed }
+    return view
   }
 
-  func updateNSView(_ nsView: NSView, context: Context) {
-    DispatchQueue.main.async {
-      nsView.window?.tabbingMode = .disallowed
-    }
+  func updateNSView(_ nsView: WindowAttachmentView, context: Context) {
+    nsView.window?.tabbingMode = .disallowed
+  }
+}
+
+final class WindowAttachmentView: NSView {
+  var onWindowChange: ((NSWindow?) -> Void)?
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    onWindowChange?(window)
   }
 }

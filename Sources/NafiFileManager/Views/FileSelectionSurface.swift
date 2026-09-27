@@ -21,6 +21,17 @@ enum FileDragHitTesting {
   }
 }
 
+enum FileDragIcon {
+  static func fitted(_ icon: NSImage, maxEdge: CGFloat = 28) -> NSImage {
+    let copy = (icon.copy() as? NSImage) ?? icon
+    let size = copy.size
+    guard size.width > 0, size.height > 0 else { return copy }
+    let scale = min(maxEdge / size.width, maxEdge / size.height)
+    copy.size = NSSize(width: size.width * scale, height: size.height * scale)
+    return copy
+  }
+}
+
 extension View {
   func fileSelectionHitTarget(_ url: URL, in coordinateSpace: String) -> some View {
     background {
@@ -283,18 +294,16 @@ struct FileSelectionSurface<Content: View>: View {
   }
 
   private func dragIcon(for url: URL) -> NSImage {
-    let pixelSize = NSSize(width: 28, height: 28)
+    let icon: NSImage
     if url.isFileURL {
-      let icon = NSWorkspace.shared.icon(forFile: url.path)
-      icon.size = pixelSize
-      return icon
+      icon = NSWorkspace.shared.icon(forFile: url.path)
+    } else {
+      let symbolName = (model.item(for: url)?.isDirectory ?? false) ? "folder.fill" : "doc.fill"
+      let config = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
+      icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
+        .withSymbolConfiguration(config) ?? NSImage()
     }
-    let symbolName = (model.item(for: url)?.isDirectory ?? false) ? "folder.fill" : "doc.fill"
-    let config = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
-    let icon = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
-      .withSymbolConfiguration(config) ?? NSImage()
-    icon.size = pixelSize
-    return icon
+    return FileDragIcon.fitted(icon)
   }
 
   private func center(of frame: CGRect?) -> CGPoint? {

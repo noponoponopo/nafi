@@ -111,7 +111,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
       // Recursive search may start Spotlight or a remote metadata catalog build.
       // A slightly longer debounce coalesces normal typing into one query while
       // current-folder filtering remains effectively immediate.
-      scheduleSearch(debounceNanoseconds: searchScope.searchesRecursively ? 300_000_000 : 90_000_000)
+      scheduleSearch(
+        debounceNanoseconds: searchScope.searchesRecursively ? 300_000_000 : 90_000_000)
     }
   }
   @Published var searchScope: FileSearchScope = .currentFolder {
@@ -271,7 +272,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
       {
         await session.invalidateSearchCache()
       }
-      guard let self, NafiURL.sameLocation(self.currentURL, directory), self.searchText == query else { return }
+      guard let self, NafiURL.sameLocation(self.currentURL, directory), self.searchText == query
+      else { return }
       self.scheduleSearch()
     }
   }
@@ -701,6 +703,14 @@ final class FilePaneModel: ObservableObject, Identifiable {
     pruneSupplementalSelection()
   }
 
+  func setListSelection(_ items: [FileItem], primary: URL?) {
+    for item in items where itemLookup[item.url] == nil { supplementalItems[item.url] = item }
+    selectionController.replace(with: Set(items.map(\.url)), primary: primary)
+    selectionAnchor = primary
+    selectionAnchorScope = NafiURL.normalized(currentURL)
+    pruneSupplementalSelection()
+  }
+
   func finishMarqueeSelection(anchor: URL?, scope: URL) {
     if let anchor {
       selectionAnchor = anchor
@@ -822,7 +832,6 @@ final class FilePaneModel: ObservableObject, Identifiable {
     return true
   }
 
-
   @discardableResult
   func requestBatchRenameSelected() -> Bool {
     let urls = selectedItems.map(\.url)
@@ -943,7 +952,6 @@ final class FilePaneModel: ObservableObject, Identifiable {
       [try await UnifiedFileSystemService.compress(urls, in: directory)]
     }
   }
-
 
   func extractSelection() {
     guard canExtractSelection, let archive = selectedItems.first?.url else { return }
@@ -1109,7 +1117,8 @@ final class FilePaneModel: ObservableObject, Identifiable {
     panel.canChooseDirectories = true
     panel.canCreateDirectories = true
     panel.allowsMultipleSelection = false
-    panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+    panel.directoryURL =
+      FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
     guard panel.runModal() == .OK, let destination = panel.url else { return }
     transferItems(urls, to: destination, move: false)
   }
@@ -1228,7 +1237,9 @@ final class FilePaneModel: ObservableObject, Identifiable {
     matched.reserveCapacity(items.count)
 
     for item in items
-    where (searchTerms.isEmpty || FileNameSearchMatcher.matches(normalizedCandidate: item.normalizedName, terms: searchTerms))
+    where
+      (searchTerms.isEmpty
+      || FileNameSearchMatcher.matches(normalizedCandidate: item.normalizedName, terms: searchTerms))
       && (searchTerms.isEmpty || filter.matches(item))
     {
       matched.append(item)

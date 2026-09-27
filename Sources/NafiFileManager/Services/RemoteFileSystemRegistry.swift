@@ -4,35 +4,55 @@ actor RemoteFileSystemRegistry {
   static let shared = RemoteFileSystemRegistry()
 
   private var profiles: [UUID: ServerProfile] = [:]
+  private var generations: [UUID: UUID] = [:]
   private var sessions: [UUID: any RemoteServerSession] = [:]
   private var connector: (@Sendable (UUID) async throws -> Void)?
-  private var connectionTasks: [UUID: Task<Void, Error>] = [:]
+  private var connectionTasks: [UUID: (id: UUID, task: Task<Void, Error>)] = [:]
 
   func configureConnector(_ connector: @escaping @Sendable (UUID) async throws -> Void) {
     self.connector = connector
   }
 
   func registerProfiles(_ values: [ServerProfile]) {
-    for profile in values { profiles[profile.id] = profile }
+    for profile in values { update(profile: profile) }
   }
 
-  func register(profile: ServerProfile, session: any RemoteServerSession) {
-    profiles[profile.id] = profile
+  func connectionGeneration(for profileID: UUID) -> UUID {
+    if let generation = generations[profileID] { return generation }
+    let generation = UUID()
+    generations[profileID] = generation
+    return generation
+  }
+
+  @discardableResult
+  func register(profile: ServerProfile, session: any RemoteServerSession, generation: UUID) -> Bool
+  {
+    guard generations[profile.id] == generation, let current = profiles[profile.id],
+      current.configurationRevision == profile.configurationRevision
+    else { return false }
     sessions[profile.id] = session
+    return true
   }
 
   func update(profile: ServerProfile) {
+    if let current = profiles[profile.id],
+      current.configurationRevision != profile.configurationRevision
+    {
+      disconnect(profileID: profile.id)
+    }
     profiles[profile.id] = profile
   }
 
   func unregister(profileID: UUID) {
-    connectionTasks.removeValue(forKey: profileID)?.cancel()
+    connectionTasks.removeValue(forKey: profileID)?.task.cancel()
     sessions[profileID] = nil
     profiles[profileID] = nil
+    generations[profileID] = nil
   }
 
   func disconnect(profileID: UUID) {
-    connectionTasks.removeValue(forKey: profileID)?.cancel()
+    generations[profileID] = UUID()
+    connectionTasks.removeValue(forKey: profileID)?.task.cancel()
     sessions[profileID] = nil
   }
 
@@ -50,25 +70,24 @@ actor RemoteFileSystemRegistry {
     guard profiles[profileID] != nil else { throw RemoteServerError.notConnected }
     guard let connector else { throw RemoteServerError.notConnected }
 
-    let task: Task<Void, Error>
+    let entry: (id: UUID, task: Task<Void, Error>)
     if let existing = connectionTasks[profileID] {
-      task = existing
+      entry = existing
     } else {
-      let created = Task {
-        try Task.checkCancellation()
-        try await connector(profileID)
-      }
-      connectionTasks[profileID] = created
-      task = created
+      entry = (
+        UUID(),
+        Task {
+          try Task.checkCancellation()
+          try await connector(profileID)
+        }
+      )
+      connectionTasks[profileID] = entry
     }
-
-    do {
-      try await task.value
-      connectionTasks[profileID] = nil
-    } catch {
-      connectionTasks[profileID] = nil
-      throw error
+    defer {
+      if connectionTasks[profileID]?.id == entry.id { connectionTasks[profileID] = nil }
     }
+    try await entry.task.value
+    try Task.checkCancellation()
 
     guard let session = sessions[profileID] else { throw RemoteServerError.notConnected }
     return session

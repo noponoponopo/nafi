@@ -18,7 +18,7 @@ nafiは、macOS 14以降に対応するネイティブなマルチペインフ�
 ./scripts/build-app.sh
 ```
 
-このスクリプトはリリースビルドを実行し、`.build/nafi.app`を作成します。利用可能なローカル開発用署名を使って署名し、見つからない場合はアドホック署名を使ってから、バンドルを検証します。インストール済みアプリのFile Provider拡張と競合しないように、通常は開発用バンドルをLaunch Servicesへ登録しません。開発用バンドルを登録する場合は`NAFI_REGISTER_BUILD=true`を、Finderで表示する場合は`NAFI_REVEAL_BUILD=true`を指定してください。
+このスクリプトはリリースビルドを実行し、`.build/nafi.app`を作成します。利用可能なローカル開発用署名を使って署名し、見つからない場合はアドホック署名を使ってから、バンドルを検証します。インストール済みアプリのFile Provider拡張と競合しないように、通常は開発用バンドルをLaunch Servicesへ登録しません。開発用バンドルを登録する場合は`NAFI_REGISTER_BUILD=true`を、Finderで表示する場合は`NAFI_REVEAL_BUILD=true`を指定してください。File Providerは既存の拡張専用領域でアプリと設定を共有します。保存先を安全に読み書きできない場合は、元の設定を保持したままFinder公開の操作を無効にします。
 
 SwiftPMのビルドディレクトリを削除して再ビルドする場合:
 
@@ -64,10 +64,8 @@ GitHub Actionsは`macos-15`でビルドし、利用可能ならXcode 16.4を選�
 
 | 接続先 | 接続実装 | ペインでの扱い |
 | --- | --- | --- |
-| SMB、WebDAV、NFS、AFP | macOS NetFS | マウント済みのローカルファイルURL |
-| SFTP（パスワードまたは秘密鍵） | macOS OpenSSH（`/usr/bin/sftp`） | 内部の`nafi-remote://` URL |
-| FTP、明示的FTPS、暗黙的FTPS | アプリ内のSwiftNIOクライアント | 内部の`nafi-remote://` URL |
-| S3互換ストレージ | AWS Signature V4対応のURLSession | 内部の`nafi-remote://` URL |
+| NFS、AFP | macOS NetFS | マウント済みのローカルファイルURL |
+| SFTP、FTP/FTPS、SMB、WebDAV、S3、クラウド接続先 | オンデマンドのrclone | 内部の`nafi-remote://` URL |
 
 S3互換接続では、AWS S3、Cloudflare R2、MinIO、Ceph、匿名の公開バケット、独自HTTPSエンドポイント、仮想ホスト形式またはパス形式、プレフィックス、一時セッショントークン、サーバー側コピー、マルチパートアップロードを利用できます。Cloudflare R2ではアカウントエンドポイントと`auto`リージョンを使います。
 
@@ -77,9 +75,9 @@ SMB、WebDAV、NFS、AFPの接続でFinderや他のGUIクライアントは起�
 
 - 起動時の自動接続を有効にしたプロファイルは、バックオフを挟んで最大3回再試行します。
 - FTP、`AUTH TLS`を使う明示的FTPS、暗黙的FTPSに対応します。FTPSではTLS 1.2以降を使い、証明書検証は既定で有効です。
-- SFTPは両方の認証方式でmacOSのOpenSSHを使い、`StrictHostKeyChecking=yes`を指定します。初回接続前にサーバー鍵を取得して自動的に信頼し、標準の`~/.ssh/known_hosts`へ保存します。未登録または変更された鍵は拒否します。
+- SFTP接続にはrcloneを使い、`~/.ssh/known_hosts`のホストキーと照合します。未登録・変更された鍵は明示的な確認後にのみ信頼します。
 - 「ここでターミナルを開く」はローカルフォルダとSFTPルートで利用できます。FTPとFTPSには対話的なシェルがありません。
-- パスワード、SFTP秘密鍵のパスフレーズ、S3シークレットキー、一時S3セッショントークンはmacOS Keychainに分けて保存します。秘密鍵ファイルの内容は選択した場所に残し、接続時だけ読み込みます。
+- パスワード、SFTP秘密鍵のパスフレーズ、S3シークレットキー、一時S3セッショントークンは、macOSキーチェーンの共通鍵で保護した認証付き暗号化ストアにまとめて保存します。解除要求は集約し、追加承認なしで読み出せない旧認証情報は、確認を連発せず明示的な再入力で移行します。秘密鍵ファイルの内容は選択した場所に残し、接続時だけ読み込みます。
 
 ### macOSとの統合
 
@@ -94,10 +92,12 @@ SMB、WebDAV、NFS、AFPの接続でFinderや他のGUIクライアントは起�
 アプリケーションの状態は`~/Library/Application Support/nafi`に保存します。
 
 - `servers.json`にはサーバープロファイルを保存します。秘密情報は含めません。
+- `credentials.encrypted`には認証付き暗号化された認証情報を保存し、共通の暗号鍵はキーチェーンで保護します。
 - `sidebar.json`にはサイドバーの構成を保存します。
 - `icloud-drive.bookmark`には、手動で選択したiCloud Driveのセキュリティスコープ付きブックマークを保存します。
 - `~/.ssh/known_hosts`には、信頼したSFTPホストキーを保存します。
 - `transfers.json`には、件数とサイズに上限を設けた永続転送キューと直近の完了履歴を保存します。
+- File Providerの公開設定と一時的なrclone接続情報は、拡張専用のApplication Support領域で共有します。既存の公開設定を優先し、ない場合だけ読み取り可能な旧ファイルまたはFinder登録済みドメインから復元します。旧Keychain項目は追加承認なしで読める場合だけ自動移行し、読めない場合は元の項目を残して接続の編集画面で再入力を案内します。
 
 nafiは閲覧したフォルダへ独自の表示メタデータを書き込まず、`.DS_Store`を作成しません。Finderや他のアプリケーションが作成するメタデータは抑止しません。リモート項目のQuick Look、サムネイル、編集、ルート間転送では、操作中に一時的なローカルファイルを作成する場合があります。
 

@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 
@@ -176,18 +177,92 @@ final class RobustnessTests: XCTestCase {
     try Data("1234".utf8).write(to: file)
     XCTAssertEqual(try AppStoragePaths.readRegularFile(at: file, maximumBytes: 4), Data("1234".utf8))
     XCTAssertThrowsError(try AppStoragePaths.readRegularFile(at: file, maximumBytes: 3))
+    try Data("123456".utf8).write(to: file)
+    XCTAssertEqual(try AppStoragePaths.readRegularFile(at: file, maximumBytes: 6), Data("123456".utf8))
 
     let link = directory.appendingPathComponent("record-link.json")
     try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
-    XCTAssertThrowsError(try AppStoragePaths.readRegularFile(at: link, maximumBytes: 4))
+    XCTAssertThrowsError(try AppStoragePaths.readRegularFile(at: link, maximumBytes: 6))
   }
 
-  func testFileProviderSharedStoreUsesTheExtensionContainer() {
-    XCTAssertTrue(
-      AppStoragePaths.sharedDirectory.path.hasSuffix(
-        "/Library/Containers/app.nafi.filemanager.fileprovider/Data/Library/Application Support/nafi"
-      )
+  func testFileProviderStoreNeverFallsBackToApplicationStorage() {
+    let store = AppStoragePaths.fileProviderFile(named: "file-provider-domains.json")
+    if let providerDirectory = AppStoragePaths.fileProviderDirectory {
+      XCTAssertEqual(store, providerDirectory.appendingPathComponent("file-provider-domains.json"))
+      XCTAssertTrue(providerDirectory.path.contains(
+        "/Library/Containers/app.nafi.filemanager.fileprovider/Data/"))
+    } else {
+      XCTAssertNil(store)
+    }
+    XCTAssertNotEqual(store, AppStoragePaths.directory.appendingPathComponent("file-provider-domains.json"))
+  }
+
+  @MainActor
+  func testFileProviderMigrationUsesReadableSourceWithoutReplacingExistingRecords() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "nafi-fp-migration-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let source = root.appendingPathComponent("legacy.json")
+    let original = Data(
+      #"[{"id":"00000000-0000-0000-0000-000000000001","displayName":"Test","fs":"remote:","rootPath":"","updatedAt":0}]"#.utf8
     )
+    try original.write(to: source)
+    let shared = root.appendingPathComponent("extension", isDirectory: true)
+    let destination = shared.appendingPathComponent("file-provider-domains.json")
+    let unreadable = root.appendingPathComponent("unreadable.json", isDirectory: true)
+    try FileManager.default.createDirectory(at: unreadable, withIntermediateDirectories: true)
+
+    try SystemIntegrationService.migrateLegacyFileProviderStoreIfNeeded(
+      to: nil, legacyAppGroupStoreURL: source, legacyFileProviderStoreURL: source)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+
+    try FileManager.default.createDirectory(at: shared, withIntermediateDirectories: true)
+    try SystemIntegrationService.migrateLegacyFileProviderStoreIfNeeded(
+      to: shared, legacyAppGroupStoreURL: unreadable,
+      legacyFileProviderStoreURL: root.appendingPathComponent("missing.json"))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    let malformed = root.appendingPathComponent("malformed.json")
+    try Data(#"[{"id":"00000000-0000-0000-0000-000000000002"}]"#.utf8).write(to: malformed)
+    try SystemIntegrationService.migrateLegacyFileProviderStoreIfNeeded(
+      to: shared, legacyAppGroupStoreURL: malformed,
+      legacyFileProviderStoreURL: root.appendingPathComponent("missing.json"))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    try SystemIntegrationService.migrateLegacyFileProviderStoreIfNeeded(
+      to: shared, legacyAppGroupStoreURL: unreadable, legacyFileProviderStoreURL: source)
+    XCTAssertEqual(try Data(contentsOf: destination), original)
+    XCTAssertEqual(try Data(contentsOf: source), original)
+    let mode = try FileManager.default.attributesOfItem(atPath: destination.path)[.posixPermissions] as? Int
+    XCTAssertEqual(mode, 0o600)
+
+    try Data("changed".utf8).write(to: source)
+    try SystemIntegrationService.migrateLegacyFileProviderStoreIfNeeded(
+      to: shared, legacyAppGroupStoreURL: unreadable, legacyFileProviderStoreURL: source)
+    XCTAssertEqual(try Data(contentsOf: destination), original)
+
+    let second = root.appendingPathComponent("extension-two", isDirectory: true)
+    try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+    let legacyID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+    let legacyIDs = try JSONEncoder().encode(Set([legacyID]))
+    try legacyIDs.write(to: source)
+    try SystemIntegrationService.migrateLegacyFileProviderStoreIfNeeded(
+      to: second, legacyAppGroupStoreURL: unreadable, legacyFileProviderStoreURL: source)
+    XCTAssertEqual(
+      try Data(contentsOf: second.appendingPathComponent("file-provider-domains.json")), legacyIDs)
+
+    let olderGroup = root.appendingPathComponent("appgroup.json")
+    try original.write(to: olderGroup)
+    try FileManager.default.setAttributes(
+      [.modificationDate: Date(timeIntervalSince1970: 100)], ofItemAtPath: olderGroup.path)
+    try FileManager.default.setAttributes(
+      [.modificationDate: Date(timeIntervalSince1970: 200)], ofItemAtPath: source.path)
+    let third = root.appendingPathComponent("extension-three", isDirectory: true)
+    try FileManager.default.createDirectory(at: third, withIntermediateDirectories: true)
+    try SystemIntegrationService.migrateLegacyFileProviderStoreIfNeeded(
+      to: third, legacyAppGroupStoreURL: olderGroup, legacyFileProviderStoreURL: source)
+    XCTAssertEqual(
+      try Data(contentsOf: third.appendingPathComponent("file-provider-domains.json")), legacyIDs)
   }
 
   func testFileDragPayloadPreservesObjectEncodingAndRejectsUnsupportedURLs() throws {
@@ -205,6 +280,18 @@ final class RobustnessTests: XCTestCase {
         from: Data(#"{"urls":["https://example.com/file.txt"]}"#.utf8)
       )
     )
+  }
+
+  @MainActor
+  func testDragIconsFitWithoutChangingAspectRatio() throws {
+    for symbol in ["folder.fill", "doc.fill"] {
+      let icon = try XCTUnwrap(NSImage(systemSymbolName: symbol, accessibilityDescription: nil))
+      let originalSize = icon.size
+      let fitted = FileDragIcon.fitted(icon)
+      XCTAssertEqual(fitted.size.width / fitted.size.height, originalSize.width / originalSize.height, accuracy: 0.001)
+      XCTAssertEqual(max(fitted.size.width, fitted.size.height), 28, accuracy: 0.001)
+      XCTAssertEqual(icon.size, originalSize)
+    }
   }
 
   func testFileDragStartsOnlyFromASelectedItem() {

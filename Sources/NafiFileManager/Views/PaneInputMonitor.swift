@@ -135,19 +135,19 @@ struct PaneInputMonitor: NSViewRepresentable {
         case .keyDown:
           guard self.shouldHandleKeyboardEvent(event) else { return event }
           switch event.keyCode {
-          case 125:
+          case 125
+          where event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty:
             self.moveSelection(1)
             return nil
-          case 126:
+          case 126
+          where event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty:
             self.moveSelection(-1)
-            return nil
-          case 48 where event.modifierFlags.intersection([.command, .option, .control]).isEmpty:
-            self.moveSelection(event.modifierFlags.contains(.shift) ? -1 : 1)
             return nil
           case 53:
             self.clearSelection()
             return nil
-          case 36,
+          case 36
+          where event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
             76
           where event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty:
             return self.renameSelection() ? nil : event
@@ -177,8 +177,13 @@ struct PaneInputMonitor: NSViewRepresentable {
 
     private func shouldHandleKeyboardEvent(_ event: NSEvent) -> Bool {
       guard isActive, let window = view?.window, event.window === window else { return false }
-      if window.firstResponder is NSTextView { return false }
-      return true
+      if window.firstResponder is NSTextView || window.firstResponder is NSControl { return false }
+      // Native table/outline views own their keyboard handling. Tab always follows
+      // the system key-view loop rather than moving the file selection.
+      if let responder = window.firstResponder as? NSView, let pane = view?.superview {
+        return responder.isDescendant(of: pane)
+      }
+      return false
     }
 
     private func contains(_ event: NSEvent) -> Bool {

@@ -48,12 +48,11 @@ Quick Edit uses `QuickEditService` and `NSFileCoordinator`. It supports recogniz
 
 `ServerManager` persists non-secret `ServerProfile` values in `servers.json`, keeps credentials in `KeychainStore`, and registers live sessions with `RemoteFileSystemRegistry`.
 
-- SMB, WebDAV, NFS, and AFP call macOS NetFS directly and expose the resulting mount as an ordinary local file URL.
-- SFTP password and private-key authentication both use the installed macOS `/usr/bin/sftp` process without opening a GUI client. A private temporary askpass helper supplies the secret. `SSHHostKeyService` scans fingerprints and stores trusted keys in the user's `~/.ssh/known_hosts`; all connections use that standard file with `StrictHostKeyChecking=yes`.
-- FTP, explicit FTPS, and implicit FTPS use the in-process SwiftNIO client. FTPS uses TLS 1.2 or later, supports protected passive data channels, and verifies certificates by default.
-- S3-compatible storage uses `URLSession`, AWS Signature V4, paginated prefix listing, server-side copy where possible, and multipart upload for local files at least 128 MiB. Objects and common prefixes are mapped to ordinary file items.
+- SFTP, FTP/FTPS, S3, SMB, WebDAV, and named rclone providers share one on-demand `RcloneRuntime` daemon and an ephemeral, private runtime config. All RC config writes (create, update, delete, interactive setup) are serialized per daemon; unrelated file operations stay concurrent. Each completed write is checked against rclone's own `config/listremotes` before a connection or File Provider domain is marked ready. A missing section marks that daemon unhealthy, withdraws File Provider readiness, and waits for jobs and the idle lease to finish before replacing it. Starting a new daemon never terminates a previously published one with reported running jobs or transfers. Profile settings and credentials remain in the app's durable stores, not the disposable runtime config.
+- `SSHHostKeyService` scans SFTP fingerprints and stores trusted keys in the user's `~/.ssh/known_hosts`; rclone uses that standard file when connecting.
+- NFS and AFP use macOS NetFS and expose the resulting mount as an ordinary local file URL.
 
-External OpenSSH, `ssh-keyscan`, `ssh-keygen`, `zip`, `unzip`, and `ditto` invocations run through `BoundedProcessRunner`, which limits execution time, standard output, standard error, and cancellation cleanup. FTP control replies and listings, S3 control responses and pagination, and persisted JSON files also have explicit size and count bounds.
+External OpenSSH, `ssh-keyscan`, `ssh-keygen`, `zip`, `unzip`, and `ditto` invocations run through `BoundedProcessRunner`, which limits execution time, standard output, standard error, and cancellation cleanup. Rclone RC responses and persisted JSON files have explicit size bounds.
 
 `TerminalApplicationService` creates a short-lived `.command` file and asks macOS to open it with the associated terminal application. Local roots run a shell in the local directory; SFTP roots run `ssh -t` and change to the displayed remote path. FTP and FTPS roots do not expose an interactive shell.
 
@@ -67,7 +66,7 @@ External OpenSSH, `ssh-keyscan`, `ssh-keygen`, `zip`, `unzip`, and `ditto` invoc
 - the user's `~/.ssh/known_hosts` for explicitly trusted SFTP host keys
 - `transfers.json` for the bounded persistent transfer queue and recent terminal history
 
-Passwords, SFTP key passphrases, S3 secret access keys, and temporary S3 session tokens are stored separately in the macOS Keychain. Private-key file contents are not copied into the profile. nafi does not write its own view metadata or `.DS_Store` files into browsed folders. Temporary local staging files can exist during remote preview, editing, or cross-root transfer operations.
+Current builds store these secrets together in `credentials.encrypted` under application support, authenticated with a single key in the macOS Keychain. `KeychainStore` reads accessible legacy Keychain items once per profile and migrates them without interactive per-item prompts. Unreadable items are retained and the editor requests explicit re-entry instead of clearing them. Private-key file contents are not copied into the profile. nafi does not write its own view metadata or `.DS_Store` files into browsed folders. Temporary local staging files can exist during remote preview, editing, or cross-root transfer operations.
 
 ## macOS integration
 

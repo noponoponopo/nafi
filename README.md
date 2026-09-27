@@ -18,7 +18,7 @@ Build the application bundle with:
 ./scripts/build-app.sh
 ```
 
-The script runs a release build, creates `.build/nafi.app`, signs it with a local development identity when one is available, otherwise uses an ad-hoc signature, and verifies the bundle. Staging builds are not registered with Launch Services, which prevents their File Provider extension from competing with an installed copy. Set `NAFI_REGISTER_BUILD=true` to register the staging app or `NAFI_REVEAL_BUILD=true` to show it in Finder.
+The script runs a release build, creates `.build/nafi.app`, signs it with a local development identity when one is available, otherwise uses an ad-hoc signature, and verifies the bundle. Staging builds are not registered with Launch Services, which prevents their File Provider extension from competing with an installed copy. Set `NAFI_REGISTER_BUILD=true` to register the staging app or `NAFI_REVEAL_BUILD=true` to show it in Finder. File Provider continues to share records with the host through the extension's existing application-support directory. If the host cannot safely read and write there, Settings disables Finder publishing without overwriting existing records.
 
 To rebuild from a clean SwiftPM build directory:
 
@@ -64,10 +64,8 @@ GitHub Actions builds on `macos-15`, selects Xcode 16.4 when available, and publ
 
 | Profile | Connection implementation | Pane representation |
 | --- | --- | --- |
-| SMB, WebDAV, NFS, AFP | macOS NetFS | Mounted local file URL |
-| SFTP with password or private key | macOS OpenSSH (`/usr/bin/sftp`) | Internal `nafi-remote://` URL |
-| FTP, explicit FTPS, implicit FTPS | In-process SwiftNIO client | Internal `nafi-remote://` URL |
-| S3-compatible storage | URLSession with AWS Signature V4 | Internal `nafi-remote://` URL |
+| NFS, AFP | macOS NetFS | Mounted local file URL |
+| SFTP, FTP/FTPS, SMB, WebDAV, S3, named cloud providers | On-demand rclone runtime | Internal `nafi-remote://` URL |
 
 Supported S3-compatible configurations include AWS S3, Cloudflare R2, MinIO, Ceph, anonymous public buckets, custom HTTPS endpoints, virtual-host or path addressing, prefixes, temporary session tokens, server-side copy, and multipart uploads. Cloudflare R2 uses its account endpoint and the `auto` region.
 
@@ -77,9 +75,9 @@ Additional server behavior:
 
 - Launch-time auto-connect retries each enabled profile up to three times with backoff.
 - FTP supports plain FTP, explicit FTPS with `AUTH TLS`, and implicit FTPS. TLS 1.2 or later is required for FTPS, and certificate verification is enabled by default.
-- Both SFTP authentication modes use the installed macOS OpenSSH engine with `StrictHostKeyChecking=yes`. Before the first connection, nafi scans and automatically trusts the server key, storing it in the standard `~/.ssh/known_hosts`; changed or unknown keys are rejected.
+- SFTP connections use rclone with host-key verification against `~/.ssh/known_hosts`. Unregistered or changed keys require explicit review before they are trusted.
 - Open Terminal Here works for local folders and SFTP roots. FTP and FTPS do not provide an interactive shell.
-- Passwords, SFTP key passphrases, S3 secret keys, and temporary S3 session tokens are stored separately in the macOS Keychain. Private-key file contents remain at the selected path and are read only when connecting.
+- Passwords, SFTP key passphrases, S3 secret keys, and temporary S3 session tokens share one authenticated encrypted vault protected by a single macOS Keychain key. Unlock requests are coalesced; legacy credentials that cannot be read without another authorization require explicit re-entry, not repeated prompts. Private-key file contents remain at the selected path and are read only when connecting.
 
 ### macOS integration
 
@@ -94,10 +92,12 @@ Additional server behavior:
 Application state is stored under `~/Library/Application Support/nafi`:
 
 - `servers.json` stores server profiles without their secret values.
+- `credentials.encrypted` stores the authenticated encrypted credential vault; its single encryption key is held in Keychain.
 - `sidebar.json` stores sidebar configuration.
 - `icloud-drive.bookmark` stores the selected iCloud Drive security-scoped bookmark when one is configured.
 - `~/.ssh/known_hosts` stores trusted SFTP host keys.
 - `transfers.json` stores the bounded persistent transfer queue and recent terminal history.
+- File Provider domain records and temporary rclone runtime discovery live in the extension's application-support directory. Existing records take precedence; only if they are absent does nafi recover from a readable legacy file or registered Finder domains. Legacy Keychain entries are migrated automatically only when readable without additional authorization; otherwise the original items are preserved and the connection editor requests re-entry rather than repeatedly prompting.
 
 nafi does not write its own view metadata into browsed folders and does not create `.DS_Store`. Finder or another application may still create its own metadata. Remote Quick Look, thumbnails, editing, and cross-root transfers may create temporary local staging files while an operation is running.
 

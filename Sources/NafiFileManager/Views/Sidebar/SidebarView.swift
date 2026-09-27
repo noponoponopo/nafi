@@ -43,9 +43,6 @@ struct SidebarView: View {
       }
     }
     .listStyle(.sidebar)
-    .scrollContentBackground(.hidden)
-    .contentMargins(.trailing, 8, for: .scrollContent)
-    .nafiChromeBackground(.sidebar)
     .frame(minWidth: 120, idealWidth: 240)
     .safeAreaInset(edge: .bottom, spacing: 0) {
       SidebarFooter {
@@ -71,13 +68,6 @@ private struct SidebarFavoritesSection: View {
 
   var body: some View {
     Section {
-      SidebarSectionHeader(
-        title: "よく使う項目",
-        topPadding: 10,
-        actionHelp: isCurrentFolderFavorite ? "現在のフォルダは追加済みです" : "現在のフォルダを追加",
-        isActionDisabled: isCurrentFolderFavorite,
-        action: addCurrentFolder
-      )
 
       ForEach(model.favorites) { favorite in
         SidebarDestinationRow(
@@ -111,6 +101,13 @@ private struct SidebarFavoritesSection: View {
           }
         }
       }
+    } header: {
+      SidebarSectionHeader(
+        title: "よく使う項目",
+        actionHelp: isCurrentFolderFavorite ? "現在のフォルダは追加済みです" : "現在のフォルダを追加",
+        isActionDisabled: isCurrentFolderFavorite,
+        action: addCurrentFolder
+      )
     }
     .sheet(item: $renamingFavorite) { favorite in
       RenameFavoriteDialog(
@@ -132,13 +129,6 @@ private struct SidebarICloudSection: View {
 
   var body: some View {
     Section {
-      SidebarSectionHeader(
-        title: "iCloud",
-        topPadding: 8,
-        showsAction: false,
-        actionHelp: "",
-        action: {}
-      )
 
       if let url = cloudStorage.iCloudDriveURL {
         SidebarDestinationRow(
@@ -168,6 +158,13 @@ private struct SidebarICloudSection: View {
           if cloudStorage.isAvailable { appState.openICloudDrive() }
         }
       }
+    } header: {
+      SidebarSectionHeader(
+        title: "iCloud",
+        showsAction: false,
+        actionHelp: "",
+        action: {}
+      )
     }
   }
 }
@@ -179,13 +176,6 @@ private struct SidebarVolumesSection: View {
 
   var body: some View {
     Section {
-      SidebarSectionHeader(
-        title: "ボリューム",
-        topPadding: 6,
-        showsAction: false,
-        actionHelp: "",
-        action: {}
-      )
 
       ForEach(volumes) { volume in
         SidebarDestinationRow(
@@ -204,6 +194,13 @@ private struct SidebarVolumesSection: View {
           .listRowInsets(EdgeInsets(top: 2, leading: 13, bottom: 2, trailing: 12))
           .listRowBackground(Color.clear)
       }
+    } header: {
+      SidebarSectionHeader(
+        title: "ボリューム",
+        showsAction: false,
+        actionHelp: "",
+        action: {}
+      )
     }
   }
 }
@@ -214,12 +211,6 @@ private struct SidebarServersSection: View {
 
   var body: some View {
     Section {
-      SidebarSectionHeader(
-        title: "サーバー",
-        topPadding: 6,
-        actionHelp: "サーバー接続を追加",
-        action: { openEditor(.blank) }
-      )
 
       ForEach(manager.profiles) { profile in
         ServerSidebarRow(
@@ -228,6 +219,12 @@ private struct SidebarServersSection: View {
           edit: { openEditor(profile) }
         )
       }
+    } header: {
+      SidebarSectionHeader(
+        title: "サーバー",
+        actionHelp: "サーバー接続を追加",
+        action: { openEditor(.blank) }
+      )
     }
   }
 }

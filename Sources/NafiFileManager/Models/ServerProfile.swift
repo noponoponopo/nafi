@@ -258,7 +258,8 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
       ?? .automatic
     s3Anonymous = try container.decodeIfPresent(Bool.self, forKey: .s3Anonymous) ?? false
     rcloneBackend = try container.decodeIfPresent(String.self, forKey: .rcloneBackend) ?? ""
-    rcloneParametersJSON = try container.decodeIfPresent(String.self, forKey: .rcloneParametersJSON) ?? "{}"
+    rcloneParametersJSON =
+      try container.decodeIfPresent(String.self, forKey: .rcloneParametersJSON) ?? "{}"
     transferPolicy =
       try container.decodeIfPresent(ConnectionTransferPolicy.self, forKey: .transferPolicy)
       ?? .default
@@ -279,6 +280,15 @@ struct ServerProfile: Identifiable, Codable, Hashable, Sendable {
       autoConnect: true,
       localMountPath: ""
     )
+  }
+
+  var requiresStoredSecrets: Bool {
+    switch kind {
+    case .sftp: sftpAuthentication != .sshAgent
+    case .s3: !s3Anonymous
+    case .nfs: false
+    default: true
+    }
   }
 
   var effectiveDefaultPort: Int {

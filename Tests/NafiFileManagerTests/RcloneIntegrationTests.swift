@@ -6,6 +6,66 @@ import Darwin
 @testable import NafiFileManager
 
 final class RcloneIntegrationTests: XCTestCase {
+  func testConfigurationWritesAreSerializedWithoutPoisoningLaterWrites() async throws {
+    let queue = RcloneConfigWriteQueue()
+    let probe = RcloneWriteProbe()
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      for _ in 0..<32 {
+        group.addTask {
+          try await queue.run {
+            await probe.begin()
+            try? await Task.sleep(nanoseconds: 2_000_000)
+            await probe.end()
+          }
+        }
+      }
+      try await group.waitForAll()
+    }
+    let first = await probe.result()
+    XCTAssertEqual(first.count, 32)
+    XCTAssertEqual(first.maximum, 1)
+
+    do {
+      try await queue.run { throw RcloneWriteProbe.ExpectedFailure() }
+      XCTFail("The configuration write should have failed")
+    } catch is RcloneWriteProbe.ExpectedFailure {}
+    try await queue.run {
+      await probe.begin()
+      await probe.end()
+    }
+    let last = await probe.result()
+    XCTAssertEqual(last.count, 33)
+  }
+
+  func testPreviousRcloneRetirementRequiresNoReportedJobsOrTransfers() {
+    let idleJobs: [String: JSONValue] = ["runningIds": .array([])]
+    XCTAssertTrue(RcloneRuntime.canRetirePublishedRuntime(jobs: idleJobs, stats: [:]))
+    XCTAssertFalse(RcloneRuntime.canRetirePublishedRuntime(jobs: [:], stats: [:]))
+    XCTAssertFalse(RcloneRuntime.canRetirePublishedRuntime(
+      jobs: ["runningIds": .array([.integer(42)])], stats: [:]))
+    XCTAssertFalse(RcloneRuntime.canRetirePublishedRuntime(
+      jobs: idleJobs, stats: ["transferring": .array([.object([:])])]))
+    XCTAssertFalse(RcloneRuntime.canRetirePublishedRuntime(
+      jobs: idleJobs, stats: ["checking": .array([.object([:])])]))
+    XCTAssertFalse(RcloneRuntime.canRetirePublishedRuntime(
+      jobs: idleJobs, stats: ["transferring": .string("unknown")]))
+  }
+
+  func testConfigurationVisibilityRejectsMissingOrMalformedRemotes() throws {
+    let expected: Set<String> = ["nafi_first", "nafi_second"]
+    XCTAssertEqual(
+      try RcloneConfigVisibility.missing(
+        expected, in: ["remotes": .array([.string("nafi_first")])]),
+      ["nafi_second"])
+    XCTAssertTrue(
+      try RcloneConfigVisibility.missing(
+        expected, in: ["remotes": .array([.string("nafi_first"), .string("nafi_second")])]
+      ).isEmpty)
+    XCTAssertThrowsError(try RcloneConfigVisibility.missing(expected, in: [:]))
+    XCTAssertThrowsError(
+      try RcloneConfigVisibility.missing(expected, in: ["remotes": .array([.integer(1)])]))
+  }
+
   func testOAuthTokenReplacementPreservesOtherSecrets() throws {
     let oldToken = #"{"access_token":"old","refresh_token":"old-refresh"}"#
     let newToken = #"{"access_token":"new","refresh_token":"new-refresh"}"#
@@ -236,4 +296,20 @@ final class RcloneIntegrationTests: XCTestCase {
     XCTAssertEqual(NafiExternalCommand(url: URL(string: "nafi://drop-stack")!), .dropStack)
     XCTAssertNil(NafiExternalCommand(url: URL(string: "https://example.com")!))
   }
+}
+
+private actor RcloneWriteProbe {
+  struct ExpectedFailure: Error {}
+  private var active = 0
+  private var maximum = 0
+  private var count = 0
+
+  func begin() {
+    active += 1
+    maximum = max(maximum, active)
+    count += 1
+  }
+
+  func end() { active -= 1 }
+  func result() -> (count: Int, maximum: Int) { (count, maximum) }
 }

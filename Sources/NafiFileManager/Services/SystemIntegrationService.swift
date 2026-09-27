@@ -13,22 +13,33 @@ final class SystemIntegrationService: ObservableObject {
   @Published private(set) var shellCommandInstalled = false
   @Published private(set) var rcloneVersion: String?
   @Published private(set) var fileProviderProfileIDs = Set<UUID>()
+  @Published private(set) var fileProviderStoreUsable = true
   private var fileProviderRecords: [UUID: FileProviderDomainRecord] = [:]
+  private var attemptedLegacyDomainRecovery = false
   @Published private(set) var fileProviderStatus = "未構成"
   @Published var errorMessage: String?
 
   private let shellURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".local/bin/nafi")
-  private let fileProviderStoreURL = AppStoragePaths.sharedFile(named: "file-provider-domains.json")
-  private let legacyFileProviderStoreURL = AppStoragePaths.file(named: "file-provider-domains.json")
+  private var fileProviderStoreURL: URL? {
+    AppStoragePaths.fileProviderFile(named: "file-provider-domains.json")
+  }
+  private var legacyFileProviderStoreURL: URL {
+    AppStoragePaths.file(named: "file-provider-domains.json")
+  }
   private let legacyAppGroupStoreURL = AppStoragePaths.legacyAppGroupDirectory
     .appendingPathComponent("file-provider-domains.json")
   private let shellMarker = "# Managed by nafi (app.nafi.filemanager)"
 
   init() {
     refresh()
-    migrateLegacyFileProviderStoreIfNeeded()
-    loadFileProviderProfiles()
+    if fileProviderStoreURL == nil {
+      fileProviderStoreUsable = false
+      fileProviderStatus = "利用不可（File Providerの保存先にアクセスできません）"
+    } else {
+      migrateLegacyFileProviderStoreIfNeeded()
+      loadFileProviderProfiles()
+    }
   }
 
   func refresh() {
@@ -210,6 +221,11 @@ final class SystemIntegrationService: ObservableObject {
   func setFileProviderEnabled(_ enabled: Bool, profile: ServerProfile) {
     Task {
       do {
+        guard fileProviderStoreUsable, fileProviderStoreURL != nil else {
+          throw CocoaError(.fileWriteNoPermission, userInfo: [
+            NSLocalizedDescriptionKey: "File Provider拡張の保存先に書き込めません。nafi内でのサーバー接続は引き続き利用できます。"
+          ])
+        }
         let previous = await MainActor.run { self.fileProviderRecords }
         var updated = previous
         if enabled { updated[profile.id] = FileProviderDomainRecord(profile: profile) }
@@ -229,54 +245,105 @@ final class SystemIntegrationService: ObservableObject {
         }
       } catch {
         await MainActor.run {
-          self.errorMessage = "File Providerを変更できません。拡張の署名、App Group、File Provider entitlementを確認してください。\n\(error.localizedDescription)"
+          self.errorMessage = "File Providerを変更できません。\n\(error.localizedDescription)"
         }
       }
     }
   }
 
   private func migrateLegacyFileProviderStoreIfNeeded() {
-    guard !FileManager.default.fileExists(atPath: fileProviderStoreURL.path) else { return }
-    let source = [legacyAppGroupStoreURL, legacyFileProviderStoreURL].first {
-      FileManager.default.fileExists(atPath: $0.path)
-    }
-    guard let source else { return }
     do {
-      let data = try AppStoragePaths.readRegularFile(
-        at: source,
-        maximumBytes: 4 * 1_024 * 1_024
-      )
-      try data.write(to: fileProviderStoreURL, options: [.atomic, .completeFileProtectionUnlessOpen])
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o600],
-        ofItemAtPath: fileProviderStoreURL.path
+      try Self.migrateLegacyFileProviderStoreIfNeeded(
+        to: AppStoragePaths.fileProviderDirectory,
+        legacyAppGroupStoreURL: legacyAppGroupStoreURL,
+        legacyFileProviderStoreURL: legacyFileProviderStoreURL
       )
     } catch {
       errorMessage = "旧File Provider設定を拡張領域へ移行できません。\n\(error.localizedDescription)"
     }
   }
 
-  private func loadFileProviderProfiles() {
-    guard FileManager.default.fileExists(atPath: fileProviderStoreURL.path) else { return }
-    do {
-      let data = try AppStoragePaths.readRegularFile(
-        at: fileProviderStoreURL,
-        maximumBytes: 4 * 1_024 * 1_024
-      )
-      if let records = try? JSONDecoder().decode([FileProviderDomainRecord].self, from: data),
-        records.count <= 10_000
-      {
-        var unique: [UUID: FileProviderDomainRecord] = [:]
-        for record in records where unique[record.id] == nil { unique[record.id] = record }
-        fileProviderRecords = unique
-        fileProviderProfileIDs = Set(unique.keys)
-      } else if let ids = try? JSONDecoder().decode(Set<UUID>.self, from: data), ids.count <= 10_000 {
-        fileProviderProfileIDs = ids
-      } else {
-        throw CocoaError(.fileReadCorruptFile)
+  static func migrateLegacyFileProviderStoreIfNeeded(
+    to sharedDirectory: URL?,
+    legacyAppGroupStoreURL: URL,
+    legacyFileProviderStoreURL: URL
+  ) throws {
+    guard let sharedDirectory else { return }
+    let destination = sharedDirectory.appendingPathComponent("file-provider-domains.json")
+    guard !FileManager.default.fileExists(atPath: destination.path) else { return }
+    // Legacy files may be visible but unreadable. Never replace current records
+    // with unvalidated data, and leave every failed source untouched.
+    let candidates = [legacyFileProviderStoreURL, legacyAppGroupStoreURL]
+      .filter { FileManager.default.fileExists(atPath: $0.path) }
+      .sorted {
+        if $0 == $1 { return false }
+        let left = (try? URL(fileURLWithPath: $0.path)
+          .resourceValues(forKeys: [.contentModificationDateKey]))?
+          .contentModificationDate ?? .distantPast
+        let right = (try? URL(fileURLWithPath: $1.path)
+          .resourceValues(forKeys: [.contentModificationDateKey]))?
+          .contentModificationDate ?? .distantPast
+        return left == right ? $0 == legacyFileProviderStoreURL : left > right
       }
+    for source in candidates {
+      guard let data = try? AppStoragePaths.readRegularFile(
+        at: source, maximumBytes: 4 * 1_024 * 1_024),
+        (try? Self.decodeFileProviderProfiles(data)) != nil
+      else { continue }
+      let temporary = sharedDirectory.appendingPathComponent(".nafi-import-\(UUID().uuidString)")
+      defer { try? FileManager.default.removeItem(at: temporary) }
+      try data.write(to: temporary, options: [.atomic, .completeFileProtectionUnlessOpen])
+      try FileManager.default.setAttributes(
+        [.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+      do {
+        try FileManager.default.moveItem(at: temporary, to: destination)
+      } catch {
+        if !FileManager.default.fileExists(atPath: destination.path) { throw error }
+      }
+      return
+    }
+  }
+
+  private static func decodeFileProviderProfiles(
+    _ data: Data
+  ) throws -> (records: [UUID: FileProviderDomainRecord], ids: Set<UUID>) {
+    if let records = try? JSONDecoder().decode([FileProviderDomainRecord].self, from: data),
+      records.count <= 10_000 {
+      var unique: [UUID: FileProviderDomainRecord] = [:]
+      for record in records where unique[record.id] == nil { unique[record.id] = record }
+      return (unique, Set(unique.keys))
+    }
+    if let ids = try? JSONDecoder().decode(Set<UUID>.self, from: data), ids.count <= 10_000 {
+      return ([:], ids)
+    }
+    throw CocoaError(.fileReadCorruptFile)
+  }
+
+  private func loadFileProviderProfiles() {
+    guard let fileProviderStoreURL,
+      FileManager.default.fileExists(atPath: fileProviderStoreURL.path) else { return }
+    let data: Data
+    do {
+      data = try AppStoragePaths.readRegularFile(
+        at: fileProviderStoreURL, maximumBytes: 4 * 1_024 * 1_024)
+    } catch {
+      fileProviderStoreUsable = false
+      fileProviderStatus = "利用不可（File Provider設定を読み取れません）"
+      errorMessage = "File Provider設定を読み取れません。元のファイルは保持しています。\n\(error.localizedDescription)"
+      return
+    }
+    do {
+      let decoded = try Self.decodeFileProviderProfiles(data)
+      fileProviderRecords = decoded.records
+      fileProviderProfileIDs = decoded.ids
     } catch {
       AppStoragePaths.quarantineCorruptFile(at: fileProviderStoreURL)
+      if FileManager.default.fileExists(atPath: fileProviderStoreURL.path) {
+        fileProviderStoreUsable = false
+        fileProviderStatus = "利用不可（File Provider設定を隔離できません）"
+        errorMessage = "File Provider設定を読み取れず、元のファイルを隔離できません。上書きせず保持しています。\n\(error.localizedDescription)"
+        return
+      }
       errorMessage = "File Provider設定が破損していたため隔離しました。\n\(error.localizedDescription)"
       fileProviderRecords = [:]
       fileProviderProfileIDs = []
@@ -285,7 +352,44 @@ final class SystemIntegrationService: ObservableObject {
   }
 
   func reconcileFileProviderProfiles(_ profiles: [ServerProfile]) {
+    guard fileProviderStoreUsable, let fileProviderStoreURL else { return }
     let byID = Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
+    if !attemptedLegacyDomainRecovery {
+      attemptedLegacyDomainRecovery = true
+      if !FileManager.default.fileExists(atPath: fileProviderStoreURL.path) {
+        // If no readable legacy store was available, reconstruct missing records
+        // from registered Finder domains and the saved server profiles.
+        Task { [weak self] in
+          guard let self else { return }
+          do {
+            let domains = try await registeredFileProviderDomains()
+            guard !FileManager.default.fileExists(atPath: fileProviderStoreURL.path) else {
+              loadFileProviderProfiles()
+              reconcileFileProviderProfiles(profiles)
+              return
+            }
+            let prefix = "app.nafi.filemanager.remote."
+            let recovered = domains.compactMap { domain -> FileProviderDomainRecord? in
+              let raw = domain.identifier.rawValue
+              guard raw.hasPrefix(prefix),
+                let id = UUID(uuidString: String(raw.dropFirst(prefix.count))),
+                let profile = byID[id]
+              else { return nil }
+              return FileProviderDomainRecord(profile: profile)
+            }
+            guard !recovered.isEmpty else { return }
+            let records = Dictionary(uniqueKeysWithValues: recovered.map { ($0.id, $0) })
+            try persistFileProviderProfiles(records)
+            fileProviderRecords = records
+            fileProviderProfileIDs = Set(records.keys)
+            fileProviderStatus = "\(records.count)接続を復元"
+            reconcileFileProviderProfiles(profiles)
+          } catch {
+            errorMessage = "旧File Provider設定を復元できません。Finderの公開状態を確認してください。\n\(error.localizedDescription)"
+          }
+        }
+      }
+    }
     let removed = fileProviderRecords.values.filter { byID[$0.id] == nil }
     var changed = false
     for id in fileProviderProfileIDs {
@@ -344,6 +448,9 @@ final class SystemIntegrationService: ObservableObject {
   private func persistFileProviderProfiles(
     _ values: [UUID: FileProviderDomainRecord]
   ) throws {
+    guard fileProviderStoreUsable, let fileProviderStoreURL else {
+      throw CocoaError(.fileWriteNoPermission)
+    }
     guard values.count <= 10_000 else { throw CocoaError(.fileWriteOutOfSpace) }
     let records = values.values.sorted {
       $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
@@ -444,7 +551,11 @@ final class SystemIntegrationService: ObservableObject {
   /// republishes records on the next launch regardless.
   static func repairFileProviderDomains() async {
     #if canImport(FileProvider)
-    let storeURL = AppStoragePaths.sharedFile(named: "file-provider-domains.json")
+    guard let root = AppStoragePaths.fileProviderDirectory else {
+      print("repair aborted: File Provider storage is inaccessible")
+      return
+    }
+    let storeURL = root.appendingPathComponent("file-provider-domains.json")
     var records: [FileProviderDomainRecord] = []
     if let data = try? AppStoragePaths.readRegularFile(at: storeURL, maximumBytes: 4 * 1_024 * 1_024),
       let decoded = try? JSONDecoder().decode([FileProviderDomainRecord].self, from: data)
@@ -482,8 +593,7 @@ final class SystemIntegrationService: ObservableObject {
         print("removed materialized volume: \(volume.lastPathComponent)")
       }
     }
-    let snapshots = AppStoragePaths.sharedDirectory
-      .appendingPathComponent("FileProviderSnapshots", isDirectory: true)
+    let snapshots = root.appendingPathComponent("FileProviderSnapshots", isDirectory: true)
     if let files = try? FileManager.default.contentsOfDirectory(
       at: snapshots, includingPropertiesForKeys: nil
     ) {

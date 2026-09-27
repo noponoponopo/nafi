@@ -489,6 +489,10 @@ private struct IntegrationSettingsView: View {
       Section("File Provider") {
         Text("有効にした接続をFinder、開く／保存パネル、他のmacOSアプリへ公開します。rcloneは必要な時だけ起動し、File Providerがアイドルになると終了します。定期ポーリングは行いません。")
           .font(.caption).foregroundStyle(.secondary)
+        if !service.fileProviderStoreUsable {
+          Text("File Provider設定を安全に読み書きできません。元のファイルは保持しています。nafi内のサーバー接続は使えます。")
+            .font(.caption).foregroundStyle(.secondary)
+        }
         if serverManager.profiles.isEmpty {
           Text("先にリモート接続を追加してください。").foregroundStyle(.secondary)
         } else {
@@ -502,9 +506,11 @@ private struct IntegrationSettingsView: View {
               ) {
                 Label(profile.name, systemImage: profile.kind.systemImage)
               }
+              .disabled(!service.fileProviderStoreUsable)
               if service.fileProviderProfileIDs.contains(profile.id) {
                 Button("今すぐ確認") { service.refreshFileProvider(profileID: profile.id) }
                   .buttonStyle(.borderless)
+                  .disabled(!service.fileProviderStoreUsable)
                   .help("定期ポーリングを有効にせず、Finderへリモートの最新状態を確認するよう要求します")
               }
             }

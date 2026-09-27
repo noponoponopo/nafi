@@ -48,11 +48,13 @@ private struct ServerConnectionOption: Identifiable, Hashable {
   }
 
   private static func option(_ kind: ServerProfile.Kind) -> ServerConnectionOption {
-    ServerConnectionOption(id: "kind:\(kind.rawValue)", label: kind.label, kind: kind, rcloneBackend: nil)
+    ServerConnectionOption(
+      id: "kind:\(kind.rawValue)", label: kind.label, kind: kind, rcloneBackend: nil)
   }
 
   private static func rclone(_ label: String, _ backend: String) -> ServerConnectionOption {
-    ServerConnectionOption(id: "rclone:\(backend)", label: label, kind: .rclone, rcloneBackend: backend)
+    ServerConnectionOption(
+      id: "rclone:\(backend)", label: label, kind: .rclone, rcloneBackend: backend)
   }
 }
 
@@ -69,6 +71,11 @@ struct ServerEditorView: View {
   @State private var hostKeyStatus: String?
   @State private var isCheckingHostKey = false
   @State private var connectionOptionID: String
+  @State private var isLoadingSecrets = true
+  @State private var isSaving = false
+  @State private var secretLoadError: String?
+  @State private var replaceUnreadableSecrets = false
+  @State private var originalSecrets: ServerSecrets?
 
   init(serverManager: ServerManager, profile: ServerProfile? = nil) {
     let initialProfile = profile ?? .blank
@@ -81,18 +88,10 @@ struct ServerEditorView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      HStack {
-        VStack(alignment: .leading, spacing: 3) {
-          Text("サーバー接続")
-            .font(.title2.weight(.semibold))
-        }
-        Spacer()
-        Image(systemName: draft.kind.systemImage)
-          .font(.system(size: 34))
-          .symbolRenderingMode(.hierarchical)
-      }
-      .padding(20)
-      .background(.ultraThinMaterial)
+      Text("サーバー接続")
+        .font(.headline)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding()
 
       Form {
         Section("接続先") {
@@ -130,6 +129,26 @@ struct ServerEditorView: View {
           }
         }
 
+        if isLoadingSecrets {
+          HStack {
+            ProgressView().controlSize(.small)
+            Text("認証情報を読み込み中…")
+          }
+        } else if let secretLoadError {
+          Section("認証情報を確認してください") {
+            Text(secretLoadError).foregroundStyle(.secondary)
+            Toggle("保存済みの認証情報を再入力した内容で置き換える", isOn: $replaceUnreadableSecrets)
+            if replaceUnreadableSecrets {
+              Text("パスワードやトークンを再入力してから保存してください。空のままでは旧版の認証情報を上書きしません。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Button("キーチェーンを再試行") {
+              Task { await loadSecrets(retry: true) }
+            }
+          }
+        }
+
         switch draft.kind {
         case .sftp:
           sftpAuthenticationSection
@@ -138,7 +157,11 @@ struct ServerEditorView: View {
           s3AuthenticationSection
           s3CompatibilitySection
         case .rclone:
-          rcloneConfigurationSection
+          if !isLoadingSecrets, secretLoadError == nil || replaceUnreadableSecrets {
+            rcloneConfigurationSection
+          }
+        case .nfs:
+          EmptyView()
         default:
           Section("認証") {
             TextField("ユーザー名", text: $draft.username)
@@ -164,6 +187,7 @@ struct ServerEditorView: View {
         }
       }
       .formStyle(.grouped)
+      .disabled(isSaving || isLoadingSecrets)
       .frame(maxHeight: .infinity)
 
       Divider()
@@ -172,10 +196,15 @@ struct ServerEditorView: View {
           .font(.caption.monospaced())
           .lineLimit(1)
         Spacer()
+        if isSaving { ProgressView().controlSize(.small) }
         Button("キャンセル") { dismiss() }
+          .keyboardShortcut(.cancelAction)
+          .disabled(isSaving)
         Button("保存") { save() }
           .keyboardShortcut(.defaultAction)
-          .disabled(!isValid)
+          .disabled(
+            !isValid || isSaving || isLoadingSecrets || serverManager.isSavingProfiles
+              || (secretLoadError != nil && !replaceUnreadableSecrets))
       }
       .padding(16)
     }
@@ -188,29 +217,7 @@ struct ServerEditorView: View {
       pendingHostKeyScan = nil
       hostKeyStatus = nil
     }
-    .onAppear {
-      // Read only the secrets this connection type actually uses. This avoids
-      // unnecessary Keychain access prompts when editing a profile.
-      switch draft.kind {
-      case .sftp:
-        switch draft.sftpAuthentication {
-        case .password:
-          password = serverManager.password(for: draft)
-        case .privateKey:
-          keyPassphrase = serverManager.keyPassphrase(for: draft)
-        case .sshAgent:
-          break
-        }
-      case .s3:
-        if !draft.s3Anonymous {
-          password = serverManager.password(for: draft)
-          sessionToken = serverManager.sessionToken(for: draft)
-        }
-      case .ftp, .smb, .webdav, .nfs, .afp, .rclone:
-        password = serverManager.password(for: draft)
-      }
-      if draft.kind == .sftp { refreshHostKeyStatus() }
-    }
+    .task { await loadSecrets() }
     .alert(
       "操作を完了できません",
       isPresented: Binding(
@@ -246,7 +253,6 @@ struct ServerEditorView: View {
         .frame(width: 90)
     }
   }
-
 
   @ViewBuilder
   private var rcloneConfigurationSection: some View {
@@ -377,18 +383,27 @@ struct ServerEditorView: View {
   private var transferPolicySection: some View {
     Section("転送ポリシー") {
       HStack {
-        Stepper("並列転送: \(draft.transferPolicy.parallelTransfers)", value: $draft.transferPolicy.parallelTransfers, in: 1...32)
-        Stepper("並列確認: \(draft.transferPolicy.parallelChecks)", value: $draft.transferPolicy.parallelChecks, in: 1...64)
+        Stepper(
+          "並列転送: \(draft.transferPolicy.parallelTransfers)",
+          value: $draft.transferPolicy.parallelTransfers, in: 1...32)
+        Stepper(
+          "並列確認: \(draft.transferPolicy.parallelChecks)",
+          value: $draft.transferPolicy.parallelChecks, in: 1...64)
       }
-      TextField("帯域上限", text: $draft.transferPolicy.bandwidthLimit, prompt: Text("off / 20M / 10M:2M"))
+      TextField(
+        "帯域上限", text: $draft.transferPolicy.bandwidthLimit, prompt: Text("off / 20M / 10M:2M"))
       Picker("完了検証", selection: $draft.transferPolicy.verification) {
         ForEach(TransferVerificationMode.allCases) { mode in
           Text(mode.label).tag(mode)
         }
       }
       HStack {
-        Stepper("再試行: \(draft.transferPolicy.retryCount)", value: $draft.transferPolicy.retryCount, in: 0...20)
-        Stepper("低水準再試行: \(draft.transferPolicy.lowLevelRetryCount)", value: $draft.transferPolicy.lowLevelRetryCount, in: 0...100)
+        Stepper(
+          "再試行: \(draft.transferPolicy.retryCount)", value: $draft.transferPolicy.retryCount,
+          in: 0...20)
+        Stepper(
+          "低水準再試行: \(draft.transferPolicy.lowLevelRetryCount)",
+          value: $draft.transferPolicy.lowLevelRetryCount, in: 0...100)
       }
       Toggle("空フォルダを保持", isOn: $draft.transferPolicy.preserveEmptyDirectories)
       Toggle("可能ならサーバー側コピーを使用", isOn: $draft.transferPolicy.useServerSideCopy)
@@ -505,12 +520,15 @@ struct ServerEditorView: View {
     if draft.kind == .rclone {
       let backend = draft.rcloneBackend.trimmingCharacters(in: .whitespacesAndNewlines)
       guard named, !backend.isEmpty,
-        (try? JSONSerialization.jsonObject(with: Data(draft.rcloneParametersJSON.utf8))) is [String: Any]
+        (try? JSONSerialization.jsonObject(with: Data(draft.rcloneParametersJSON.utf8)))
+          is [String: Any]
       else { return false }
       let secret = password.trimmingCharacters(in: .whitespacesAndNewlines)
-      return secret.isEmpty || ((try? JSONSerialization.jsonObject(with: Data(secret.utf8))) is [String: Any])
+      return secret.isEmpty
+        || ((try? JSONSerialization.jsonObject(with: Data(secret.utf8))) is [String: Any])
     }
-    let basics = named
+    let basics =
+      named
       && !draft.host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       && (1...65535).contains(draft.port)
     guard basics else { return false }
@@ -597,35 +615,73 @@ struct ServerEditorView: View {
     }
   }
 
-  private func save() {
-    draft.transferPolicy.clamp()
+  @MainActor
+  private func loadSecrets(retry: Bool = false) async {
+    isLoadingSecrets = true
+    defer { isLoadingSecrets = false }
+    guard serverManager.profiles.contains(where: { $0.id == draft.id }) else { return }
     do {
-      try serverManager.save(
-        profile: draft,
-        password: password,
-        keyPassphrase: keyPassphrase,
-        sessionToken: sessionToken
-      )
-      if connectAfterSave {
-        let savedProfile = serverManager.profiles.first(where: { $0.id == draft.id }) ?? draft
-        Task { await serverManager.connect(savedProfile) }
-      }
-      dismiss()
+      let stored = try await serverManager.secrets(for: draft, retryUnlock: retry)
+      guard !Task.isCancelled else { return }
+      // Preserve inactive authentication fields as well as the currently visible ones.
+      originalSecrets = stored
+      password = stored.password
+      keyPassphrase = stored.keyPassphrase
+      sessionToken = stored.sessionToken
+      secretLoadError = nil
+      replaceUnreadableSecrets = false
     } catch {
-      errorMessage = error.localizedDescription
+      if !Task.isCancelled { secretLoadError = error.localizedDescription }
+    }
+    if draft.kind == .sftp { refreshHostKeyStatus() }
+  }
+
+  private func save() {
+    guard !isSaving else { return }
+    isSaving = true
+    Task { @MainActor in
+      defer { isSaving = false }
+      do {
+        try await persistConfiguration()
+        if connectAfterSave {
+          let savedProfile = draft
+          Task { await serverManager.connect(savedProfile) }
+        }
+        dismiss()
+      } catch {
+        errorMessage = error.localizedDescription
+      }
     }
   }
 
-  private func persistRcloneConfiguration() throws {
+  @MainActor
+  private func persistConfiguration() async throws {
     draft.transferPolicy.clamp()
-    try serverManager.save(
+    try await serverManager.save(
       profile: draft,
       password: password,
-      keyPassphrase: "",
-      sessionToken: ""
+      keyPassphrase: keyPassphrase,
+      sessionToken: sessionToken,
+      replaceUnreadableSecrets: replaceUnreadableSecrets,
+      originalSecrets: originalSecrets
     )
     if let saved = serverManager.profiles.first(where: { $0.id == draft.id }) {
       draft = saved
     }
+    let stored = try await serverManager.secrets(for: draft)
+    originalSecrets = stored
+    password = stored.password
+    keyPassphrase = stored.keyPassphrase
+    sessionToken = stored.sessionToken
+    secretLoadError = nil
+    replaceUnreadableSecrets = false
+  }
+
+  @MainActor
+  private func persistRcloneConfiguration() async throws {
+    guard !isSaving else { return }
+    isSaving = true
+    defer { isSaving = false }
+    try await persistConfiguration()
   }
 }
